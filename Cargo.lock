@@ -2004,9 +2004,12 @@ dependencies = [
 name = "murmur-engine"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "ed25519-dalek 2.2.0",
  "murmur-dag",
  "murmur-net",
  "murmur-types",
+ "rand 0.8.5",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
