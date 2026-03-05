@@ -4,7 +4,7 @@
 mod helpers;
 
 use helpers::*;
-use murmur_types::{AccessGrant, AccessScope, DeviceRole};
+use murmur_types::{AccessScope, DeviceRole};
 
 // =========================================================================
 // Offline reconnect
@@ -15,11 +15,7 @@ use murmur_types::{AccessGrant, AccessScope, DeviceRole};
 fn test_offline_reconnect() {
     let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
     let (mut phone, _, phone_id) = join_engine("Phone");
-
-    // Join + approve.
-    sync_engines(&phone, &mut nas);
-    nas.approve_device(phone_id, DeviceRole::Source).unwrap();
-    bidirectional_sync(&mut nas, &mut phone);
+    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
 
     // Phone goes "offline" — adds files without syncing.
     for i in 0..5 {
@@ -63,10 +59,7 @@ fn test_offline_reconnect() {
 fn test_multiple_offline_cycles() {
     let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
     let (mut phone, _, phone_id) = join_engine("Phone");
-
-    sync_engines(&phone, &mut nas);
-    nas.approve_device(phone_id, DeviceRole::Source).unwrap();
-    bidirectional_sync(&mut nas, &mut phone);
+    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
 
     let nas_id = nas.device_id();
 
@@ -102,14 +95,12 @@ fn test_multiple_offline_cycles() {
 fn test_device_revocation() {
     let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
     let (mut phone, _, phone_id) = join_engine("Phone");
-
-    sync_engines(&phone, &mut nas);
-    nas.approve_device(phone_id, DeviceRole::Source).unwrap();
-    bidirectional_sync(&mut nas, &mut phone);
+    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
 
     // Phone adds a file.
     let (meta, data) = make_file(b"pre-revoke photo", "pre.jpg", phone_id);
-    phone.add_file(meta.clone(), data).unwrap();
+    let hash = meta.blob_hash;
+    phone.add_file(meta, data).unwrap();
     sync_engines(&phone, &mut nas);
 
     // NAS revokes Phone.
@@ -123,7 +114,7 @@ fn test_device_revocation() {
     assert!(!phone_info.approved);
 
     // The file added before revocation still exists.
-    assert!(nas.state().files.contains_key(&meta.blob_hash));
+    assert!(nas.state().files.contains_key(&hash));
 }
 
 /// Revoked device's access grants are separate from device revocation.
@@ -131,20 +122,10 @@ fn test_device_revocation() {
 fn test_revoke_device_with_grants() {
     let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
     let (mut phone, _, phone_id) = join_engine("Phone");
-
-    sync_engines(&phone, &mut nas);
-    nas.approve_device(phone_id, DeviceRole::Source).unwrap();
-    bidirectional_sync(&mut nas, &mut phone);
+    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
 
     // NAS grants phone access.
-    let grant = AccessGrant {
-        to: phone_id,
-        from: nas.device_id(),
-        scope: AccessScope::AllFiles,
-        expires_at: u64::MAX,
-        signature_r: [0u8; 32],
-        signature_s: [0u8; 32],
-    };
+    let grant = make_grant(phone_id, nas.device_id(), AccessScope::AllFiles, u64::MAX);
     nas.grant_access(grant).unwrap();
     sync_engines(&nas, &mut phone);
 
@@ -168,20 +149,15 @@ fn test_revoke_device_with_grants() {
 fn test_access_grant_lifecycle() {
     let (mut nas, _) = create_engine("NAS", DeviceRole::Backup);
     let (mut phone, _, phone_id) = join_engine("Phone");
-
-    sync_engines(&phone, &mut nas);
-    nas.approve_device(phone_id, DeviceRole::Source).unwrap();
-    bidirectional_sync(&mut nas, &mut phone);
+    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
 
     // Grant with expiration at timestamp 1000.
-    let grant = AccessGrant {
-        to: phone_id,
-        from: nas.device_id(),
-        scope: AccessScope::SingleFile(murmur_types::BlobHash::from_data(b"test")),
-        expires_at: 1000,
-        signature_r: [0u8; 32],
-        signature_s: [0u8; 32],
-    };
+    let grant = make_grant(
+        phone_id,
+        nas.device_id(),
+        AccessScope::SingleFile(murmur_types::BlobHash::from_data(b"test")),
+        1000,
+    );
     nas.grant_access(grant).unwrap();
     sync_engines(&nas, &mut phone);
 
@@ -200,19 +176,9 @@ fn test_access_grant_lifecycle() {
 fn test_access_grant_all_files() {
     let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
     let (mut tablet, _, tablet_id) = join_engine("Tablet");
+    join_approve_sync(&mut nas, &mut tablet, tablet_id, DeviceRole::Source);
 
-    sync_engines(&tablet, &mut nas);
-    nas.approve_device(tablet_id, DeviceRole::Source).unwrap();
-    bidirectional_sync(&mut nas, &mut tablet);
-
-    let grant = AccessGrant {
-        to: tablet_id,
-        from: nas.device_id(),
-        scope: AccessScope::AllFiles,
-        expires_at: u64::MAX,
-        signature_r: [0u8; 32],
-        signature_s: [0u8; 32],
-    };
+    let grant = make_grant(tablet_id, nas.device_id(), AccessScope::AllFiles, u64::MAX);
     nas.grant_access(grant).unwrap();
     sync_engines(&nas, &mut tablet);
 
@@ -225,19 +191,9 @@ fn test_access_grant_all_files() {
 fn test_access_revoke_explicit() {
     let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
     let (mut phone, _, phone_id) = join_engine("Phone");
+    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
 
-    sync_engines(&phone, &mut nas);
-    nas.approve_device(phone_id, DeviceRole::Source).unwrap();
-    bidirectional_sync(&mut nas, &mut phone);
-
-    let grant = AccessGrant {
-        to: phone_id,
-        from: nas.device_id(),
-        scope: AccessScope::AllFiles,
-        expires_at: u64::MAX,
-        signature_r: [0u8; 32],
-        signature_s: [0u8; 32],
-    };
+    let grant = make_grant(phone_id, nas.device_id(), AccessScope::AllFiles, u64::MAX);
     nas.grant_access(grant).unwrap();
     sync_engines(&nas, &mut phone);
     assert!(phone.has_active_grant(phone_id, 0));
@@ -259,20 +215,21 @@ fn test_large_file_integrity() {
     let nas_id = nas.device_id();
 
     // Generate a 1MB file.
-    let large_data: Vec<u8> = (0..1_000_000).map(|i| (i % 256) as u8).collect();
+    let large_data: Vec<u8> = (0u8..=255).cycle().take(1_000_000).collect();
     let (meta, data) = make_file(&large_data, "large_file.bin", nas_id);
+    let hash = meta.blob_hash;
 
-    nas.add_file(meta.clone(), data.clone()).unwrap();
+    nas.add_file(meta, data).unwrap();
 
     // Verify the blob was stored via callback.
     let blobs = cb_nas.blobs.lock().unwrap();
     assert_eq!(blobs.len(), 1);
-    assert_eq!(blobs[0].0, meta.blob_hash);
+    assert_eq!(blobs[0].0, hash);
     assert_eq!(blobs[0].1.len(), 1_000_000);
 
     // Verify blake3 hash matches.
     let actual_hash = murmur_types::BlobHash::from_data(&blobs[0].1);
-    assert_eq!(actual_hash, meta.blob_hash);
+    assert_eq!(actual_hash, hash);
 }
 
 /// Bad hash detection.
@@ -307,26 +264,24 @@ fn test_dag_convergence_after_partition() {
     let (mut phone, _, phone_id) = join_engine("Phone");
     let (mut tablet, _, tablet_id) = join_engine("Tablet");
 
-    // Setup: approve both devices.
-    sync_engines(&phone, &mut nas);
-    nas.approve_device(phone_id, DeviceRole::Source).unwrap();
-    sync_engines(&tablet, &mut nas);
-    nas.approve_device(tablet_id, DeviceRole::Source).unwrap();
+    // Setup: approve both devices via NAS.
+    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut tablet, tablet_id, DeviceRole::Source);
+    // Ensure phone sees tablet and vice versa.
     bidirectional_sync(&mut nas, &mut phone);
-    bidirectional_sync(&mut nas, &mut tablet);
 
     let nas_id = nas.device_id();
 
     // Network partition: Phone and Tablet can't see each other or NAS.
     // Each adds files independently.
     let (mp, dp) = make_file(b"partition phone file", "part_phone.jpg", phone_id);
-    phone.add_file(mp.clone(), dp).unwrap();
+    phone.add_file(mp, dp).unwrap();
 
     let (mt, dt) = make_file(b"partition tablet file", "part_tablet.pdf", tablet_id);
-    tablet.add_file(mt.clone(), dt).unwrap();
+    tablet.add_file(mt, dt).unwrap();
 
     let (mn, dn) = make_file(b"partition nas file", "part_nas.log", nas_id);
-    nas.add_file(mn.clone(), dn).unwrap();
+    nas.add_file(mn, dn).unwrap();
 
     // Partition heals: full mesh sync.
     bidirectional_sync(&mut nas, &mut phone);
@@ -394,33 +349,29 @@ fn test_dag_convergence_many_entries() {
 }
 
 // =========================================================================
-// File deletion
+// File addition and sync (engine doesn't expose delete_file yet)
 // =========================================================================
 
-/// File deletion propagates through sync.
+/// File added on one device, synced, verified on the other.
 #[test]
-fn test_file_deletion_sync() {
+fn test_file_add_and_sync() {
     let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
     let (mut phone, _, phone_id) = join_engine("Phone");
+    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
 
-    sync_engines(&phone, &mut nas);
-    nas.approve_device(phone_id, DeviceRole::Source).unwrap();
-    bidirectional_sync(&mut nas, &mut phone);
-
-    // Phone adds then deletes a file.
+    // Phone adds a file.
     let (meta, data) = make_file(b"temp file", "temp.txt", phone_id);
-    phone.add_file(meta.clone(), data).unwrap();
+    let hash = meta.blob_hash;
+    phone.add_file(meta, data).unwrap();
     sync_engines(&phone, &mut nas);
 
     // NAS sees the file.
-    assert!(nas.state().files.contains_key(&meta.blob_hash));
+    assert!(nas.state().files.contains_key(&hash));
 
-    // Phone deletes it (via DAG append of FileDeleted action).
-    // We need to use the DAG directly since engine doesn't expose delete yet.
-    // Use receive_entry with a manually created entry from phone's DAG.
-    // Actually, let's just check the DAG-level behavior is consistent.
-    // The engine's add_file → sync → both see it pattern is already tested.
-    // File deletion would be a DAG action, tested at the DAG level.
+    // Verify file metadata matches.
+    let nas_meta = nas.state().files.get(&hash).unwrap();
+    assert_eq!(nas_meta.filename, "temp.txt");
+    assert_eq!(nas_meta.device_origin, phone_id);
 }
 
 // =========================================================================
@@ -466,9 +417,7 @@ fn test_sequential_device_joins() {
     let mut devices = vec![];
     for i in 0..4 {
         let (mut dev, _, dev_id) = join_engine(&format!("Device{i}"));
-        sync_engines(&dev, &mut nas);
-        nas.approve_device(dev_id, DeviceRole::Source).unwrap();
-        bidirectional_sync(&mut nas, &mut dev);
+        join_approve_sync(&mut nas, &mut dev, dev_id, DeviceRole::Source);
         devices.push((dev, dev_id));
     }
 
@@ -493,14 +442,11 @@ fn test_sequential_device_joins() {
 fn test_callbacks_triggered_on_sync() {
     let (mut nas, cb_nas) = create_engine("NAS", DeviceRole::Full);
     let (mut phone, _, phone_id) = join_engine("Phone");
-
-    sync_engines(&phone, &mut nas);
-    nas.approve_device(phone_id, DeviceRole::Source).unwrap();
-    bidirectional_sync(&mut nas, &mut phone);
+    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
 
     // Phone adds a file.
     let (meta, data) = make_file(b"callback test file", "cb.txt", phone_id);
-    phone.add_file(meta.clone(), data.clone()).unwrap();
+    phone.add_file(meta, data).unwrap();
 
     // Clear NAS callbacks to measure just the sync.
     cb_nas.entries.lock().unwrap().clear();

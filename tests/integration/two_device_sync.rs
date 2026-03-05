@@ -11,7 +11,7 @@ use murmur_types::DeviceRole;
 #[test]
 fn test_two_device_full_sync() {
     // Device A creates the network.
-    let (mut engine_a, cb_a) = create_engine("NAS", DeviceRole::Backup);
+    let (mut engine_a, _) = create_engine("NAS", DeviceRole::Backup);
     let device_a_id = engine_a.device_id();
 
     // Device B joins.
@@ -44,32 +44,28 @@ fn test_two_device_full_sync() {
 
     // B adds a file.
     let (meta, data) = make_file(b"photo from phone", "photo.jpg", device_b_id);
-    engine_b.add_file(meta.clone(), data).unwrap();
+    let hash_b = meta.blob_hash;
+    engine_b.add_file(meta, data).unwrap();
 
     // Sync B → A.
     sync_engines(&engine_b, &mut engine_a);
 
     // A should have the file in its state.
-    assert!(engine_a.state().files.contains_key(&meta.blob_hash));
-
-    // A's callback should have received the blob.
-    let blobs_a = cb_a.blobs.lock().unwrap();
-    // The file was added by B, synced to A. A gets the DAG entry but not the blob
-    // (blob transfer is separate from DAG sync). The file appears in state though.
-    drop(blobs_a);
+    assert!(engine_a.state().files.contains_key(&hash_b));
 
     // A adds a file too.
     let (meta_a, data_a) = make_file(b"backup log", "backup.log", device_a_id);
-    engine_a.add_file(meta_a.clone(), data_a).unwrap();
+    let hash_a = meta_a.blob_hash;
+    engine_a.add_file(meta_a, data_a).unwrap();
 
     // Bidirectional sync.
     bidirectional_sync(&mut engine_a, &mut engine_b);
 
     // Both should have both files.
-    assert!(engine_a.state().files.contains_key(&meta.blob_hash));
-    assert!(engine_a.state().files.contains_key(&meta_a.blob_hash));
-    assert!(engine_b.state().files.contains_key(&meta.blob_hash));
-    assert!(engine_b.state().files.contains_key(&meta_a.blob_hash));
+    assert!(engine_a.state().files.contains_key(&hash_b));
+    assert!(engine_a.state().files.contains_key(&hash_a));
+    assert!(engine_b.state().files.contains_key(&hash_b));
+    assert!(engine_b.state().files.contains_key(&hash_a));
 
     // Verify events on B's side.
     let events_b = cb_b.events.lock().unwrap();
@@ -94,8 +90,10 @@ fn test_two_device_concurrent_files() {
     // Both add files independently (no sync yet).
     let (meta_a, data_a) = make_file(b"file from A", "a.txt", id_a);
     let (meta_b, data_b) = make_file(b"file from B", "b.txt", id_b);
-    engine_a.add_file(meta_a.clone(), data_a).unwrap();
-    engine_b.add_file(meta_b.clone(), data_b).unwrap();
+    let hash_a = meta_a.blob_hash;
+    let hash_b = meta_b.blob_hash;
+    engine_a.add_file(meta_a, data_a).unwrap();
+    engine_b.add_file(meta_b, data_b).unwrap();
 
     // Bidirectional sync.
     bidirectional_sync(&mut engine_a, &mut engine_b);
@@ -103,13 +101,12 @@ fn test_two_device_concurrent_files() {
     // Both should have both files.
     assert_eq!(engine_a.state().files.len(), 2);
     assert_eq!(engine_b.state().files.len(), 2);
-    assert!(engine_a.state().files.contains_key(&meta_a.blob_hash));
-    assert!(engine_a.state().files.contains_key(&meta_b.blob_hash));
-    assert!(engine_b.state().files.contains_key(&meta_a.blob_hash));
-    assert!(engine_b.state().files.contains_key(&meta_b.blob_hash));
+    assert!(engine_a.state().files.contains_key(&hash_a));
+    assert!(engine_a.state().files.contains_key(&hash_b));
+    assert!(engine_b.state().files.contains_key(&hash_a));
+    assert!(engine_b.state().files.contains_key(&hash_b));
 
     // After merge, tips should converge.
-    // Do another round of sync to settle any merge entries.
     engine_a.maybe_merge();
     engine_b.maybe_merge();
     bidirectional_sync(&mut engine_a, &mut engine_b);
@@ -129,7 +126,8 @@ fn test_two_device_deduplication() {
 
     // A adds the file.
     let (meta_a, data_a) = make_file(content, "a_copy.txt", id_a);
-    engine_a.add_file(meta_a.clone(), data_a).unwrap();
+    let hash_a = meta_a.blob_hash;
+    engine_a.add_file(meta_a, data_a).unwrap();
 
     // Sync A → B.
     sync_engines(&engine_a, &mut engine_b);
@@ -137,7 +135,7 @@ fn test_two_device_deduplication() {
     // B tries to add the same content — should be rejected (dedup).
     let (meta_b, data_b) = make_file(content, "b_copy.txt", id_b);
     // Same blob hash, so it's a duplicate.
-    assert_eq!(meta_a.blob_hash, meta_b.blob_hash);
+    assert_eq!(hash_a, meta_b.blob_hash);
     let result = engine_b.add_file(meta_b, data_b);
     assert!(result.is_err()); // FileAlreadyExists
 

@@ -1,10 +1,11 @@
 //! Shared test helpers for integration tests.
+#![allow(dead_code)]
 
 use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::SigningKey;
 use murmur_engine::{EngineEvent, MurmurEngine, PlatformCallbacks};
-use murmur_types::{BlobHash, DeviceId, DeviceRole, FileMetadata};
+use murmur_types::{AccessGrant, AccessScope, BlobHash, DeviceId, DeviceRole, FileMetadata};
 use rand::rngs::OsRng;
 
 /// Test platform callbacks that capture all events, entries, and blobs.
@@ -74,6 +75,35 @@ pub fn bidirectional_sync(a: &mut MurmurEngine, b: &mut MurmurEngine) {
     let delta_b = b.compute_delta(a.tips());
     if !delta_b.is_empty() {
         a.receive_sync_entries(delta_b).unwrap();
+    }
+}
+
+/// Join a device to an existing network: sync join request, approve, sync back.
+pub fn join_approve_sync(
+    approver: &mut MurmurEngine,
+    joiner: &mut MurmurEngine,
+    joiner_id: DeviceId,
+    role: DeviceRole,
+) {
+    sync_engines(joiner, approver);
+    approver.approve_device(joiner_id, role).unwrap();
+    bidirectional_sync(approver, joiner);
+}
+
+/// Create an `AccessGrant` with zeroed (dummy) signatures for testing.
+pub fn make_grant(
+    to: DeviceId,
+    from: DeviceId,
+    scope: AccessScope,
+    expires_at: u64,
+) -> AccessGrant {
+    AccessGrant {
+        to,
+        from,
+        scope,
+        expires_at,
+        signature_r: [0u8; 32],
+        signature_s: [0u8; 32],
     }
 }
 
