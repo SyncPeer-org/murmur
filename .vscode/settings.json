@@ -1,0 +1,19 @@
+{
+  "cSpell.words": [
+    "alpn",
+    "clippy",
+    "crdt",
+    "dalek",
+    "fjall",
+    "hkdf",
+    "iroh",
+    "keypair",
+    "logtree",
+    "murmurd",
+    "quic",
+    "serde",
+    "tauri",
+    "thiserror",
+    "zstd"
+  ]
+}
