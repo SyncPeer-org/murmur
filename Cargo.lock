@@ -365,6 +365,7 @@ dependencies = [
  "ed25519-dalek",
  "murmur-types",
  "postcard",
+ "rand",
  "serde",
  "thiserror",
  "tracing",
