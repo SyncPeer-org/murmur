@@ -5,6 +5,26 @@
 This is the **architecture and implementation plan** for Murmur. Work milestone by milestone, in order.
 For each milestone: implement, test, `cargo clippy -- -D warnings`, `cargo fmt`, stop.
 
+## Current Status (as of 2026-03-19)
+
+| Milestone | Status |
+| --------- | ------ |
+| 0 — Workspace Setup | ✅ Complete |
+| 1 — Types | ✅ Complete |
+| 2 — Seed | ✅ Complete |
+| 3 — DAG | ✅ Complete |
+| 4 — Network | ✅ Complete |
+| 5 — Engine | ✅ Complete |
+| 6 — Server Daemon | ✅ Complete |
+| 7 — Integration Tests | ✅ Complete |
+| 8 — FFI Core Library | 🔲 Next |
+| 9 — Android App | 🔲 Planned |
+| 10 — iOS App | 🔲 Planned |
+| 11 — Hardening | 🔲 Planned |
+
+The entire Rust core is implemented and tested. The server daemon (`murmurd`) runs as a headless
+backup node. Next step is exposing the core via FFI so mobile platforms can consume it.
+
 ---
 
 ## What is Murmur?
@@ -343,36 +363,36 @@ platforms/
 
 ## Milestones
 
-### Milestone 0 — Workspace Setup
+### Milestone 0 — Workspace Setup ✅
 
 **Goal**: Cargo workspace compiles, CI-ready structure.
 
-- [ ] Create workspace `Cargo.toml` with all members
-- [ ] Create all crate directories with stub `lib.rs` / `main.rs`
-- [ ] Ensure `cargo build`, `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` all pass
-- [ ] Create `CLAUDE.md` and `docs/plan.md`
-- [ ] Create `.gitignore`
+- [x] Create workspace `Cargo.toml` with all members
+- [x] Create all crate directories with stub `lib.rs` / `main.rs`
+- [x] Ensure `cargo build`, `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` all pass
+- [x] Create `CLAUDE.md` and `docs/plan.md`
+- [x] Create `.gitignore`
 
 **Tests**: `cargo build` and `cargo test` succeed with zero warnings.
 
 ---
 
-### Milestone 1 — Types
+### Milestone 1 — Types ✅
 
 **Crate**: `murmur-types`
 
 **Goal**: All shared types, identifiers, and the HLC.
 
-- [ ] `DeviceId` — 32-byte newtype, `Debug`/`Display` with hex, `Serialize`/`Deserialize`
-- [ ] `BlobHash` — 32-byte newtype, same traits
-- [ ] `NetworkId` — 32-byte newtype
-- [ ] `DeviceRole` enum (`Source`, `Backup`, `Full`)
-- [ ] `DeviceInfo` struct
-- [ ] `FileMetadata` struct
-- [ ] `AccessGrant` and `AccessScope`
-- [ ] `Action` enum (all variants listed in Key Data Types above)
-- [ ] `HybridClock` — same implementation as Shoal (`tick()`, `witness()`, monotonic)
-- [ ] `GossipPayload` enum for gossip messages (DAG entries, membership events)
+- [x] `DeviceId` — 32-byte newtype, `Debug`/`Display` with hex, `Serialize`/`Deserialize`
+- [x] `BlobHash` — 32-byte newtype, same traits
+- [x] `NetworkId` — 32-byte newtype
+- [x] `DeviceRole` enum (`Source`, `Backup`, `Full`)
+- [x] `DeviceInfo` struct
+- [x] `FileMetadata` struct
+- [x] `AccessGrant` and `AccessScope`
+- [x] `Action` enum (all variants listed in Key Data Types above)
+- [x] `HybridClock` — same implementation as Shoal (`tick()`, `witness()`, monotonic)
+- [x] `GossipPayload` enum for gossip messages (DAG entries, membership events)
 
 **Tests** (≥15):
 
@@ -383,22 +403,22 @@ platforms/
 
 ---
 
-### Milestone 2 — Seed
+### Milestone 2 — Seed ✅
 
 **Crate**: `murmur-seed`
 
 **Goal**: BIP39 mnemonic generation, seed derivation, key management.
 
-- [ ] Generate new mnemonic (12 or 24 words, user's choice)
-- [ ] Validate existing mnemonic
-- [ ] Mnemonic → 64-byte seed (BIP39 standard, optional passphrase)
-- [ ] HKDF derivation with domain separation:
+- [x] Generate new mnemonic (12 or 24 words, user's choice)
+- [x] Validate existing mnemonic
+- [x] Mnemonic → 64-byte seed (BIP39 standard, optional passphrase)
+- [x] HKDF derivation with domain separation:
   - `network_id`: `hkdf(seed, info="murmur/network-id")` → blake3 → `NetworkId`
   - `alpn`: `"murmur/0/" + hex(network_id)[..16]`
   - `first_device_key`: `hkdf(seed, info="murmur/first-device-key")` → Ed25519 `SigningKey`
-- [ ] `NetworkIdentity` struct that holds all derived values
-- [ ] `DeviceKeyPair` — generate random Ed25519 keypair for non-first devices
-- [ ] Persist device keypair to disk (encrypted at rest with seed-derived key, future; plaintext for v1)
+- [x] `NetworkIdentity` struct that holds all derived values
+- [x] `DeviceKeyPair` — generate random Ed25519 keypair for non-first devices
+- [x] Persist device keypair to disk (plaintext for v1; encrypted at rest deferred to M11)
 
 **Tests** (≥12):
 
@@ -415,295 +435,395 @@ platforms/
 
 ---
 
-### Milestone 3 — DAG
+### Milestone 3 — DAG ✅
 
 **Crate**: `murmur-dag`
 
 **Goal**: Signed append-only DAG, adapted from Shoal's `shoal-logtree`. This is the core CRDT.
 **The DAG is in-memory only.** The platform is responsible for persisting and loading entries.
 
-Adapt from Shoal:
+- [x] `DagEntry` — same fields as Shoal's LogEntry, using our Action enum
+- [x] `DagEntry::new_signed()` — create, hash (blake3), sign (ed25519)
+- [x] `DagEntry::verify_hash()` and `verify_signature()`
+- [x] `DagEntry::to_bytes()` / `from_bytes()` — postcard serialization for platform persistence
+- [x] `Dag` struct — owns in-memory entry store, tips, clock, device_id, signing_key
+- [x] `Dag::load_entry()` — platform feeds a persisted entry back on startup
+- [x] `Dag::append()` — tick HLC, get tips as parents, sign, store in memory, update tips, apply to state, return new entry
+- [x] `Dag::receive_entry()` — verify hash+sig, check parents exist, store, update tips, apply
+- [x] `Dag::apply_sync_entries()` — batch receive with topological ordering
+- [x] `Dag::compute_delta()` — given remote tips, compute entries to send (Kahn's toposort)
+- [x] `Dag::maybe_merge()` — auto-merge when multiple tips exist
+- [x] Materialized state: `apply_to_state()` for all Action variants
 
-- `LogEntry` → `DagEntry` (same structure: hlc, device_id, action, parents, hash, signature)
-- `LogTree` → `Dag` (append, receive_entry, merge, sync)
-- Drop: `LogTreeStore`'s Fjall backend. The DAG stores entries in a `HashMap` in memory.
-  On startup, the platform feeds entries back into the DAG. The DAG emits new entries
-  via callbacks for the platform to persist however it wants.
-
-Key changes from Shoal:
-
-- Replace `Action::Put/Delete` (S3 objects) with our `Action` enum (devices, files, access)
-- Replace `Version` / bucket/key state with `MaterializedState` (devices map, files map, grants)
-- No disk backend — in-memory `HashMap<[u8; 32], DagEntry>` + `HashSet<[u8; 32]>` for tips
-- Keep: hash computation, signature verification, tip management, topological sort, delta sync
-
-- [ ] `DagEntry` — same fields as Shoal's LogEntry, using our Action enum
-- [ ] `DagEntry::new_signed()` — create, hash (blake3), sign (ed25519)
-- [ ] `DagEntry::verify_hash()` and `verify_signature()`
-- [ ] `DagEntry::to_bytes()` / `from_bytes()` — postcard serialization for platform persistence
-- [ ] `Dag` struct — owns in-memory entry store, tips, clock, device_id, signing_key
-- [ ] `Dag::load_entry()` — platform feeds a persisted entry back on startup
-- [ ] `Dag::append()` — tick HLC, get tips as parents, sign, store in memory, update tips, apply to state, **return the new entry** for the platform to persist
-- [ ] `Dag::receive_entry()` — verify hash+sig, check parents exist, store, update tips, apply. Returns the entry for platform persistence.
-- [ ] `Dag::apply_sync_entries()` — batch receive with topological ordering
-- [ ] `Dag::compute_delta()` — given remote tips, compute entries to send (Kahn's toposort)
-- [ ] `Dag::maybe_merge()` — auto-merge when multiple tips exist
-- [ ] Materialized state: `apply_to_state()` processes each Action variant
-  - `DeviceApproved` → insert into devices map
-  - `DeviceRevoked` → mark as revoked
-  - `FileAdded` → insert into files map
-  - `FileDeleted` → remove from files map
-  - `AccessGranted` → add to grants list
-  - `AccessRevoked` → remove from grants list
-
-**Tests** (≥30):
-
-- Append single entry, verify hash and signature
-- Append multiple entries, verify DAG chain (parents correct)
-- Receive remote entry, verify it's stored
-- Reject entry with bad hash
-- Reject entry with bad signature
-- Reject entry with missing parents
-- Two devices append concurrently → merge produces single tip
-- Delta computation: device A has entries B doesn't → correct delta
-- Topological sort ordering
-- Materialized state: approve device → appears in devices map
-- Materialized state: revoke device → marked revoked
-- Materialized state: add file → appears in files map
-- Materialized state: delete file → removed from files map
-- Materialized state: grant access → appears in grants
-- Materialized state: revoke access → removed from grants
-- LWW conflict resolution (higher HLC wins)
-- LWW tiebreak (higher DeviceId wins when HLC equal)
-- Snapshot and state hash
-- Load entries on startup: feed entries → correct materialized state
-- Serialization roundtrip: `to_bytes()` / `from_bytes()` for all entry types
-- Sync roundtrip: two DAGs, diverge, sync, converge
+**Tests**: ≥30 passing.
 
 ---
 
-### Milestone 4 — Network
+### Milestone 4 — Network ✅
 
 **Crate**: `murmur-net`
 
 **Goal**: iroh QUIC transport + gossip, adapted from Shoal's `shoal-net` and `shoal-cluster`.
 
-- [ ] `MurmurMessage` enum (wire protocol):
-  - `DagEntryBroadcast { entry_bytes }` — gossip a new DAG entry
-  - `DagSyncRequest { tips }` — request missing entries
-  - `DagSyncResponse { entries }` — response with missing entries
-  - `BlobPush { blob_hash, data }` — push file data to backup
-  - `BlobPushAck { blob_hash, ok }` — acknowledge blob stored
-  - `BlobRequest { blob_hash }` — request a blob
-  - `BlobResponse { blob_hash, data }` — response with blob data
-  - `AccessRequest { from, scope }` — request temporary access
-  - `AccessResponse { grant }` — response with signed grant (or rejection)
-  - `Ping { timestamp }` / `Pong { timestamp }`
-- [ ] `MurmurTransport` — wraps iroh `Endpoint`:
-  - Connection pooling (same as Shoal)
-  - Length-prefixed postcard messages over QUIC streams
-  - `send_to()`, `request_response()` (uni and bi streams)
-  - `push_blob()`, `pull_blob()` — blob transfer with blake3 verification
-  - `pull_dag_entries()` — DAG sync
-- [ ] `GossipService` — adapted from Shoal:
-  - `TopicId = blake3(network_id)` (derived from seed)
-  - `subscribe_and_join()` with bootstrap peers
-  - Receiver loop: dispatch DAG entries to engine via channel
-  - `broadcast_payload()` for outgoing entries
-- [ ] ALPN derivation: `network_alpn(network_id)` → `"murmur/0/<hex prefix>"`
-  - Nodes with wrong seed can't even complete QUIC handshake
+- [x] `MurmurMessage` enum (all variants: DagEntryBroadcast, DagSyncRequest/Response, BlobPush/PushAck/Request/Response, AccessRequest/Response, Ping/Pong)
+- [x] `MurmurTransport` — iroh `Endpoint` wrapper with connection pooling, length-prefixed postcard over QUIC
+- [x] `push_blob()`, `pull_blob()` — blob transfer with blake3 verification
+- [x] `pull_dag_entries()` — DAG sync
+- [x] `GossipService` — TopicId from network_id, subscribe_and_join, broadcast_payload
+- [x] ALPN isolation: `network_alpn(network_id)` → `"murmur/0/<hex prefix>"`
 
-**Tests** (≥20):
-
-- Message roundtrip serialization for every variant
-- Two endpoints connect, exchange Ping/Pong
-- Blob push + verify blake3 on receive
-- Blob push with corruption → rejected
-- DAG sync: two nodes, one has entries the other doesn't
-- Gossip: broadcast entry, verify all subscribers receive it
-- ALPN isolation: different network IDs can't connect
-- Connection pooling: multiple messages reuse connection
+**Tests**: ≥20 passing.
 
 ---
 
-### Milestone 5 — Engine
+### Milestone 5 — Engine ✅
 
 **Crate**: `murmur-engine`
 
-**Goal**: The orchestrator that ties DAG and network together. The engine is
-**storage-agnostic** — it does not read or write to disk. It communicates with
-the platform via events and callbacks.
+**Goal**: The orchestrator that ties DAG and network together. Storage-agnostic; communicates with the platform via events and callbacks.
 
-- [ ] `MurmurEngine` struct — the main entry point:
-  - Owns: `Dag`, `MurmurTransport`, `GossipService`
-  - Initialized with `NetworkIdentity` (from seed) + device keypair
-  - The platform feeds persisted DAG entries on startup via `load_entry()`
-- [ ] **Platform callbacks** (the engine calls these, the platform implements them):
-  - `on_dag_entry(entry_bytes: Vec<u8>)` — persist a new DAG entry
-  - `on_blob_received(blob_hash: BlobHash, data: Vec<u8>)` — store a received blob
-  - `on_blob_needed(blob_hash: BlobHash) → Option<Vec<u8>>` — load a blob for transfer
-  - `on_event(event: EngineEvent)` — notify UI of state changes
-- [ ] **Device management**:
-  - `create_network()` — first device, auto-approved
-  - `join_network()` — new device, broadcasts join request
-  - `approve_device(device_id)` — approve a pending device
-  - `revoke_device(device_id)` — remove a device
-  - `list_devices()` → `Vec<DeviceInfo>`
-  - `pending_requests()` → `Vec<DeviceJoinRequest>`
-- [ ] **Push sync**:
-  - `add_file(blob_hash, metadata, data)` — the platform provides the hash and bytes,
-    the engine creates a DAG entry, gossips it, pushes the blob to backup nodes
-  - Push queue: retry on failure, skip already-synced
-- [ ] **Pull access**:
-  - `request_access(device_id, scope)` — send access request
-  - `handle_access_request(from, scope)` → return grant or rejection
-  - `fetch_blob(device_id, blob_hash)` — pull a blob using an active grant
-- [ ] **DAG sync loop**:
-  - On gossip receive: apply entry to local DAG, call `on_dag_entry` for persistence
-  - Periodic full sync with known peers (pull missing entries)
-  - On new peer join: full DAG transfer
-- [ ] **Event system**:
-  - `EngineEvent` enum: `DeviceJoinRequested`, `DeviceApproved`, `FileSynced`, `AccessRequested`, etc.
+- [x] `MurmurEngine` struct — owns Dag, MurmurTransport, GossipService
+- [x] Platform callbacks: `on_dag_entry`, `on_blob_received`, `on_blob_needed`, `on_event`
+- [x] Device management: `create_network`, `join_network`, `approve_device`, `revoke_device`, `list_devices`, `pending_requests`
+- [x] Push sync: `add_file` with deduplication and push queue
+- [x] Pull access: `request_access`, `handle_access_request`, `fetch_blob`
+- [x] DAG sync loop: gossip receive → apply → persist callback; periodic full sync
+- [x] `EngineEvent` enum: DeviceJoinRequested, DeviceApproved, FileSynced, AccessRequested, etc.
 
-**Tests** (≥25):
-
-- Create network → first device in peer list
-- Join network → join request appears on existing device
-- Approve device → new device in peer list on all devices
-- Revoke device → device removed from peer list
-- Add file → DAG entry created, `on_dag_entry` callback called
-- Add duplicate file → deduplicated (no new DAG entry)
-- Push file to backup → `on_blob_received` called on backup
-- Request access → pending on target device
-- Grant access → requester can fetch blob
-- Deny access → requester gets rejection
-- Access expiration → fetch after expiry fails
-- Two devices add files concurrently → both appear after sync
-- Full sync: new device joins, gets complete file list
-- Callbacks: all platform callbacks are invoked correctly
+**Tests**: ≥25 passing.
 
 ---
 
-### Milestone 6 — Server Daemon
+### Milestone 6 — Server Daemon ✅
 
 **Crate**: `murmurd`
 
 **Goal**: Headless backup server daemon. Runs on a NAS, Raspberry Pi, or VPS.
-This is the first "platform implementation" — it implements the platform callbacks
-that `murmur-engine` expects, using Fjall for DAG persistence and filesystem for blobs.
 
-`murmurd` is typically the first device in the network: the user generates a mnemonic,
-starts the daemon, and then connects phones/tablets to it.
+- [x] CLI: `murmurd init`, `murmurd init --join <mnemonic>`, `murmurd start`, `murmurd approve <device_id>`, `murmurd status`
+- [x] Config file (`~/.murmur/config.toml`) with device name/role and storage paths
+- [x] Platform callbacks: Fjall for DAG persistence, content-addressed filesystem for blobs
+- [x] Startup: load all DAG entries from Fjall → feed into engine
+- [x] Auto-approve mode (config flag)
+- [x] Signal handling: graceful shutdown on SIGTERM/SIGINT
+- [x] Systemd service file example in `docs/`
 
-- [ ] CLI (clap), minimal:
-  - `murmurd init` — generate mnemonic, create network, store seed, start
-  - `murmurd init --join <mnemonic>` — join existing network as backup node
-  - `murmurd start` — start daemon (reads config from `~/.murmur/config.toml`)
-  - `murmurd approve <device_id>` — approve pending device (one-shot command)
-  - `murmurd status` — print network status, connected devices, then exit
-- [ ] Config file (`~/.murmur/config.toml`):
-
-  ```toml
-  [device]
-  name = "Home NAS"
-  role = "backup"
-
-  [storage]
-  blob_dir = "/data/murmur/blobs"
-  data_dir = "/data/murmur/db"       # Fjall
-  ```
-
-- [ ] Platform callbacks implementation:
-  - `on_dag_entry` → persist to Fjall
-  - `on_blob_received` → write to `blob_dir` (content-addressed: `ab/cd/<hash>`)
-  - `on_blob_needed` → read from `blob_dir`
-  - `on_event` → log via `tracing`
-- [ ] Startup: load all DAG entries from Fjall → feed into engine via `load_entry()`
-- [ ] Auto-approve mode (optional config flag): automatically approve new devices
-      that present the correct network ID. Useful for home setups.
-- [ ] Signal handling: graceful shutdown on SIGTERM/SIGINT
-- [ ] Systemd service file example in `docs/`
-
-**Tests** (≥10):
-
-- Init creates config and data directories
-- Init with `--join` and valid mnemonic succeeds
-- Init with invalid mnemonic fails with clear error
-- Config parsing roundtrip
-- Blob storage: write and read back with blake3 verification
-- DAG persistence: write entries, restart, verify they reload
-- Daemon start/stop lifecycle
-- Auto-approve mode: new device auto-approved when flag is set
+**Tests**: ≥10 passing.
 
 ---
 
-### Milestone 7 — Integration Tests
+### Milestone 7 — Integration Tests ✅
 
 **Directory**: `tests/`
 
 **Goal**: End-to-end tests simulating real multi-device scenarios.
 
-- [ ] **Two-device sync**: Device A creates network, device B joins, A approves, both sync files
-- [ ] **Three-device topology**: Phone (source) → NAS (backup), Tablet requests access from Phone
-- [ ] **Concurrent edits**: Two devices add files simultaneously, DAGs merge correctly
-- [ ] **Offline reconnect**: Device goes offline, adds files, reconnects, syncs
-- [ ] **Device revocation**: Revoked device can no longer sync or access
-- [ ] **Access grant lifecycle**: Request → grant → use → expiry
-- [ ] **Large file transfer**: Multi-MB file push and pull with integrity verification
-- [ ] **Deduplication**: Same file added on two devices → stored once on backup
-- [ ] **DAG convergence**: After network partition heals, all devices reach same state
+- [x] Two-device sync: A creates network, B joins, A approves, both sync files
+- [x] Three-device topology: Phone → NAS (backup), Tablet requests access from Phone
+- [x] Concurrent edits: two devices add files simultaneously, DAGs merge correctly
+- [x] Offline reconnect: device goes offline, adds files, reconnects, syncs
+- [x] Device revocation: revoked device can no longer sync or access
+- [x] Access grant lifecycle: request → grant → use → expiry
+- [x] Large file transfer: multi-MB file push and pull with integrity verification
+- [x] Deduplication: same file added on two devices → stored once on backup
+- [x] DAG convergence: after network partition heals, all devices reach same state
 
-**Tests** (≥20 integration tests):
-All scenarios above, tested with in-memory transport (no real network needed).
+**Tests**: ≥20 integration tests passing, using in-memory transport.
 
 ---
 
-## Future Milestones (not yet planned in detail)
+---
 
-### Milestone 8 — Mobile: Core Library (`murmur-core`)
+### Milestone 8 — FFI Core Library (`murmur-ffi`)
 
-- Build `murmur-core` as static library for Android (`cargo-ndk`) and iOS (xcframework)
-- Define FFI boundary (UniFFI or manual C FFI — TBD)
-- Expose: init, join, approve, list_devices, add_file, sync status, events callback
-- **iroh on mobile**: iroh already cross-compiles and runs on Android and iOS natively.
-  `n0-computer/iroh-ffi` provides UniFFI-based bindings (Swift, Kotlin, Python) but
-  releases are currently **paused** — n0 recommends writing your own thin wrapper around
-  iroh that exposes only what your app needs, rather than wrapping iroh's full API.
-  This is exactly our approach: the FFI boundary is at the `murmur-engine` level, not
-  at iroh. iroh is an internal implementation detail of the Rust core. The mobile apps
-  call `murmur_create_network()`, `murmur_join()`, `murmur_approve()`, etc. — they
-  never touch iroh types directly.
+**Crate**: `murmur-ffi` (new crate, added to workspace)
+
+**Goal**: Expose `murmur-engine` to mobile platforms via a thin, stable C-compatible FFI
+using [UniFFI](https://mozilla.github.io/uniffi-rs/). This is the **only** boundary mobile
+apps cross. iroh is an internal detail — mobile code never sees iroh types.
+
+**FFI surface** (defined in `murmur.udl`):
+
+```udl
+namespace murmur {
+    MurmurHandle create_network(string device_name, string mnemonic, PlatformCallbacks callbacks);
+    MurmurHandle join_network(string device_name, string mnemonic, PlatformCallbacks callbacks);
+};
+
+interface MurmurHandle {
+    void load_dag_entry(bytes entry_bytes);
+    void start();
+    void stop();
+    void approve_device(string device_id_hex);
+    void revoke_device(string device_id_hex);
+    sequence<DeviceInfoFfi> list_devices();
+    sequence<DeviceInfoFfi> pending_requests();
+    void add_file(bytes blob_hash, FileMetadataFfi metadata, bytes data);
+    void request_access(string device_id_hex, AccessScopeFfi scope);
+    bytes? fetch_blob(string device_id_hex, bytes blob_hash);
+};
+
+callback interface PlatformCallbacks {
+    void on_dag_entry(bytes entry_bytes);
+    void on_blob_received(bytes blob_hash, bytes data);
+    bytes? on_blob_needed(bytes blob_hash);
+    void on_event(MurmurEventFfi event);
+};
+```
+
+- [ ] `crates/murmur-ffi/` — new crate with `uniffi` as build dependency
+- [ ] `murmur.udl` — UniFFI definition file
+- [ ] Thin wrapper types: `DeviceInfoFfi`, `FileMetadataFfi`, `AccessScopeFfi`, `MurmurEventFfi`
+  - All byte arrays as `Vec<u8>`, all IDs as hex strings or raw bytes
+  - No iroh types, no `ed25519-dalek` types crossing the boundary
+- [ ] `MurmurHandle` — wraps `Arc<Mutex<MurmurEngine>>`, thread-safe
+- [ ] Async bridging: `tokio::runtime::Runtime` owned by `MurmurHandle`, all async engine
+  calls driven from it. FFI surface is fully synchronous (mobile calls from any thread).
+- [ ] Build targets:
+  - Android: `cargo-ndk` → `jniLibs/` (arm64-v8a, armeabi-v7a, x86_64)
+  - iOS: `cargo-lipo` or `xcodebuild` xcframework (arm64 device + arm64-sim + x86_64-sim)
+- [ ] `build.rs` to invoke `uniffi_bindgen` → generate Kotlin + Swift bindings
+
+**Build instructions** (in `crates/murmur-ffi/README.md`):
+
+```bash
+# Android
+cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o ./jniLibs build --release -p murmur-ffi
+
+# iOS (xcframework)
+cargo build --release --target aarch64-apple-ios -p murmur-ffi
+cargo build --release --target aarch64-apple-ios-sim -p murmur-ffi
+xcodebuild -create-xcframework \
+  -library target/aarch64-apple-ios/release/libmurmur_ffi.a \
+  -library target/aarch64-apple-ios-sim/release/libmurmur_ffi.a \
+  -output MurmurCore.xcframework
+```
+
+**Tests** (≥10):
+
+- [ ] All FFI wrapper types roundtrip through their native representations
+- [ ] `create_network()` returns a valid handle
+- [ ] `join_network()` with invalid mnemonic returns error (not panic)
+- [ ] `approve_device()` on unknown device_id returns error (not panic)
+- [ ] `add_file()` invokes `on_dag_entry` callback
+- [ ] `on_blob_needed` callback returning `None` causes `fetch_blob` to return `None`
+- [ ] `list_devices()` returns correct FFI structs after approve
+- [ ] Thread safety: concurrent calls from multiple threads don't deadlock
+- [ ] `start()` + `stop()` lifecycle — no crash, tokio runtime shuts down cleanly
+- [ ] FFI string/bytes encoding is UTF-8 and length-prefixed (UniFFI guarantees)
+
+---
 
 ### Milestone 9 — Android App
 
-- Kotlin wrapper around `murmur-core` native library
-- Foreground Service for background sync
-- DocumentsProvider for file manager integration (appear in Files app)
-- UI: device management, photo gallery, sync status
-- Camera intent / MediaStore integration for auto-upload
-- Note: iroh's QUIC transport works on Android — the Rust core handles
-  all networking. Kotlin only does OS integration (service lifecycle,
-  file provider, notifications, UI).
+**Directory**: `platforms/android/`
+
+**Goal**: Kotlin Android application that wraps `murmur-ffi`. The app manages photos and
+documents, syncing them automatically to the NAS via murmurd. iroh handles all networking
+inside the Rust core — Kotlin only does Android OS integration.
+
+**Architecture**:
+
+```
+platforms/android/
+  app/
+    src/main/
+      java/net/murmur/app/
+        MurmurService.kt       # Foreground Service — runs the engine
+        MurmurEngine.kt        # Kotlin wrapper around MurmurHandle (FFI)
+        DeviceViewModel.kt     # StateFlow-based ViewModel for device list
+        FileViewModel.kt       # StateFlow-based ViewModel for file list
+        ui/
+          MainActivity.kt
+          DeviceScreen.kt      # Approve/revoke devices
+          FileScreen.kt        # Photo/file grid
+          SyncStatusBar.kt
+      jniLibs/                 # .so files from cargo-ndk
+      assets/
+        murmur.udl             # copied for reference
+  build.gradle.kts
+  settings.gradle.kts
+```
+
+- [ ] Gradle project setup: `cargo-ndk` build task in `build.gradle.kts`
+- [ ] `MurmurService` — Android Foreground Service:
+  - Starts on boot (BOOT_COMPLETED receiver)
+  - Holds a `MurmurHandle` — calls `start()` on service start, `stop()` on destroy
+  - Implements `PlatformCallbacks`:
+    - `on_dag_entry` → Room database insert
+    - `on_blob_received` → write to app-private storage (`filesDir/blobs/`)
+    - `on_blob_needed` → read from `filesDir/blobs/`
+    - `on_event` → broadcast LocalBroadcastManager intent → update UI via ViewModel
+  - Loads all DAG entries from Room on startup → calls `load_dag_entry()` for each
+- [ ] Room database:
+  - `DagEntryEntity(hash TEXT PRIMARY KEY, data BLOB)` — stores raw postcard bytes
+  - `DagEntryDao` with insert + loadAll
+- [ ] `DocumentsProvider` subclass — exposes synced files in Android Files app:
+  - `queryRoots()` → one root per network
+  - `queryChildDocuments()` → list files from engine's `list_files()`
+  - `openDocument()` → stream blob from `filesDir/blobs/`
+- [ ] MediaStore / PhotoPicker integration for auto-upload:
+  - `ContentObserver` on `MediaStore.Images` → detects new photos
+  - Hashes new photo, calls `engine.add_file()`
+- [ ] UI (Jetpack Compose):
+  - Device list screen: pending requests with approve/deny buttons
+  - File grid screen: thumbnails of synced files
+  - Sync status notification with progress
+- [ ] Notification channel for sync status and join requests
+
+**Tests** (≥10):
+
+- [ ] `MurmurService` starts and binds without crash
+- [ ] `on_dag_entry` callback persists to Room
+- [ ] Startup loads Room entries and calls `load_dag_entry()`
+- [ ] `on_blob_received` writes file to expected path
+- [ ] `on_blob_needed` reads file back correctly
+- [ ] `DocumentsProvider.queryRoots()` returns correct root
+- [ ] `DocumentsProvider.queryChildDocuments()` lists synced files
+- [ ] New photo in MediaStore triggers `add_file()`
+- [ ] Approve device flow: join request appears in UI → tap approve → device approved
+- [ ] Service survives process death and restarts (WorkManager or sticky service)
+
+---
 
 ### Milestone 10 — iOS App
 
-- Swift wrapper around `murmur-core` native library
-- File Provider Extension for Files.app integration
-- Background App Refresh + BGProcessingTask for periodic sync
-- NSURLSession background transfers for large files (when app is suspended)
-- PhotoKit integration for camera roll auto-upload
-- Note: same as Android — iroh runs natively, Swift only does OS glue.
-  The iroh-ffi Swift package on SPM can be referenced for patterns, but
-  we wrap murmur-engine, not iroh.
+**Directory**: `platforms/ios/`
+
+**Goal**: Swift iOS application wrapping `murmur-ffi` via the generated Swift bindings.
+iroh runs natively in the Rust core; Swift only handles iOS OS integration.
+
+**Architecture**:
+
+```
+platforms/ios/
+  MurmurApp/
+    MurmurApp.swift           # @main, App lifecycle
+    MurmurEngine.swift        # Swift wrapper around MurmurHandle
+    MurmurService.swift       # Background task management
+    PlatformCallbacksImpl.swift # implements PlatformCallbacks protocol
+    Persistence/
+      CoreDataStack.swift     # DAG entry persistence
+      DagEntry+CoreData.swift
+      BlobStore.swift         # Content-addressed blob storage in app container
+    UI/
+      DeviceListView.swift
+      FileGridView.swift
+      SyncStatusView.swift
+    FileProvider/
+      FileProviderExtension.swift
+      FileProviderItem.swift
+  MurmurCore.xcframework/     # built from murmur-ffi
+  Package.swift               # SwiftPM (if using SPM for the framework)
+```
+
+- [ ] Xcode project + SwiftPM integration for `MurmurCore.xcframework`
+- [ ] `MurmurEngine.swift` — wraps `MurmurHandle`, manages object lifecycle
+- [ ] `PlatformCallbacksImpl` — implements the generated `PlatformCallbacks` protocol:
+  - `onDagEntry(entryBytes:)` → Core Data insert
+  - `onBlobReceived(blobHash:data:)` → write to `FileManager.default.containerURL()/blobs/`
+  - `onBlobNeeded(blobHash:)` → read from same location
+  - `onEvent(event:)` → post `NotificationCenter` notification → update SwiftUI state
+- [ ] Core Data model:
+  - `DagEntryMO`: `hash: String` (PK), `data: Data`
+  - On startup: fetch all → call `loadDagEntry()` for each
+- [ ] File Provider Extension (`MurmurFileProvider`):
+  - `NSFileProviderManager` + `NSFileProviderItem` per synced file
+  - `startProvidingItem(at:completionHandler:)` → `fetchBlob()` on demand
+  - `importDocument(at:toParentItemIdentifier:completionHandler:)` → `addFile()`
+- [ ] Background sync:
+  - `BGProcessingTask` for periodic full DAG sync when app is in background
+  - `BGAppRefreshTask` for lightweight heartbeat (check for pending approvals)
+  - `NSURLSession` background transfer for large blobs (delegates to Rust core)
+- [ ] PhotoKit integration:
+  - `PHPhotoLibraryChangeObserver` → detect new photos
+  - Hash + `addFile()` on new asset
+- [ ] SwiftUI views: device list with approve sheet, file grid, sync status bar
+
+**Tests** (≥10):
+
+- [ ] `MurmurEngine` initializes without crash
+- [ ] `onDagEntry` persists to Core Data
+- [ ] Startup loads Core Data entries correctly
+- [ ] `onBlobReceived` writes to expected path in container
+- [ ] `onBlobNeeded` reads blob back
+- [ ] File Provider item count matches `listFiles()` count
+- [ ] `startProvidingItem` triggers `fetchBlob()`
+- [ ] PhotoKit observer fires on new photo → `addFile()` called
+- [ ] `BGProcessingTask` handler runs without crashing
+- [ ] Approve device flow: join request notification → approve → device in list
+
+---
 
 ### Milestone 11 — Hardening
 
-- Encrypted blob storage at rest (seed-derived key)
-- Encrypted mnemonic/seed storage on disk
-- Rate limiting, bandwidth throttling
-- Compression (zstd) for blob transfer
-- Chunking for large files (avoid loading entire file in memory)
-- Progress reporting for large transfers
+**Crates**: across all crates, primarily `murmur-engine`, `murmurd`, `murmur-ffi`
+
+**Goal**: Production-quality security, performance, and reliability. No new public API —
+all changes are internal improvements and new configuration options.
+
+**Security**:
+
+- [ ] **Encrypted blob storage at rest**: AES-256-GCM with a key derived via
+  `hkdf(seed, info="murmur/blob-encryption-key")`. `murmurd` and mobile platforms
+  encrypt before write, decrypt after read. Core is unchanged (bytes in = bytes out).
+- [ ] **Encrypted seed/keypair on disk**: In `murmurd`, wrap the stored seed and device
+  keypair with a password-derived key (Argon2id). CLI prompts for password on `start`.
+  Optional: keyring integration (Secret Service on Linux, Keychain on macOS/iOS, Keystore on Android).
+- [ ] **Gossip message authentication**: already handled by DAG signatures, but add
+  explicit sender verification in `GossipService` to reject messages from unknown devices
+  before they reach the DAG layer.
+
+**Performance**:
+
+- [ ] **Chunked blob transfer**: split blobs > 4 MB into 1 MB chunks. Stream chunks over
+  the QUIC connection instead of buffering the entire file in memory. Sender and receiver
+  both process chunk-by-chunk. Add `BlobPushChunk` / `BlobPullChunk` message variants.
+- [ ] **zstd compression**: compress DAG entry bytes before gossip broadcast and before
+  writing to Fjall. Add `Compressed { algorithm, data }` wrapper in `MurmurMessage`.
+  For blobs, compress text/JSON/document MIME types; skip already-compressed types
+  (JPEG, PNG, MP4).
+- [ ] **Bandwidth throttling**: configurable upload/download rate limit in `murmurd`
+  config (tokens-per-second bucket). Primarily for NAS deployments on metered links.
+- [ ] **Push queue persistence**: in `murmurd`, store the pending push queue in Fjall
+  so it survives daemon restarts. Currently in-memory only.
+
+**Observability**:
+
+- [ ] **Progress events**: add `EngineEvent::BlobTransferProgress { blob_hash, bytes_sent, total_bytes }`
+  so UIs can show a real progress bar for large transfers.
+- [ ] **Metrics**: optional `prometheus` feature flag in `murmurd` exposing:
+  - `murmur_dag_entries_total` (counter)
+  - `murmur_blobs_stored_bytes` (gauge)
+  - `murmur_sync_duration_seconds` (histogram)
+  - `murmur_connected_peers` (gauge)
+- [ ] **Health endpoint**: optional HTTP endpoint (`--http-port`) in `murmurd` serving
+  `/health` (JSON: status, peer count, last sync time) for monitoring systems.
+
+**Reliability**:
+
+- [ ] **DAG compaction**: after N entries, emit a `Snapshot` entry capturing the full
+  `MaterializedState`. Peers that are far behind can fast-forward to the snapshot instead
+  of replaying the full history. Old entries before the snapshot can be archived.
+- [ ] **Retry with backoff**: push queue retries should use exponential backoff with jitter
+  (currently linear). Max retry interval: 30 minutes. Persist retry count in Fjall.
+- [ ] **Peer discovery via mDNS**: use `mdns-sd` crate for LAN peer discovery, supplementing
+  iroh's relay-based discovery. Reduces latency for local network syncs significantly.
+
+**Tests** (≥15):
+
+- [ ] Encrypted blob: write encrypted, read back, verify plaintext matches
+- [ ] Encrypted blob: tampered ciphertext → decryption error, blob rejected
+- [ ] Encrypted seed: persist encrypted, reload with correct password → success
+- [ ] Encrypted seed: reload with wrong password → error
+- [ ] Chunked transfer: 8 MB file sent in 8 chunks, reassembled correctly on receiver
+- [ ] Chunked transfer: corruption in chunk 3 → rejected, blake3 mismatch reported
+- [ ] zstd roundtrip: compress DAG entry, decompress, verify identical
+- [ ] Bandwidth throttle: upload speed stays within configured limit (±10%)
+- [ ] Push queue persists across daemon restart: pending blobs re-queued on startup
+- [ ] Progress events: `BlobTransferProgress` events fired for large transfers
+- [ ] Snapshot entry: create snapshot, new peer joins, syncs via snapshot, not full history
+- [ ] mDNS discovery: two daemons on LAN discover each other without relay
 
 ---
 
