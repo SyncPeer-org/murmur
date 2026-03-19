@@ -17,10 +17,11 @@ For each milestone: implement, test, `cargo clippy -- -D warnings`, `cargo fmt`,
 | 5 — Engine | ✅ Complete |
 | 6 — Server Daemon | ✅ Complete |
 | 7 — Integration Tests | ✅ Complete |
-| 8 — FFI Core Library | 🔲 Next |
-| 9 — Android App | 🔲 Planned |
-| 10 — iOS App | 🔲 Planned |
-| 11 — Hardening | 🔲 Planned |
+| 8 — COSMIC Desktop App | 🔲 Next |
+| 9 — FFI Core Library | 🔲 Planned |
+| 10 — Android App | 🔲 Planned |
+| 11 — iOS App | 🔲 Planned |
+| 12 — Hardening | 🔲 Planned |
 
 The entire Rust core is implemented and tested. The server daemon (`murmurd`) runs as a headless
 backup node. Next step is exposing the core via FFI so mobile platforms can consume it.
@@ -534,7 +535,63 @@ platforms/
 
 ---
 
-### Milestone 8 — FFI Core Library (`murmur-ffi`)
+### Milestone 8 — COSMIC Desktop App
+
+**Crate**: `murmur-desktop`
+
+**Goal**: A graphical desktop application for Pop!\_OS (COSMIC) and other Linux desktops.
+Built with [`iced`](https://iced.rs) — the pure-Rust UI toolkit that COSMIC is built on —
+so it looks native on Pop!\_OS. This is the second "platform implementation" after `murmurd`,
+providing a full GUI instead of a headless CLI.
+
+Unlike `murmurd` (headless backup daemon), `murmur-desktop` is a user-facing app with device
+management, file browsing, and sync status. It reuses the same storage pattern (Fjall + filesystem)
+and implements the same `PlatformCallbacks` trait, with the addition of an event channel that
+drives UI updates.
+
+**Architecture**:
+
+```
+crates/murmur-desktop/
+  Cargo.toml
+  src/
+    main.rs         # iced Application: state, Message, update, view
+    storage.rs      # Fjall + filesystem + DesktopPlatform (PlatformCallbacks)
+```
+
+- [ ] `iced` application with dark theme (matches COSMIC default)
+- [ ] **Setup screen**: device name input, create/join network toggle, mnemonic
+  generation or entry, error display
+- [ ] **Main screen** with sidebar navigation:
+  - **Devices tab**: approved device list with revoke, pending requests with approve
+  - **Files tab**: file list with metadata, add file by path
+  - **Status tab**: device ID, DAG entry count, event log
+- [ ] `DesktopPlatform` — implements `PlatformCallbacks`:
+  - `on_dag_entry` → persist to Fjall
+  - `on_blob_received` → write to content-addressed filesystem
+  - `on_blob_needed` → read from filesystem (with blake3 verification)
+  - `on_event` → push to `Arc<Mutex<Vec<EngineEvent>>>` → UI drains on update
+- [ ] Storage: same Fjall + filesystem pattern as `murmurd`
+- [ ] Persistent config at `~/.murmur-desktop/config.toml`; auto-loads on startup
+  if already initialized
+- [ ] File add: read from filesystem path, compute blake3, create `FileAdded` DAG entry
+
+**Tests** (≥10):
+
+- [ ] Storage open creates directories
+- [ ] Blob store and load roundtrip
+- [ ] Blob load with blake3 verification
+- [ ] Blob load missing returns None
+- [ ] DAG entry persist and reload
+- [ ] Multiple DAG entries persist across storage reopen
+- [ ] Platform callbacks: on\_dag\_entry persists
+- [ ] Platform callbacks: on\_blob\_received + on\_blob\_needed roundtrip
+- [ ] Platform callbacks: on\_event pushes to event queue
+- [ ] Config file roundtrip (TOML serialize/deserialize)
+
+---
+
+### Milestone 9 — FFI Core Library (`murmur-ffi`) (was M8)
 
 **Crate**: `murmur-ffi` (new crate, added to workspace)
 
@@ -614,7 +671,7 @@ xcodebuild -create-xcframework \
 
 ---
 
-### Milestone 9 — Android App
+### Milestone 10 — Android App (was M9)
 
 **Directory**: `platforms/android/`
 
@@ -686,7 +743,7 @@ platforms/android/
 
 ---
 
-### Milestone 10 — iOS App
+### Milestone 11 — iOS App (was M10)
 
 **Directory**: `platforms/ios/`
 
@@ -755,7 +812,7 @@ platforms/ios/
 
 ---
 
-### Milestone 11 — Hardening
+### Milestone 12 — Hardening (was M11)
 
 **Crates**: across all crates, primarily `murmur-engine`, `murmurd`, `murmur-ffi`
 
