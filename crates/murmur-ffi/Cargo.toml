@@ -1,0 +1,27 @@
+[package]
+name = "murmur-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "UniFFI FFI bindings for murmur-engine — exposes the Rust core to Android and iOS"
+
+[lib]
+# lib: for Rust-to-Rust usage (tests, other crates)
+# cdylib: for Android JNI (.so)
+# staticlib: for iOS static linking (.a)
+crate-type = ["lib", "cdylib", "staticlib"]
+name = "murmur_ffi"
+
+[dependencies]
+murmur-engine = { workspace = true }
+murmur-seed = { workspace = true }
+murmur-types = { workspace = true }
+murmur-dag = { workspace = true }
+uniffi = "0.31"
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+hex = "0.4"
+
+[build-dependencies]
+uniffi = { version = "0.31", features = ["build"] }
