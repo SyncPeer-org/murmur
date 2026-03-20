@@ -44,7 +44,7 @@ crates/
   murmur-net/        iroh QUIC + gossip broadcast
   murmur-engine/     Orchestrator (sync, approval, blob transfer)
   murmurd/           Headless backup server daemon (NAS/RPi/VPS)
-  murmur-desktop/    COSMIC/iced desktop GUI app (Pop!_OS and Linux)
+  murmur-desktop/    iced desktop GUI app (Linux, macOS, Windows)
 tests/
   integration/       Multi-device simulation tests
 ```
@@ -65,7 +65,7 @@ cargo fmt --check                    # format check
 # Headless backup daemon (NAS, RPi, VPS)
 cargo install --path crates/murmurd
 
-# COSMIC/iced desktop GUI app (Pop!_OS and Linux)
+# iced desktop GUI app (Linux, macOS, Windows)
 cargo install --path crates/murmur-desktop
 ```
 
@@ -81,7 +81,7 @@ cargo install --path crates/murmur-desktop
 | Signing        | ed25519-dalek v2   |
 | Serialization  | postcard + serde   |
 | Async          | tokio              |
-| UI (desktop)   | iced 0.13          |
+| UI (desktop)   | iced 0.14          |
 
 Desktop platforms (`murmurd`, `murmur-desktop`): fjall v3 (metadata DB), clap (CLI).
 

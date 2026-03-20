@@ -1,6 +1,6 @@
-//! Murmur desktop application for Pop!_OS (COSMIC) and Linux.
+//! Murmur desktop application for Linux, macOS, and Windows.
 //!
-//! Built with [`iced`](https://iced.rs), the same toolkit COSMIC uses.
+//! Built with [`iced`](https://iced.rs), a pure-Rust cross-platform UI toolkit.
 //! Provides a graphical interface for device management, file syncing,
 //! and network status.
 
@@ -80,8 +80,9 @@ struct App {
 
 impl Default for App {
     fn default() -> Self {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let data_dir = PathBuf::from(home).join(".murmur-desktop");
+        let data_dir = dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("murmur-desktop");
 
         let mut app = Self {
             screen: Screen::Setup,

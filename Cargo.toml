@@ -42,6 +42,7 @@ bytes = "1"
 futures-lite = "2"
 
 # Desktop / server only
+dirs = "5"
 fjall = "3"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
