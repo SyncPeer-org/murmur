@@ -5,7 +5,7 @@
 This is the **architecture and implementation plan** for Murmur. Work milestone by milestone, in order.
 For each milestone: implement, test, `cargo clippy -- -D warnings`, `cargo fmt`, stop.
 
-## Current Status (as of 2026-03-19)
+## Current Status (as of 2026-03-20)
 
 | Milestone | Status |
 | --------- | ------ |
@@ -18,8 +18,8 @@ For each milestone: implement, test, `cargo clippy -- -D warnings`, `cargo fmt`,
 | 6 — Server Daemon | ✅ Complete |
 | 7 — Integration Tests | ✅ Complete |
 | 8 — COSMIC Desktop App | ✅ Complete |
-| 9 — FFI Core Library | 🔲 Next |
-| 10 — Android App | 🔲 Planned |
+| 9 — FFI Core Library | ✅ Complete |
+| 10 — Android App | ✅ Complete |
 | 11 — iOS App | 🔲 Planned |
 | 12 — Hardening | 🔲 Planned |
 
@@ -628,18 +628,18 @@ callback interface PlatformCallbacks {
 };
 ```
 
-- [ ] `crates/murmur-ffi/` — new crate with `uniffi` as build dependency
-- [ ] `murmur.udl` — UniFFI definition file
-- [ ] Thin wrapper types: `DeviceInfoFfi`, `FileMetadataFfi`, `AccessScopeFfi`, `MurmurEventFfi`
+- [x] `crates/murmur-ffi/` — new crate with `uniffi` as build dependency
+- [x] `murmur.udl` — UniFFI definition file
+- [x] Thin wrapper types: `DeviceInfoFfi`, `FileMetadataFfi`, `AccessScopeFfi`, `MurmurEventFfi`
   - All byte arrays as `Vec<u8>`, all IDs as hex strings or raw bytes
   - No iroh types, no `ed25519-dalek` types crossing the boundary
-- [ ] `MurmurHandle` — wraps `Arc<Mutex<MurmurEngine>>`, thread-safe
-- [ ] Async bridging: `tokio::runtime::Runtime` owned by `MurmurHandle`, all async engine
+- [x] `MurmurHandle` — wraps `Arc<Mutex<MurmurEngine>>`, thread-safe
+- [x] Async bridging: `tokio::runtime::Runtime` owned by `MurmurHandle`, all async engine
   calls driven from it. FFI surface is fully synchronous (mobile calls from any thread).
-- [ ] Build targets:
+- [x] Build targets:
   - Android: `cargo-ndk` → `jniLibs/` (arm64-v8a, armeabi-v7a, x86_64)
   - iOS: `cargo-lipo` or `xcodebuild` xcframework (arm64 device + arm64-sim + x86_64-sim)
-- [ ] `build.rs` to invoke `uniffi_bindgen` → generate Kotlin + Swift bindings
+- [x] `build.rs` to invoke `uniffi_bindgen` → generate Kotlin + Swift bindings
 
 **Build instructions** (in `crates/murmur-ffi/README.md`):
 
@@ -658,16 +658,16 @@ xcodebuild -create-xcframework \
 
 **Tests** (≥10):
 
-- [ ] All FFI wrapper types roundtrip through their native representations
-- [ ] `create_network()` returns a valid handle
-- [ ] `join_network()` with invalid mnemonic returns error (not panic)
-- [ ] `approve_device()` on unknown device_id returns error (not panic)
-- [ ] `add_file()` invokes `on_dag_entry` callback
-- [ ] `on_blob_needed` callback returning `None` causes `fetch_blob` to return `None`
-- [ ] `list_devices()` returns correct FFI structs after approve
-- [ ] Thread safety: concurrent calls from multiple threads don't deadlock
-- [ ] `start()` + `stop()` lifecycle — no crash, tokio runtime shuts down cleanly
-- [ ] FFI string/bytes encoding is UTF-8 and length-prefixed (UniFFI guarantees)
+- [x] All FFI wrapper types roundtrip through their native representations
+- [x] `create_network()` returns a valid handle
+- [x] `join_network()` with invalid mnemonic returns error (not panic)
+- [x] `approve_device()` on unknown device_id returns error (not panic)
+- [x] `add_file()` invokes `on_dag_entry` callback
+- [x] `on_blob_needed` callback returning `None` causes `fetch_blob` to return `None`
+- [x] `list_devices()` returns correct FFI structs after approve
+- [x] Thread safety: concurrent calls from multiple threads don't deadlock
+- [x] `start()` + `stop()` lifecycle — no crash, tokio runtime shuts down cleanly
+- [x] FFI string/bytes encoding is UTF-8 and length-prefixed (UniFFI guarantees)
 
 ---
 
@@ -702,8 +702,8 @@ platforms/android/
   settings.gradle.kts
 ```
 
-- [ ] Gradle project setup: `cargo-ndk` build task in `build.gradle.kts`
-- [ ] `MurmurService` — Android Foreground Service:
+- [x] Gradle project setup: `cargo-ndk` build task in `build.gradle.kts`
+- [x] `MurmurService` — Android Foreground Service:
   - Starts on boot (BOOT_COMPLETED receiver)
   - Holds a `MurmurHandle` — calls `start()` on service start, `stop()` on destroy
   - Implements `PlatformCallbacks`:
@@ -712,34 +712,34 @@ platforms/android/
     - `on_blob_needed` → read from `filesDir/blobs/`
     - `on_event` → broadcast LocalBroadcastManager intent → update UI via ViewModel
   - Loads all DAG entries from Room on startup → calls `load_dag_entry()` for each
-- [ ] Room database:
+- [x] Room database:
   - `DagEntryEntity(hash TEXT PRIMARY KEY, data BLOB)` — stores raw postcard bytes
   - `DagEntryDao` with insert + loadAll
-- [ ] `DocumentsProvider` subclass — exposes synced files in Android Files app:
+- [x] `DocumentsProvider` subclass — exposes synced files in Android Files app:
   - `queryRoots()` → one root per network
   - `queryChildDocuments()` → list files from engine's `list_files()`
   - `openDocument()` → stream blob from `filesDir/blobs/`
-- [ ] MediaStore / PhotoPicker integration for auto-upload:
+- [x] MediaStore / PhotoPicker integration for auto-upload:
   - `ContentObserver` on `MediaStore.Images` → detects new photos
   - Hashes new photo, calls `engine.add_file()`
-- [ ] UI (Jetpack Compose):
+- [x] UI (Jetpack Compose):
   - Device list screen: pending requests with approve/deny buttons
   - File grid screen: thumbnails of synced files
   - Sync status notification with progress
-- [ ] Notification channel for sync status and join requests
+- [x] Notification channel for sync status and join requests
 
 **Tests** (≥10):
 
-- [ ] `MurmurService` starts and binds without crash
-- [ ] `on_dag_entry` callback persists to Room
-- [ ] Startup loads Room entries and calls `load_dag_entry()`
-- [ ] `on_blob_received` writes file to expected path
-- [ ] `on_blob_needed` reads file back correctly
-- [ ] `DocumentsProvider.queryRoots()` returns correct root
-- [ ] `DocumentsProvider.queryChildDocuments()` lists synced files
-- [ ] New photo in MediaStore triggers `add_file()`
-- [ ] Approve device flow: join request appears in UI → tap approve → device approved
-- [ ] Service survives process death and restarts (WorkManager or sticky service)
+- [x] `MurmurService` starts and binds without crash
+- [x] `on_dag_entry` callback persists to Room
+- [x] Startup loads Room entries and calls `load_dag_entry()`
+- [x] `on_blob_received` writes file to expected path
+- [x] `on_blob_needed` reads file back correctly
+- [x] `DocumentsProvider.queryRoots()` returns correct root
+- [x] `DocumentsProvider.queryChildDocuments()` lists synced files
+- [x] New photo in MediaStore triggers `add_file()`
+- [x] Approve device flow: join request appears in UI → tap approve → device approved
+- [x] Service survives process death and restarts (WorkManager or sticky service)
 
 ---
 
