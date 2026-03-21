@@ -6,7 +6,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import net.murmur.generated.MurmurEventFfi
+import uniffi.murmur.MurmurEventFfi
 
 /**
  * ViewModel that tracks synced file metadata.
@@ -39,7 +39,7 @@ class FileViewModel(private val engine: MurmurEngine) : ViewModel() {
     }
 
     /** Upload a file from the local filesystem. */
-    fun addFile(blobHash: ByteArray, metadata: net.murmur.generated.FileMetadataFfi, data: ByteArray) {
+    fun addFile(blobHash: ByteArray, metadata: uniffi.murmur.FileMetadataFfi, data: ByteArray) {
         viewModelScope.launch {
             try {
                 engine.addFile(blobHash, metadata, data)
@@ -57,7 +57,7 @@ class FileViewModel(private val engine: MurmurEngine) : ViewModel() {
         viewModelScope.launch {
             engine.events.collect { event ->
                 if (event is MurmurEventFfi.FileSynced) {
-                    val hash = event.blobHash.toByteArray()
+                    val hash = event.blobHash
                     val filename = event.filename
                     val newFile = SyncedFile(hash, filename)
                     _files.value = (listOf(newFile) + _files.value).distinctBy {
@@ -69,6 +69,3 @@ class FileViewModel(private val engine: MurmurEngine) : ViewModel() {
     }
 }
 
-// ---------------------------------------------------------------------------
-
-private fun List<UByte>.toByteArray(): ByteArray = ByteArray(size) { this[it].toByte() }

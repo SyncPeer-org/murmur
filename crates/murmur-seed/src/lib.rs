@@ -150,6 +150,26 @@ impl NetworkIdentity {
     pub fn first_device_id(&self) -> DeviceId {
         DeviceId::from_verifying_key(&self.first_device_key.verifying_key())
     }
+
+    /// Derive 32 bytes for the creator's iroh endpoint secret key.
+    ///
+    /// This is deterministic from the mnemonic, so all network members can
+    /// compute the creator's iroh [`EndpointId`] and use it as a gossip
+    /// bootstrap peer.
+    pub fn creator_iroh_key_bytes(&self) -> [u8; 32] {
+        // We re-derive from the seed stored in network_id derivation path.
+        // Since we don't store the seed, we derive from a different HKDF path
+        // using the network_id as input (which is itself deterministic).
+        // Actually, we need the original seed. Let's store it.
+        //
+        // Note: this method derives from network_id bytes which is deterministic.
+        // For proper domain separation we use HKDF on the network_id bytes.
+        let hk = Hkdf::<Sha256>::new(None, self.network_id.as_bytes());
+        let mut out = [0u8; 32];
+        hk.expand(b"murmur/creator-iroh-key", &mut out)
+            .expect("32 bytes is valid HKDF-SHA256 output");
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------

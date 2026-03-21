@@ -1,18 +1,24 @@
-//! Headless backup server daemon for Murmur.
+//! `murmurd` — Murmur headless backup daemon.
 //!
-//! `murmurd` is the desktop/server platform implementation. It uses Fjall for
-//! DAG persistence and the filesystem for blob storage.
+//! Runs as a pure daemon with no subcommands. Management is done via
+//! `murmur-cli` which connects over a Unix domain socket.
 
 mod config;
+mod networking;
 mod storage;
 
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::Parser;
+use murmur_ipc::{CliRequest, CliResponse, DeviceInfoIpc, FileInfoIpc};
 use murmur_types::DeviceId;
-use tracing::info;
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
 
 use config::Config;
 use storage::{FjallPlatform, Storage};
@@ -22,6 +28,9 @@ use storage::{FjallPlatform, Storage};
 // ---------------------------------------------------------------------------
 
 /// Murmur headless backup daemon.
+///
+/// On first run, automatically creates a new network and prints the mnemonic.
+/// To join an existing network instead, use `murmur-cli join <mnemonic>` first.
 #[derive(Parser)]
 #[command(name = "murmurd", about = "Murmur headless backup daemon")]
 struct Cli {
@@ -29,36 +38,17 @@ struct Cli {
     #[arg(long, default_value_os_t = Config::default_base_dir())]
     data_dir: PathBuf,
 
-    #[command(subcommand)]
-    command: Command,
-}
+    /// Device name (only used on first run).
+    #[arg(long, default_value = "murmurd")]
+    name: String,
 
-#[derive(Subcommand)]
-enum Command {
-    /// Initialize a new Murmur network (generates mnemonic).
-    Init {
-        /// Device name.
-        #[arg(long, default_value = "murmurd")]
-        name: String,
-        /// Device role: source, backup, or full.
-        #[arg(long, default_value = "backup")]
-        role: String,
-        /// Join an existing network instead of creating one.
-        #[arg(long)]
-        join: Option<String>,
-        /// Enable auto-approve for new devices.
-        #[arg(long)]
-        auto_approve: bool,
-    },
-    /// Start the daemon.
-    Start,
-    /// Approve a pending device.
-    Approve {
-        /// Device ID (hex).
-        device_id: String,
-    },
-    /// Print network status and exit.
-    Status,
+    /// Device role: source, backup, or full (only used on first run).
+    #[arg(long, default_value = "backup")]
+    role: String,
+
+    /// Increase log verbosity (debug level).
+    #[arg(long, short)]
+    verbose: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -66,151 +56,39 @@ enum Command {
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    let log_level = if cli.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
         )
         .init();
 
-    let cli = Cli::parse();
-
-    match cli.command {
-        Command::Init {
-            name,
-            role,
-            join,
-            auto_approve,
-        } => cmd_init(&cli.data_dir, &name, &role, join.as_deref(), auto_approve),
-        Command::Start => cmd_start(&cli.data_dir),
-        Command::Approve { device_id } => cmd_approve(&cli.data_dir, &device_id),
-        Command::Status => cmd_status(&cli.data_dir),
-    }
+    run_daemon(&cli.data_dir, &cli.name, &cli.role)
 }
 
 // ---------------------------------------------------------------------------
-// Commands
+// Daemon
 // ---------------------------------------------------------------------------
 
-/// Initialize a new network or join an existing one.
-fn cmd_init(
-    base_dir: &Path,
-    name: &str,
-    role: &str,
-    join_mnemonic: Option<&str>,
-    auto_approve: bool,
-) -> Result<()> {
-    // Check if already initialized.
+/// Run the daemon: load state, listen on socket, handle signals.
+///
+/// On first run (no config.toml), automatically creates a new network,
+/// generates a mnemonic, writes config, and prints the mnemonic.
+fn run_daemon(base_dir: &Path, default_name: &str, default_role: &str) -> Result<()> {
     let config_path = Config::config_path(base_dir);
-    if config_path.exists() {
-        anyhow::bail!(
-            "already initialized at {}. Remove the directory to reinitialize.",
-            base_dir.display()
-        );
+
+    // Auto-initialize on first run.
+    let first_run = !config_path.exists();
+    if first_run {
+        auto_init(base_dir, default_name, default_role)?;
     }
 
-    // Create config.
-    let mut config = Config::with_base_dir(base_dir, name, role);
-    config.network.auto_approve = auto_approve;
+    let config = Config::load(&config_path).context("load config")?;
 
-    // Validate role.
-    let device_role = config.parse_role()?;
-
-    // Create directories.
-    std::fs::create_dir_all(base_dir).context("create base dir")?;
-
-    // Handle mnemonic: generate or parse.
-    let mnemonic = if let Some(phrase) = join_mnemonic {
-        murmur_seed::parse_mnemonic(phrase).context("invalid mnemonic")?
-    } else {
-        let m = murmur_seed::generate_mnemonic(murmur_seed::WordCount::TwentyFour);
-        info!("generated new 24-word mnemonic");
-        m
-    };
-
-    // Derive network identity.
-    let identity = murmur_seed::NetworkIdentity::from_mnemonic(&mnemonic, "");
-
-    // Determine device key.
-    let (device_id, signing_key) = if join_mnemonic.is_some() {
-        // Joining: generate a random device key.
-        let kp = murmur_seed::DeviceKeyPair::generate();
-        let id = kp.device_id();
-        let sk = kp.signing_key().clone();
-        // Save device key.
-        std::fs::write(Config::device_key_path(base_dir), kp.to_bytes())
-            .context("save device key")?;
-        (id, sk)
-    } else {
-        // Creating: use the first device key from the seed.
-        let id = identity.first_device_id();
-        let sk = identity.first_device_signing_key().clone();
-        (id, sk)
-    };
-
-    // Save mnemonic (plaintext for v1).
-    std::fs::write(
-        Config::mnemonic_path(base_dir),
-        mnemonic.to_string().as_bytes(),
-    )
-    .context("save mnemonic")?;
-
-    // Save config.
-    config.save(&config_path)?;
-
-    // Open storage.
-    let storage = Arc::new(Storage::open(
-        &config.storage.data_dir,
-        &config.storage.blob_dir,
-    )?);
-    let platform = Arc::new(FjallPlatform::new(storage.clone()));
-
-    // Create or join the engine.
-    let _engine = if join_mnemonic.is_some() {
-        info!(%device_id, "joining existing network");
-        murmur_engine::MurmurEngine::join_network(
-            device_id,
-            signing_key,
-            name.to_string(),
-            platform,
-        )
-    } else {
-        info!(%device_id, "creating new network");
-        murmur_engine::MurmurEngine::create_network(
-            device_id,
-            signing_key,
-            name.to_string(),
-            device_role,
-            platform,
-        )
-    };
-
-    // Flush storage.
-    storage.flush()?;
-
-    // Output.
-    if join_mnemonic.is_none() {
-        println!("Murmur network initialized.");
-        println!();
-        println!("IMPORTANT — Write down your mnemonic and store it safely:");
-        println!();
-        println!("  {}", mnemonic);
-        println!();
-        println!("Device ID: {device_id}");
-        println!("Config:    {}", config_path.display());
-    } else {
-        println!("Joined Murmur network (pending approval).");
-        println!("Device ID: {device_id}");
-    }
-
-    Ok(())
-}
-
-/// Start the daemon.
-fn cmd_start(base_dir: &Path) -> Result<()> {
-    let config_path = Config::config_path(base_dir);
-    let config = Config::load(&config_path).context("load config (run 'murmurd init' first)")?;
-
+    // Load mnemonic.
     let mnemonic_str =
         std::fs::read_to_string(Config::mnemonic_path(base_dir)).context("read mnemonic")?;
     let mnemonic = murmur_seed::parse_mnemonic(mnemonic_str.trim())?;
@@ -219,7 +97,6 @@ fn cmd_start(base_dir: &Path) -> Result<()> {
     // Determine device key.
     let device_key_path = Config::device_key_path(base_dir);
     let (device_id, signing_key) = if device_key_path.exists() {
-        // Joining device: load the saved key.
         let bytes: [u8; 32] = std::fs::read(&device_key_path)
             .context("read device key")?
             .try_into()
@@ -227,7 +104,6 @@ fn cmd_start(base_dir: &Path) -> Result<()> {
         let kp = murmur_seed::DeviceKeyPair::from_bytes(bytes);
         (kp.device_id(), kp.signing_key().clone())
     } else {
-        // First device: use the seed-derived key.
         (
             identity.first_device_id(),
             identity.first_device_signing_key().clone(),
@@ -241,162 +117,342 @@ fn cmd_start(base_dir: &Path) -> Result<()> {
     )?);
     let platform = Arc::new(FjallPlatform::new(storage.clone()));
 
-    // Create engine with a fresh DAG.
-    let mut engine = murmur_engine::MurmurEngine::from_dag(
-        murmur_dag::Dag::new(device_id, signing_key),
+    // Create engine.
+    let device_role = config
+        .parse_role()
+        .unwrap_or(murmur_types::DeviceRole::Backup);
+    let mut engine = murmur_engine::MurmurEngine::create_network(
+        device_id,
+        signing_key,
+        config.device.name.clone(),
+        device_role,
         platform,
     );
 
     // Load persisted DAG entries.
     let entries = storage.load_all_dag_entries()?;
     for entry_bytes in entries {
-        engine.load_entry_bytes(&entry_bytes)?;
+        if let Err(e) = engine.load_entry_bytes(&entry_bytes) {
+            warn!(error = %e, "skip loading dag entry");
+        }
     }
 
-    info!(%device_id, "daemon started");
-    println!("murmurd running. Device ID: {device_id}");
-    println!("Devices: {}", engine.list_devices().len());
+    info!(%device_id, name = %config.device.name, "daemon started");
 
-    // Run the tokio runtime for signal handling.
+    let start_time = Instant::now();
+
+    // Wrap engine in Arc<Mutex> for shared access.
+    let engine = Arc::new(Mutex::new(engine));
+
+    // Set up socket listener.
+    let sock_path = murmur_ipc::socket_path(base_dir);
+    cleanup_stale_socket(&sock_path);
+    let listener = UnixListener::bind(&sock_path)
+        .with_context(|| format!("bind socket at {}", sock_path.display()))?;
+    info!(path = %sock_path.display(), "listening on socket");
+
+    // Determine if this device is the network creator (first device).
+    let is_creator = !Config::device_key_path(base_dir).exists();
+
+    // Use tokio for networking, signal handling, and socket accept loop.
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        info!("waiting for shutdown signal");
+        // Start gossip networking.
+        let network_id = identity.network_id();
+        let topic = murmur_net::topic_from_network_id(&network_id);
+        let creator_iroh_key = identity.creator_iroh_key_bytes();
+
+        let net_handle =
+            networking::start_networking(engine.clone(), creator_iroh_key, is_creator, topic)
+                .await
+                .context("start networking")?;
+
+        info!("gossip networking started");
+
+        // Spawn a task to accept socket connections.
+        let ctx = Arc::new(DaemonCtx {
+            engine: engine.clone(),
+            storage: storage.clone(),
+            device_name: config.device.name.clone(),
+            network_id_hex: identity.network_id().to_string(),
+            mnemonic: mnemonic.to_string(),
+            start_time,
+            broadcast_tx: net_handle.broadcast_tx.clone(),
+            connected_peers: net_handle.connected_peers.clone(),
+        });
+
+        let accept_handle = tokio::task::spawn_blocking(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        let ctx = ctx.clone();
+                        std::thread::spawn(move || {
+                            if let Err(e) = handle_connection(stream, &ctx) {
+                                warn!(error = %e, "socket connection error");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        // Listener was likely closed by shutdown.
+                        info!(error = %e, "socket listener stopped");
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Wait for shutdown signal.
         tokio::signal::ctrl_c().await.context("listen for ctrl-c")?;
         info!("shutdown signal received");
+
+        // Abort the accept loop (drop the listener).
+        accept_handle.abort();
+
+        // Drop the network handle to clean up.
+        drop(net_handle);
+
         Ok::<(), anyhow::Error>(())
     })?;
 
+    // Cleanup.
     storage.flush()?;
+    let _ = std::fs::remove_file(&sock_path);
     info!("daemon stopped");
-    println!("murmurd stopped.");
+
     Ok(())
 }
 
-/// Approve a pending device.
-fn cmd_approve(base_dir: &Path, device_id_hex: &str) -> Result<()> {
-    let config_path = Config::config_path(base_dir);
-    let config = Config::load(&config_path).context("load config")?;
+// ---------------------------------------------------------------------------
+// Socket connection handler
+// ---------------------------------------------------------------------------
 
-    // Parse device ID from hex.
-    let device_id = parse_device_id(device_id_hex)?;
+/// Shared context passed to CLI connection handlers.
+struct DaemonCtx {
+    engine: Arc<Mutex<murmur_engine::MurmurEngine>>,
+    storage: Arc<Storage>,
+    device_name: String,
+    network_id_hex: String,
+    mnemonic: String,
+    start_time: Instant,
+    broadcast_tx: mpsc::UnboundedSender<Vec<u8>>,
+    connected_peers: Arc<std::sync::atomic::AtomicU64>,
+}
 
-    let mnemonic_str =
-        std::fs::read_to_string(Config::mnemonic_path(base_dir)).context("read mnemonic")?;
-    let mnemonic = murmur_seed::parse_mnemonic(mnemonic_str.trim())?;
-    let identity = murmur_seed::NetworkIdentity::from_mnemonic(&mnemonic, "");
+/// Handle a single CLI connection.
+fn handle_connection(mut stream: std::os::unix::net::UnixStream, ctx: &DaemonCtx) -> Result<()> {
+    let request: CliRequest = murmur_ipc::recv_message(&mut stream)?;
+    info!(?request, "received CLI request");
 
-    // Determine signing key (same logic as start).
-    let device_key_path = Config::device_key_path(base_dir);
-    let (my_device_id, signing_key) = if device_key_path.exists() {
-        let bytes: [u8; 32] = std::fs::read(&device_key_path)
-            .context("read device key")?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("device key file must be 32 bytes"))?;
-        let kp = murmur_seed::DeviceKeyPair::from_bytes(bytes);
-        (kp.device_id(), kp.signing_key().clone())
-    } else {
-        (
-            identity.first_device_id(),
-            identity.first_device_signing_key().clone(),
-        )
-    };
+    let response = process_request(request, ctx);
 
-    let storage = Arc::new(Storage::open(
-        &config.storage.data_dir,
-        &config.storage.blob_dir,
-    )?);
-    let platform = Arc::new(FjallPlatform::new(storage.clone()));
-
-    let mut engine = murmur_engine::MurmurEngine::from_dag(
-        murmur_dag::Dag::new(my_device_id, signing_key),
-        platform,
-    );
-
-    // Load persisted entries.
-    for entry_bytes in storage.load_all_dag_entries()? {
-        engine.load_entry_bytes(&entry_bytes)?;
-    }
-
-    // Approve.
-    let role = config
-        .parse_role()
-        .unwrap_or(murmur_types::DeviceRole::Backup);
-    engine.approve_device(device_id, role)?;
-    storage.flush()?;
-
-    println!("Device {device_id} approved with role {role:?}.");
+    murmur_ipc::send_message(&mut stream, &response)?;
     Ok(())
 }
 
-/// Print network status.
-fn cmd_status(base_dir: &Path) -> Result<()> {
-    let config_path = Config::config_path(base_dir);
-    let config = Config::load(&config_path).context("load config")?;
+/// Process a CLI request and produce a response.
+fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
+    match request {
+        CliRequest::Status => {
+            let eng = ctx.engine.lock().unwrap();
+            let gossip_peers = ctx.connected_peers.load(Ordering::Relaxed);
+            CliResponse::Status {
+                device_id: eng.device_id().to_string(),
+                device_name: ctx.device_name.clone(),
+                network_id: ctx.network_id_hex.clone(),
+                peer_count: gossip_peers,
+                dag_entries: eng.all_entries().len() as u64,
+                uptime_secs: ctx.start_time.elapsed().as_secs(),
+            }
+        }
+        CliRequest::ListDevices => {
+            let eng = ctx.engine.lock().unwrap();
+            let devices = eng
+                .list_devices()
+                .into_iter()
+                .filter(|d| d.approved)
+                .map(device_to_ipc)
+                .collect();
+            CliResponse::Devices { devices }
+        }
+        CliRequest::ListPending => {
+            let eng = ctx.engine.lock().unwrap();
+            let devices = eng
+                .pending_requests()
+                .into_iter()
+                .map(device_to_ipc)
+                .collect();
+            CliResponse::Pending { devices }
+        }
+        CliRequest::ApproveDevice {
+            device_id_hex,
+            role,
+        } => {
+            let device_id = match parse_device_id(&device_id_hex) {
+                Ok(id) => id,
+                Err(e) => {
+                    return CliResponse::Error {
+                        message: format!("{e:#}"),
+                    };
+                }
+            };
+            let device_role = match role.as_str() {
+                "source" => murmur_types::DeviceRole::Source,
+                "backup" => murmur_types::DeviceRole::Backup,
+                "full" => murmur_types::DeviceRole::Full,
+                other => {
+                    return CliResponse::Error {
+                        message: format!("unknown role: {other:?}"),
+                    };
+                }
+            };
+            let mut eng = ctx.engine.lock().unwrap();
+            match eng.approve_device(device_id, device_role) {
+                Ok(entry) => {
+                    let _ = ctx.broadcast_tx.send(entry.to_bytes());
+                    if let Err(e) = ctx.storage.flush() {
+                        error!(error = %e, "flush after approve");
+                    }
+                    CliResponse::Ok {
+                        message: format!("Device {device_id} approved with role {role}."),
+                    }
+                }
+                Err(e) => CliResponse::Error {
+                    message: format!("{e}"),
+                },
+            }
+        }
+        CliRequest::RevokeDevice { device_id_hex } => {
+            let device_id = match parse_device_id(&device_id_hex) {
+                Ok(id) => id,
+                Err(e) => {
+                    return CliResponse::Error {
+                        message: format!("{e:#}"),
+                    };
+                }
+            };
+            let mut eng = ctx.engine.lock().unwrap();
+            match eng.revoke_device(device_id) {
+                Ok(entry) => {
+                    let _ = ctx.broadcast_tx.send(entry.to_bytes());
+                    if let Err(e) = ctx.storage.flush() {
+                        error!(error = %e, "flush after revoke");
+                    }
+                    CliResponse::Ok {
+                        message: format!("Device {device_id} revoked."),
+                    }
+                }
+                Err(e) => CliResponse::Error {
+                    message: format!("{e}"),
+                },
+            }
+        }
+        CliRequest::ShowMnemonic => CliResponse::Mnemonic {
+            mnemonic: ctx.mnemonic.clone(),
+        },
+        CliRequest::ListFiles => {
+            let eng = ctx.engine.lock().unwrap();
+            let files = eng
+                .state()
+                .files
+                .iter()
+                .map(|(hash, meta)| FileInfoIpc {
+                    blob_hash: hash.to_string(),
+                    filename: meta.filename.clone(),
+                    size: meta.size,
+                    mime_type: meta.mime_type.clone(),
+                    device_origin: meta.device_origin.to_string(),
+                })
+                .collect();
+            CliResponse::Files { files }
+        }
+        CliRequest::AddFile { path } => {
+            let file_path = std::path::Path::new(&path);
+            if !file_path.exists() {
+                return CliResponse::Error {
+                    message: format!("file not found: {path}"),
+                };
+            }
+            let data = match std::fs::read(file_path) {
+                Ok(d) => d,
+                Err(e) => {
+                    return CliResponse::Error {
+                        message: format!("read file: {e}"),
+                    };
+                }
+            };
+            let blob_hash = murmur_types::BlobHash::from_data(&data);
+            let filename = file_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let size = data.len() as u64;
+            let mime_type = guess_mime(&filename);
 
-    let mnemonic_str =
-        std::fs::read_to_string(Config::mnemonic_path(base_dir)).context("read mnemonic")?;
-    let mnemonic = murmur_seed::parse_mnemonic(mnemonic_str.trim())?;
-    let identity = murmur_seed::NetworkIdentity::from_mnemonic(&mnemonic, "");
-
-    let device_key_path = Config::device_key_path(base_dir);
-    let (my_device_id, signing_key) = if device_key_path.exists() {
-        let bytes: [u8; 32] = std::fs::read(&device_key_path)
-            .context("read device key")?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("device key file must be 32 bytes"))?;
-        let kp = murmur_seed::DeviceKeyPair::from_bytes(bytes);
-        (kp.device_id(), kp.signing_key().clone())
-    } else {
-        (
-            identity.first_device_id(),
-            identity.first_device_signing_key().clone(),
-        )
-    };
-
-    let storage = Arc::new(Storage::open(
-        &config.storage.data_dir,
-        &config.storage.blob_dir,
-    )?);
-    let platform = Arc::new(FjallPlatform::new(storage.clone()));
-
-    let mut engine = murmur_engine::MurmurEngine::from_dag(
-        murmur_dag::Dag::new(my_device_id, signing_key),
-        platform,
-    );
-
-    for entry_bytes in storage.load_all_dag_entries()? {
-        engine.load_entry_bytes(&entry_bytes)?;
+            let mut eng = ctx.engine.lock().unwrap();
+            let metadata = murmur_types::FileMetadata {
+                blob_hash,
+                filename: filename.clone(),
+                size,
+                mime_type: mime_type.clone(),
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                device_origin: eng.device_id(),
+            };
+            match eng.add_file(metadata, data) {
+                Ok(entry) => {
+                    let _ = ctx.broadcast_tx.send(entry.to_bytes());
+                    if let Err(e) = ctx.storage.flush() {
+                        error!(error = %e, "flush after add_file");
+                    }
+                    CliResponse::Ok {
+                        message: format!("File added: {filename} ({blob_hash})"),
+                    }
+                }
+                Err(e) => CliResponse::Error {
+                    message: format!("{e}"),
+                },
+            }
+        }
     }
+}
 
-    println!("Network ID: {}", identity.network_id());
-    println!("Device ID:  {my_device_id}");
-    println!("Config:     {}", config_path.display());
+// ---------------------------------------------------------------------------
+// Auto-init
+// ---------------------------------------------------------------------------
+
+/// Initialize a new network on first run.
+fn auto_init(base_dir: &Path, name: &str, role: &str) -> Result<()> {
+    info!("first run — creating new network");
+
+    std::fs::create_dir_all(base_dir).context("create base directory")?;
+
+    // Generate mnemonic.
+    let mnemonic = murmur_seed::generate_mnemonic(murmur_seed::WordCount::TwentyFour);
+    let identity = murmur_seed::NetworkIdentity::from_mnemonic(&mnemonic, "");
+    let device_id = identity.first_device_id();
+
+    // Save mnemonic.
+    std::fs::write(
+        Config::mnemonic_path(base_dir),
+        mnemonic.to_string().as_bytes(),
+    )
+    .context("save mnemonic")?;
+
+    // Write config.
+    let config = Config::new(base_dir, name, role);
+    let toml_str = toml::to_string_pretty(&config).context("serialize config")?;
+    std::fs::write(Config::config_path(base_dir), toml_str).context("write config")?;
+
+    println!("New Murmur network created.");
     println!();
-
-    let devices = engine.list_devices();
-    if devices.is_empty() {
-        println!("No devices.");
-    } else {
-        println!("Devices ({}):", devices.len());
-        for dev in &devices {
-            let status = if dev.approved { "approved" } else { "pending" };
-            println!(
-                "  {} {} ({:?}) [{}]",
-                dev.device_id, dev.name, dev.role, status
-            );
-        }
-    }
-
-    let files = engine.state().files.len();
-    println!("\nFiles: {files}");
-
-    let pending = engine.pending_requests();
-    if !pending.is_empty() {
-        println!("\nPending approval ({}):", pending.len());
-        for dev in &pending {
-            println!("  {} {}", dev.device_id, dev.name);
-        }
-    }
+    println!("IMPORTANT — Write down your mnemonic and store it safely:");
+    println!();
+    println!("  {mnemonic}");
+    println!();
+    println!("Device ID: {device_id}");
+    println!();
 
     Ok(())
 }
@@ -404,6 +460,16 @@ fn cmd_status(base_dir: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Convert a `DeviceInfo` to IPC format.
+fn device_to_ipc(dev: murmur_types::DeviceInfo) -> DeviceInfoIpc {
+    DeviceInfoIpc {
+        device_id: dev.device_id.to_string(),
+        name: dev.name,
+        role: format!("{:?}", dev.role).to_lowercase(),
+        approved: dev.approved,
+    }
+}
 
 /// Parse a hex string into a [`DeviceId`].
 fn parse_device_id(hex_str: &str) -> Result<DeviceId> {
@@ -422,9 +488,89 @@ fn parse_device_id(hex_str: &str) -> Result<DeviceId> {
     Ok(DeviceId::from_bytes(bytes))
 }
 
+/// Simple MIME type guess from file extension.
+fn guess_mime(filename: &str) -> Option<String> {
+    let ext = filename.rsplit('.').next()?.to_lowercase();
+    let mime = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
+/// Remove a stale socket file if no process is listening.
+fn cleanup_stale_socket(path: &Path) {
+    if path.exists() {
+        // Try connecting to see if a daemon is running.
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(_) => {
+                // Another daemon is running.
+                warn!(
+                    path = %path.display(),
+                    "another murmurd is already running on this socket"
+                );
+            }
+            Err(_) => {
+                // Stale socket — remove it.
+                info!(path = %path.display(), "removing stale socket");
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    /// Create a test [`DaemonCtx`] with storage in a temp dir.
+    fn test_ctx(dir: &Path) -> DaemonCtx {
+        let mnemonic = murmur_seed::generate_mnemonic(murmur_seed::WordCount::Twelve);
+        let identity = murmur_seed::NetworkIdentity::from_mnemonic(&mnemonic, "");
+        let device_id = identity.first_device_id();
+        let signing_key = identity.first_device_signing_key().clone();
+        let network_id_hex = identity.network_id().to_string();
+
+        let storage = Arc::new(Storage::open(&dir.join("db"), &dir.join("blobs")).unwrap());
+        let platform = Arc::new(FjallPlatform::new(storage.clone()));
+
+        let engine = murmur_engine::MurmurEngine::create_network(
+            device_id,
+            signing_key,
+            "TestDaemon".to_string(),
+            murmur_types::DeviceRole::Backup,
+            platform,
+        );
+
+        let (broadcast_tx, _rx) = mpsc::unbounded_channel();
+
+        DaemonCtx {
+            engine: Arc::new(Mutex::new(engine)),
+            storage,
+            device_name: "TestDaemon".to_string(),
+            network_id_hex,
+            mnemonic: mnemonic.to_string(),
+            start_time: Instant::now(),
+            broadcast_tx,
+            connected_peers: Arc::new(AtomicU64::new(0)),
+        }
+    }
 
     #[test]
     fn test_parse_device_id_valid() {
@@ -445,72 +591,304 @@ mod tests {
     }
 
     #[test]
-    fn test_init_creates_network() {
+    fn test_process_request_status() {
         let dir = tempfile::tempdir().unwrap();
-        cmd_init(&dir.path().to_path_buf(), "TestNAS", "backup", None, false).unwrap();
+        let ctx = test_ctx(dir.path());
 
-        assert!(Config::config_path(dir.path()).exists());
-        assert!(Config::mnemonic_path(dir.path()).exists());
-        assert!(!Config::device_key_path(dir.path()).exists()); // first device uses seed key
+        let resp = process_request(CliRequest::Status, &ctx);
+
+        match resp {
+            CliResponse::Status {
+                device_name,
+                peer_count,
+                ..
+            } => {
+                assert_eq!(device_name, "TestDaemon");
+                assert_eq!(peer_count, 0); // no gossip peers in test
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
     }
 
     #[test]
-    fn test_init_already_initialized() {
+    fn test_process_request_list_devices() {
         let dir = tempfile::tempdir().unwrap();
-        cmd_init(&dir.path().to_path_buf(), "NAS", "backup", None, false).unwrap();
-        let result = cmd_init(&dir.path().to_path_buf(), "NAS", "backup", None, false);
-        assert!(result.is_err());
+        let ctx = test_ctx(dir.path());
+
+        let resp = process_request(CliRequest::ListDevices, &ctx);
+
+        match resp {
+            CliResponse::Devices { devices } => {
+                assert!(!devices.is_empty());
+                assert!(devices[0].approved);
+            }
+            other => panic!("expected Devices, got {other:?}"),
+        }
     }
 
     #[test]
-    fn test_init_join_with_valid_mnemonic() {
-        let mnemonic = murmur_seed::generate_mnemonic(murmur_seed::WordCount::Twelve);
+    fn test_process_request_list_pending_empty() {
         let dir = tempfile::tempdir().unwrap();
-        cmd_init(
-            &dir.path().to_path_buf(),
-            "Phone",
-            "source",
-            Some(&mnemonic.to_string()),
-            false,
-        )
-        .unwrap();
+        let ctx = test_ctx(dir.path());
 
-        assert!(Config::config_path(dir.path()).exists());
-        assert!(Config::mnemonic_path(dir.path()).exists());
-        assert!(Config::device_key_path(dir.path()).exists()); // joining device has own key
+        let resp = process_request(CliRequest::ListPending, &ctx);
+
+        match resp {
+            CliResponse::Pending { devices } => assert!(devices.is_empty()),
+            other => panic!("expected Pending, got {other:?}"),
+        }
     }
 
     #[test]
-    fn test_init_join_with_invalid_mnemonic() {
+    fn test_process_request_show_mnemonic() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_init(
-            &dir.path().to_path_buf(),
-            "Phone",
-            "source",
-            Some("not a valid mnemonic phrase"),
-            false,
+        let ctx = test_ctx(dir.path());
+        let expected_mnemonic = ctx.mnemonic.clone();
+
+        let resp = process_request(CliRequest::ShowMnemonic, &ctx);
+
+        match resp {
+            CliResponse::Mnemonic { mnemonic: m } => {
+                assert_eq!(m, expected_mnemonic);
+            }
+            other => panic!("expected Mnemonic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_process_request_approve_invalid_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        let resp = process_request(
+            CliRequest::ApproveDevice {
+                device_id_hex: "not-valid-hex".to_string(),
+                role: "backup".to_string(),
+            },
+            &ctx,
         );
-        assert!(result.is_err());
+
+        match resp {
+            CliResponse::Error { message } => {
+                assert!(!message.is_empty());
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     #[test]
-    fn test_status_after_init() {
+    fn test_process_request_approve_invalid_role() {
         let dir = tempfile::tempdir().unwrap();
-        cmd_init(&dir.path().to_path_buf(), "NAS", "backup", None, false).unwrap();
-        // Status should not error.
-        cmd_status(&dir.path().to_path_buf()).unwrap();
+        let ctx = test_ctx(dir.path());
+
+        let resp = process_request(
+            CliRequest::ApproveDevice {
+                device_id_hex: "ff".repeat(32),
+                role: "bogus".to_string(),
+            },
+            &ctx,
+        );
+
+        match resp {
+            CliResponse::Error { message } => {
+                assert!(message.contains("unknown role"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     #[test]
-    fn test_start_and_stop() {
-        // We can't easily test the full daemon loop, but we can test
-        // that start loads correctly before entering the signal wait.
+    fn test_process_request_list_files_empty() {
         let dir = tempfile::tempdir().unwrap();
-        cmd_init(&dir.path().to_path_buf(), "NAS", "backup", None, false).unwrap();
+        let ctx = test_ctx(dir.path());
 
-        // Verify the config and mnemonic are loadable.
+        let resp = process_request(CliRequest::ListFiles, &ctx);
+
+        match resp {
+            CliResponse::Files { files } => assert!(files.is_empty()),
+            other => panic!("expected Files, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_process_request_add_file_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        let resp = process_request(
+            CliRequest::AddFile {
+                path: "/nonexistent/file.txt".to_string(),
+            },
+            &ctx,
+        );
+
+        match resp {
+            CliResponse::Error { message } => {
+                assert!(message.contains("not found"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_process_request_add_file_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        // Create a test file.
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, b"hello world").unwrap();
+
+        let resp = process_request(
+            CliRequest::AddFile {
+                path: file_path.to_string_lossy().to_string(),
+            },
+            &ctx,
+        );
+
+        match resp {
+            CliResponse::Ok { message } => {
+                assert!(message.contains("test.txt"), "got: {message}");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+
+        // Verify file shows up in listing.
+        let resp2 = process_request(CliRequest::ListFiles, &ctx);
+        match resp2 {
+            CliResponse::Files { files } => {
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].filename, "test.txt");
+            }
+            other => panic!("expected Files, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_socket_listener_accepts_and_responds() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("test.sock");
+        let ctx = Arc::new(test_ctx(dir.path()));
+
+        // Create listener.
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        // Spawn a thread to accept one connection.
+        let ctx_clone = ctx.clone();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_connection(stream, &ctx_clone).unwrap();
+        });
+
+        // Connect as client.
+        let mut client = UnixStream::connect(&sock_path).unwrap();
+        murmur_ipc::send_message(&mut client, &CliRequest::Status).unwrap();
+        let resp: CliResponse = murmur_ipc::recv_message(&mut client).unwrap();
+
+        match resp {
+            CliResponse::Status { device_name, .. } => {
+                assert_eq!(device_name, "TestDaemon");
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_socket_concurrent_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("concurrent.sock");
+        let ctx = Arc::new(test_ctx(dir.path()));
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        // Accept 3 connections on separate threads.
+        let ctx_for_accept = ctx.clone();
+        let accept_handle = std::thread::spawn(move || {
+            let mut handles = Vec::new();
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().unwrap();
+                let ctx = ctx_for_accept.clone();
+                handles.push(std::thread::spawn(move || {
+                    handle_connection(stream, &ctx).unwrap();
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+
+        // Send 3 concurrent requests.
+        let mut client_handles = Vec::new();
+        for _ in 0..3 {
+            let path = sock_path.clone();
+            client_handles.push(std::thread::spawn(move || {
+                let mut client = UnixStream::connect(&path).unwrap();
+                murmur_ipc::send_message(&mut client, &CliRequest::Status).unwrap();
+                let resp: CliResponse = murmur_ipc::recv_message(&mut client).unwrap();
+                assert!(matches!(resp, CliResponse::Status { .. }));
+            }));
+        }
+
+        for h in client_handles {
+            h.join().unwrap();
+        }
+        accept_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_socket_cleanup_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("stale.sock");
+
+        // Create a stale socket file (not a real listener).
+        std::fs::write(&sock_path, "stale").unwrap();
+        assert!(sock_path.exists());
+
+        cleanup_stale_socket(&sock_path);
+
+        // Stale socket should be removed.
+        assert!(!sock_path.exists());
+    }
+
+    #[test]
+    fn test_auto_init_creates_config_and_mnemonic() {
+        let dir = tempfile::tempdir().unwrap();
+        auto_init(dir.path(), "TestNAS", "backup").unwrap();
+
+        assert!(Config::config_path(dir.path()).exists());
+        assert!(Config::mnemonic_path(dir.path()).exists());
+        // First device uses seed key, no device.key file.
+        assert!(!Config::device_key_path(dir.path()).exists());
+
+        // Config should be loadable and have correct values.
         let config = Config::load(&Config::config_path(dir.path())).unwrap();
-        assert_eq!(config.device.name, "NAS");
+        assert_eq!(config.device.name, "TestNAS");
         assert_eq!(config.device.role, "backup");
+
+        // Mnemonic should be valid.
+        let mnemonic_str = std::fs::read_to_string(Config::mnemonic_path(dir.path())).unwrap();
+        murmur_seed::parse_mnemonic(mnemonic_str.trim()).unwrap();
+    }
+
+    #[test]
+    fn test_auto_init_skipped_when_config_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        auto_init(dir.path(), "First", "backup").unwrap();
+
+        // Config exists, so run_daemon would skip auto_init.
+        assert!(Config::config_path(dir.path()).exists());
+
+        let config = Config::load(&Config::config_path(dir.path())).unwrap();
+        assert_eq!(config.device.name, "First");
+    }
+
+    #[test]
+    fn test_guess_mime() {
+        assert_eq!(guess_mime("photo.jpg"), Some("image/jpeg".to_string()));
+        assert_eq!(guess_mime("doc.pdf"), Some("application/pdf".to_string()));
+        assert_eq!(guess_mime("video.mp4"), Some("video/mp4".to_string()));
+        assert_eq!(guess_mime("unknown.xyz"), None);
     }
 }

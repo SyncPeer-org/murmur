@@ -23,5 +23,13 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 hex = "0.4"
 
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["bindgen-cli"]
+
+[features]
+bindgen-cli = ["uniffi/cli"]
+
 [build-dependencies]
 uniffi = { version = "0.31", features = ["build"] }

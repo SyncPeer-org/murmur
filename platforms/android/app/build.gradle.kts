@@ -7,6 +7,10 @@ plugins {
     id("kotlin-kapt")
 }
 
+kapt {
+    correctErrorTypes = true
+}
+
 android {
     namespace = "net.murmur.app"
     compileSdk = 35
@@ -19,6 +23,11 @@ android {
         versionName = "0.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            // Only package the ABI matching the current jniLibs content.
+            abiFilters += setOf("x86_64", "arm64-v8a")
+        }
     }
 
     buildTypes {
@@ -42,6 +51,12 @@ android {
 
     buildFeatures {
         compose = true
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false  // enables compressed .so → smaller APK
+        }
     }
 
     // JNI libraries are placed under src/main/jniLibs/<abi>/libmurmur_ffi.so
@@ -107,6 +122,9 @@ val uniffiBindgen by tasks.registering(Exec::class) {
 }
 
 dependencies {
+    // JNA is required by UniFFI-generated Kotlin bindings.
+    implementation("net.java.dev.jna:jna:5.13.0@aar")
+
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.viewmodel.compose)

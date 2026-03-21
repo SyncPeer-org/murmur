@@ -16,7 +16,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.flow.SharedFlow
-import net.murmur.generated.MurmurEventFfi
+import uniffi.murmur.MurmurEventFfi
 
 /** Status tab: device ID and a scrollable event log. */
 @Composable

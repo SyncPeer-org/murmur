@@ -12,13 +12,13 @@ import kotlinx.coroutines.launch
 import net.murmur.app.db.AppDatabase
 import net.murmur.app.db.DagEntryEntity
 import net.murmur.app.storage.BlobStore
-import net.murmur.generated.DeviceInfoFfi
-import net.murmur.generated.FileMetadataFfi
-import net.murmur.generated.FfiPlatformCallbacks
-import net.murmur.generated.MurmurEventFfi
-import net.murmur.generated.MurmurHandle
-import net.murmur.generated.createNetwork
-import net.murmur.generated.joinNetwork
+import uniffi.murmur.DeviceInfoFfi
+import uniffi.murmur.FileMetadataFfi
+import uniffi.murmur.FfiPlatformCallbacks
+import uniffi.murmur.MurmurEventFfi
+import uniffi.murmur.MurmurHandle
+import uniffi.murmur.createNetwork
+import uniffi.murmur.joinNetwork
 
 private const val TAG = "MurmurEngine"
 
@@ -95,7 +95,7 @@ class MurmurEngine private constructor(
      */
     suspend fun addFile(blobHash: ByteArray, metadata: FileMetadataFfi, data: ByteArray) =
         kotlinx.coroutines.withContext(Dispatchers.IO) {
-            handle.addFile(blobHash.toList(), metadata, data.toList())
+            handle.addFile(blobHash, metadata, data)
         }
 
     // -----------------------------------------------------------------------
@@ -103,7 +103,7 @@ class MurmurEngine private constructor(
     // -----------------------------------------------------------------------
 
     /** Request access to files on another device. */
-    suspend fun requestAccess(deviceIdHex: String, scope: net.murmur.generated.AccessScopeFfi) =
+    suspend fun requestAccess(deviceIdHex: String, scope: uniffi.murmur.AccessScopeFfi) =
         kotlinx.coroutines.withContext(Dispatchers.IO) {
             handle.requestAccess(deviceIdHex, scope)
         }
@@ -117,7 +117,7 @@ class MurmurEngine private constructor(
      * Returns `null` if not available locally.
      */
     fun fetchBlob(blobHash: ByteArray): ByteArray? =
-        handle.fetchBlob(blobHash.toList())?.let { it.toByteArray() }
+        handle.fetchBlob(blobHash)
 
     // -----------------------------------------------------------------------
     // Factory
@@ -166,7 +166,7 @@ class MurmurEngine private constructor(
         kotlinx.coroutines.withContext(Dispatchers.IO) {
             for (entity in entries) {
                 try {
-                    handle.loadDagEntry(entity.data.toList())
+                    handle.loadDagEntry(entity.data)
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to load DAG entry ${entity.hash}: ${e.message}")
                 }
@@ -186,25 +186,24 @@ class MurmurEngine private constructor(
 
         private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-        override fun onDagEntry(entryBytes: List<UByte>) {
-            val bytes = entryBytes.toByteArray()
+        override fun onDagEntry(entryBytes: ByteArray) {
             // Compute a simple hex key from the first 8 bytes of the entry bytes.
-            val hashKey = bytes.take(8).joinToString("") { "%02x".format(it) }
+            val hashKey = entryBytes.take(8).joinToString("") { "%02x".format(it) }
             scope.launch {
                 try {
-                    db.dagEntryDao().insert(DagEntryEntity(hash = hashKey, data = bytes))
+                    db.dagEntryDao().insert(DagEntryEntity(hash = hashKey, data = entryBytes))
                 } catch (e: Exception) {
                     Log.e(TAG, "onDagEntry: failed to persist entry: ${e.message}")
                 }
             }
         }
 
-        override fun onBlobReceived(blobHash: List<UByte>, data: List<UByte>) {
-            blobStore.store(blobHash.toByteArray(), data.toByteArray())
+        override fun onBlobReceived(blobHash: ByteArray, data: ByteArray) {
+            blobStore.store(blobHash, data)
         }
 
-        override fun onBlobNeeded(blobHash: List<UByte>): List<UByte>? =
-            blobStore.load(blobHash.toByteArray())?.toUByteList()
+        override fun onBlobNeeded(blobHash: ByteArray): ByteArray? =
+            blobStore.load(blobHash)
 
         override fun onEvent(event: MurmurEventFfi) {
             scope.launch { eventFlow.emit(event) }
@@ -212,9 +211,3 @@ class MurmurEngine private constructor(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Extension helpers
-// ---------------------------------------------------------------------------
-
-private fun ByteArray.toUByteList(): List<UByte> = map { it.toUByte() }
-private fun List<UByte>.toByteArray(): ByteArray = ByteArray(size) { this[it].toByte() }

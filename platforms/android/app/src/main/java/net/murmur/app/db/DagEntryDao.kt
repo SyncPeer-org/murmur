@@ -17,6 +17,10 @@ interface DagEntryDao {
     @Query("SELECT * FROM dag_entries")
     suspend fun loadAll(): List<DagEntryEntity>
 
+    /** Delete all entries — called when disconnecting from a network. */
+    @Query("DELETE FROM dag_entries")
+    suspend fun deleteAll()
+
     /** Number of entries stored — useful for tests. */
     @Query("SELECT COUNT(*) FROM dag_entries")
     suspend fun count(): Int

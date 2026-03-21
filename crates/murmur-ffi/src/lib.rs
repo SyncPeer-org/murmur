@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex};
 
 use murmur_dag::DagEntry;
 use murmur_engine::{EngineEvent, MurmurEngine, PlatformCallbacks};
-use murmur_seed::{DeviceKeyPair, NetworkIdentity, parse_mnemonic};
+use murmur_seed::WordCount;
+use murmur_seed::{DeviceKeyPair, NetworkIdentity, generate_mnemonic, parse_mnemonic};
 use murmur_types::{AccessScope, BlobHash, DeviceId, DeviceRole, FileMetadata};
 use tracing::debug;
 
@@ -431,6 +432,12 @@ impl MurmurHandle {
 // ---------------------------------------------------------------------------
 // Constructor functions (FFI namespace entry points)
 // ---------------------------------------------------------------------------
+
+/// Generate a fresh 12-word BIP39 mnemonic suitable for creating a new network.
+#[uniffi::export]
+pub fn new_mnemonic() -> String {
+    generate_mnemonic(WordCount::Twelve).to_string()
+}
 
 /// Create a new Murmur network.  The first device is auto-approved (`Full` role).
 ///

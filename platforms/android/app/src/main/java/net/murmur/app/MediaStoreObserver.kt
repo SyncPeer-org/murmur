@@ -11,7 +11,7 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import net.murmur.generated.FileMetadataFfi
+import uniffi.murmur.FileMetadataFfi
 
 private const val TAG = "MediaStoreObserver"
 
@@ -83,12 +83,12 @@ class MediaStoreObserver(
             val deviceOrigin = hexDecode(engine.deviceIdHex())
 
             val metadata = FileMetadataFfi(
-                blobHash = blobHash.toList(),
+                blobHash = blobHash,
                 filename = name,
-                size = size,
+                size = size.toULong(),
                 mimeType = mime,
-                createdAt = dateAdded,
-                deviceOrigin = deviceOrigin.toList()
+                createdAt = dateAdded.toULong(),
+                deviceOrigin = deviceOrigin
             )
 
             try {

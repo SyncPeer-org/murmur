@@ -25,7 +25,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import net.murmur.app.DeviceViewModel
-import net.murmur.generated.DeviceInfoFfi
+import uniffi.murmur.DeviceInfoFfi
 
 /**
  * Screen showing approved devices and pending join requests.
@@ -146,5 +146,5 @@ private fun ApprovedDeviceCard(
     }
 }
 
-private fun hex(bytes: List<UByte>): String =
-    bytes.joinToString("") { "%02x".format(it.toByte()) }
+private fun hex(bytes: ByteArray): String =
+    bytes.joinToString("") { "%02x".format(it) }

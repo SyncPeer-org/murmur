@@ -47,6 +47,8 @@ class MurmurService : Service() {
         fun getService(): MurmurService = this@MurmurService
     }
 
+    fun getEngine(): MurmurEngine? = engine
+
     private val binder = LocalBinder()
 
     override fun onBind(intent: Intent): IBinder = binder
@@ -116,24 +118,55 @@ class MurmurService : Service() {
      * Persists credentials and (re)starts the engine.
      */
     fun initializeNetwork(deviceName: String, mnemonic: String) {
+        // Creating a fresh network — wipe any stale DAG data from previous networks.
+        clearPersistedData()
         saveCredentials(deviceName, mnemonic, isCreator = true)
         restartEngine()
     }
 
     /** Initialize this device as a joiner of an existing network. */
     fun joinExistingNetwork(deviceName: String, mnemonic: String) {
+        // Joining a new network — wipe stale data from any previous network.
+        clearPersistedData()
         saveCredentials(deviceName, mnemonic, isCreator = false)
         restartEngine()
+    }
+
+    /** Return the stored device name, or null if not initialized. */
+    fun getDeviceName(): String? =
+        getSharedPreferences("murmur", MODE_PRIVATE).getString("device_name", null)
+
+    /** Disconnect: stop engine, wipe all credentials and persisted DAG data. */
+    fun disconnect() {
+        engine?.stop()
+        engine = null
+        getSharedPreferences("murmur", MODE_PRIVATE).edit().clear().apply()
+        clearPersistedData()
+        updateNotification("Waiting for setup…")
     }
 
     // -----------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------
 
-    private fun handleEngineEvent(event: net.murmur.generated.MurmurEventFfi) {
+    private fun handleEngineEvent(event: uniffi.murmur.MurmurEventFfi) {
         Log.d(TAG, "Event: $event")
         // Broadcast to any bound UI observers via the engine's SharedFlow.
         // ViewModels observe eng.events directly; no explicit broadcast needed here.
+    }
+
+    /** Delete all DAG entries from Room and all blobs from disk. */
+    private fun clearPersistedData() {
+        serviceScope.launch {
+            try {
+                net.murmur.app.db.AppDatabase.getInstance(applicationContext)
+                    .dagEntryDao().deleteAll()
+                net.murmur.app.storage.BlobStore(applicationContext).clear()
+                Log.i(TAG, "Cleared persisted DAG entries and blobs")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to clear persisted data: ${e.message}")
+            }
+        }
     }
 
     private fun saveCredentials(deviceName: String, mnemonic: String, isCreator: Boolean) {

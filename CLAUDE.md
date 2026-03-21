@@ -26,7 +26,9 @@ crates/
   murmur-dag/        Signed append-only DAG (adapted from Shoal's LogTree, in-memory)
   murmur-net/        Network (iroh QUIC + gossip)
   murmur-engine/     Orchestrator (sync, approval, blob transfer, storage-agnostic)
-  murmurd/           Headless backup server daemon (NAS/RPi/VPS)
+  murmur-ipc/        IPC protocol types for daemon ↔ CLI communication
+  murmur-cli/        CLI tool for managing murmurd (init, join, approve, status, etc.)
+  murmurd/           Headless backup daemon (no subcommands, managed via murmur-cli)
 tests/
   integration/       Multi-device simulation tests
 ```

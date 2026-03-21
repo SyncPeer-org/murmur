@@ -48,8 +48,8 @@ impl Config {
         dirs_home().join(".murmur")
     }
 
-    /// Create a default config rooted at `base_dir`.
-    pub fn with_base_dir(base_dir: &Path, name: &str, role: &str) -> Self {
+    /// Create a config rooted at `base_dir`.
+    pub fn new(base_dir: &Path, name: &str, role: &str) -> Self {
         Self {
             device: DeviceConfig {
                 name: name.to_string(),
@@ -71,6 +71,7 @@ impl Config {
     }
 
     /// Save config to a TOML file.
+    #[cfg(test)]
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let contents = toml::to_string_pretty(self)?;
         if let Some(parent) = path.parent() {
@@ -121,7 +122,7 @@ mod tests {
 
     #[test]
     fn test_config_roundtrip_toml() {
-        let config = Config::with_base_dir(Path::new("/data/murmur"), "Home NAS", "backup");
+        let config = Config::new(Path::new("/data/murmur"), "Home NAS", "backup");
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(config, parsed);
@@ -129,31 +130,31 @@ mod tests {
 
     #[test]
     fn test_config_default_network() {
-        let config = Config::with_base_dir(Path::new("/tmp/test"), "Test", "full");
+        let config = Config::new(Path::new("/tmp/test"), "Test", "full");
         assert!(!config.network.auto_approve);
     }
 
     #[test]
     fn test_config_parse_role() {
-        let config = Config::with_base_dir(Path::new("/tmp"), "NAS", "backup");
+        let config = Config::new(Path::new("/tmp"), "NAS", "backup");
         assert_eq!(
             config.parse_role().unwrap(),
             murmur_types::DeviceRole::Backup
         );
 
-        let config = Config::with_base_dir(Path::new("/tmp"), "Phone", "source");
+        let config = Config::new(Path::new("/tmp"), "Phone", "source");
         assert_eq!(
             config.parse_role().unwrap(),
             murmur_types::DeviceRole::Source
         );
 
-        let config = Config::with_base_dir(Path::new("/tmp"), "All", "full");
+        let config = Config::new(Path::new("/tmp"), "All", "full");
         assert_eq!(config.parse_role().unwrap(), murmur_types::DeviceRole::Full);
     }
 
     #[test]
     fn test_config_parse_role_invalid() {
-        let config = Config::with_base_dir(Path::new("/tmp"), "NAS", "invalid");
+        let config = Config::new(Path::new("/tmp"), "NAS", "invalid");
         assert!(config.parse_role().is_err());
     }
 
@@ -161,7 +162,7 @@ mod tests {
     fn test_config_save_load() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let config = Config::with_base_dir(dir.path(), "NAS", "backup");
+        let config = Config::new(dir.path(), "NAS", "backup");
         config.save(&path).unwrap();
 
         let loaded = Config::load(&path).unwrap();

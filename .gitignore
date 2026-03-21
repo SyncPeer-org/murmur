@@ -1,2 +1,10 @@
 /target
 *.local.json
+
+# Android build artifacts
+platforms/android/.gradle/
+platforms/android/build/
+platforms/android/app/build/
+platforms/android/local.properties
+platforms/android/app/src/main/java/net/murmur/generated/
+platforms/android/app/src/main/jniLibs/

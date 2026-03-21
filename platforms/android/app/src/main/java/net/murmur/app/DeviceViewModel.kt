@@ -6,8 +6,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import net.murmur.generated.DeviceInfoFfi
-import net.murmur.generated.MurmurEventFfi
+import uniffi.murmur.DeviceInfoFfi
+import uniffi.murmur.MurmurEventFfi
 
 /**
  * ViewModel that manages the device list and pending join requests.
