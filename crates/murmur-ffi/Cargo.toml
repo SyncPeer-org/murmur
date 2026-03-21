@@ -17,11 +17,19 @@ murmur-engine = { workspace = true }
 murmur-seed = { workspace = true }
 murmur-types = { workspace = true }
 murmur-dag = { workspace = true }
+murmur-net = { workspace = true }
 uniffi = "0.31"
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 hex = "0.4"
+iroh = { workspace = true }
+iroh-gossip = { workspace = true }
+bytes = { workspace = true }
+futures-lite = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+rand = { workspace = true }
 
 [[bin]]
 name = "uniffi-bindgen"

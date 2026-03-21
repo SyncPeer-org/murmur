@@ -32,7 +32,6 @@ zeroize = { workspace = true }
 hex = { workspace = true }
 aes-gcm = { workspace = true }
 argon2 = { workspace = true }
-flate2 = { workspace = true }
 prometheus = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }

@@ -45,7 +45,10 @@
 ## Networking
 
 - **iroh QUIC transport** — NAT hole punching, relay fallback, built-in peer discovery. Devices behind NAT can connect.
-- **Gossip broadcast** — DAG entries propagate via iroh-gossip epidemic broadcast to all peers on the network topic.
+- **Gossip broadcast** — DAG entries propagate via iroh-gossip epidemic broadcast to all peers on the network topic. Payloads are deflate-compressed for efficiency.
+- **Delta sync** — On peer connect (`NeighborUp`), peers exchange `DagSyncRequest` with their tips. The remote computes a delta (entries the requester is missing) and responds with `DagSyncResponse`. Both sides sync to convergence.
+- **Blob sync** — When a `FileAdded` DAG entry arrives via gossip, the receiver requests missing blobs via `BlobRequest`. Small blobs (≤4 MB) are sent as a single `BlobResponse`; large blobs use chunked transfer via `BlobChunk` messages (1 MB chunks).
+- **Wire compatibility** — `murmurd` and `murmur-ffi` use the same wire format (shared `murmur-net::wire` module): `GossipMessage` serialized with postcard, then compressed with deflate (1-byte flag prefix). Desktop and mobile peers interoperate seamlessly.
 - **Point-to-point blob transfer** — Blob data transfers use direct QUIC streams (not gossip) for efficiency.
 - **Connection pooling** — Reuse QUIC connections across multiple operations.
 - **Length-prefixed messaging** — All messages use postcard serialization with length-prefix framing over QUIC.
@@ -88,7 +91,8 @@
 
 - **UniFFI 0.31 proc-macro** — No UDL file needed. Generates Kotlin and Swift bindings from Rust annotations.
 - **Synchronous API** — All FFI calls are synchronous. Async engine calls are driven internally by a tokio runtime owned by `MurmurHandle`.
-- **Thread-safe** — `MurmurHandle` wraps `Mutex<MurmurEngine>`, safe to call from any thread.
+- **Thread-safe** — `MurmurHandle` wraps `Arc<Mutex<MurmurEngine>>`, safe to call from any thread. The `Arc` enables sharing the engine with async networking tasks.
+- **Gossip networking** — `start()` creates an iroh endpoint, subscribes to gossip, and spawns background tasks for DAG delta sync and blob transfer. Same wire format as `murmurd` (shared via `murmur-net` wire utilities). `stop()` tears down networking. `connected_peers()` reports active gossip peer count.
 - **Clean type boundary** — FFI wrapper types (`DeviceInfoFfi`, `FileMetadataFfi`, etc.) use `Vec<u8>` for bytes and `String` for IDs. No iroh or ed25519-dalek types cross the boundary.
 - **Callback interface** — `FfiPlatformCallbacks` for platform-to-core communication (persist entries, store/load blobs, receive events).
 - **Error handling** — `FfiError` enum with `InvalidMnemonic`, `InvalidDeviceId`, `OperationFailed`. No panics across FFI.

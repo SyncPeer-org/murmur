@@ -15,3 +15,4 @@ iroh = { workspace = true }
 iroh-gossip = { workspace = true }
 bytes = { workspace = true }
 futures-lite = { workspace = true }
+flate2 = { workspace = true }

@@ -11,112 +11,14 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use futures_lite::StreamExt;
 use murmur_dag::DagEntry;
+use murmur_net::{CHUNK_SIZE, CHUNK_THRESHOLD, ChunkBuffer, compress_wire, decompress_wire};
 use murmur_types::{Action, BlobHash, DeviceId, GossipMessage, GossipPayload};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::storage::Storage;
-
 use crate::config::ThrottleConfig;
 use crate::metrics;
-
-/// Maximum blob size before chunked transfer is used.
-const CHUNK_THRESHOLD: usize = 4 * 1024 * 1024; // 4 MB
-
-/// Size of each chunk for large blob transfers.
-const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB
-
-/// Minimum payload size before compression is applied.
-const COMPRESS_THRESHOLD: usize = 256;
-
-/// Compress a gossip wire payload if it exceeds the threshold.
-///
-/// Format: `flag (1 byte) || data`. Flag 0 = raw, flag 1 = deflate-compressed.
-fn compress_wire(data: &[u8]) -> Vec<u8> {
-    if data.len() < COMPRESS_THRESHOLD {
-        let mut out = Vec::with_capacity(1 + data.len());
-        out.push(0); // uncompressed
-        out.extend_from_slice(data);
-        return out;
-    }
-
-    use flate2::Compression;
-    use flate2::write::DeflateEncoder;
-    use std::io::Write;
-
-    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
-    encoder.write_all(data).expect("deflate write");
-    let compressed = encoder.finish().expect("deflate finish");
-
-    // Only use compression if it actually saves space.
-    if compressed.len() < data.len() {
-        let mut out = Vec::with_capacity(1 + compressed.len());
-        out.push(1); // compressed
-        out.extend_from_slice(&compressed);
-        out
-    } else {
-        let mut out = Vec::with_capacity(1 + data.len());
-        out.push(0);
-        out.extend_from_slice(data);
-        out
-    }
-}
-
-/// Decompress a gossip wire payload.
-fn decompress_wire(data: &[u8]) -> Result<Vec<u8>> {
-    if data.is_empty() {
-        anyhow::bail!("empty wire payload");
-    }
-
-    match data[0] {
-        0 => Ok(data[1..].to_vec()),
-        1 => {
-            use flate2::read::DeflateDecoder;
-            use std::io::Read;
-
-            let mut decoder = DeflateDecoder::new(&data[1..]);
-            let mut decompressed = Vec::new();
-            decoder
-                .read_to_end(&mut decompressed)
-                .context("deflate decompress")?;
-            Ok(decompressed)
-        }
-        flag => anyhow::bail!("unknown wire compression flag: {flag}"),
-    }
-}
-
-/// In-progress chunk reassembly buffer for a single blob.
-struct ChunkBuffer {
-    total_chunks: u32,
-    received: HashMap<u32, Vec<u8>>,
-}
-
-impl ChunkBuffer {
-    fn new(total_chunks: u32) -> Self {
-        Self {
-            total_chunks,
-            received: HashMap::new(),
-        }
-    }
-
-    fn insert(&mut self, index: u32, data: Vec<u8>) {
-        self.received.insert(index, data);
-    }
-
-    fn is_complete(&self) -> bool {
-        self.received.len() == self.total_chunks as usize
-    }
-
-    fn reassemble(self) -> Vec<u8> {
-        let mut indices: Vec<u32> = self.received.keys().copied().collect();
-        indices.sort();
-        let mut out = Vec::new();
-        for i in indices {
-            out.extend_from_slice(&self.received[&i]);
-        }
-        out
-    }
-}
+use crate::storage::Storage;
 
 /// Handle returned from [`start_networking`], used to broadcast entries and
 /// query connected peer count.

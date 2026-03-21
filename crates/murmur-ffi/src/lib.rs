@@ -15,14 +15,18 @@
 
 uniffi::setup_scaffolding!("murmur");
 
+mod networking;
+
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use murmur_dag::DagEntry;
 use murmur_engine::{EngineEvent, MurmurEngine, PlatformCallbacks};
+use murmur_net::topic_from_network_id;
 use murmur_seed::WordCount;
 use murmur_seed::{DeviceKeyPair, NetworkIdentity, generate_mnemonic, parse_mnemonic};
 use murmur_types::{AccessScope, BlobHash, DeviceId, DeviceRole, FileMetadata};
-use tracing::debug;
+use tracing::{debug, error};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -307,11 +311,21 @@ impl PlatformCallbacks for CallbacksBridge {
 /// Keep alive for the duration of the session.
 #[derive(uniffi::Object)]
 pub struct MurmurHandle {
-    inner: Mutex<MurmurEngine>,
+    inner: Arc<Mutex<MurmurEngine>>,
     /// Tokio runtime for background async work.
     rt: tokio::runtime::Runtime,
     /// Stored so `fetch_blob` can call `on_blob_needed` directly.
     ffi_callbacks: SharedCallbacks,
+    /// This device's ID.
+    device_id: DeviceId,
+    /// Whether this device created the network.
+    is_creator: bool,
+    /// 32-byte secret key for the creator's iroh endpoint (deterministic from mnemonic).
+    creator_iroh_key_bytes: [u8; 32],
+    /// Gossip topic derived from the network ID.
+    topic: iroh_gossip::TopicId,
+    /// Active networking state (set by `start()`, cleared by `stop()`).
+    net: Mutex<Option<networking::NetworkState>>,
 }
 
 #[uniffi::export]
@@ -322,32 +336,69 @@ impl MurmurHandle {
         Ok(())
     }
 
-    /// Start background network activity.  Idempotent.
+    /// Start background network activity (iroh endpoint + gossip).  Idempotent.
     pub fn start(&self) {
-        // The tokio runtime is ready for spawning async tasks (gossip, sync).
-        let _handle = self.rt.handle();
-        debug!("MurmurHandle::start");
+        let mut net_guard = self.net.lock().unwrap();
+        if net_guard.is_some() {
+            debug!("MurmurHandle::start: already running");
+            return;
+        }
+
+        let engine = Arc::clone(&self.inner);
+        let callbacks = Arc::clone(&self.ffi_callbacks);
+        let device_id = self.device_id;
+        let creator_iroh_key_bytes = self.creator_iroh_key_bytes;
+        let is_creator = self.is_creator;
+        let topic = self.topic;
+
+        match self.rt.block_on(networking::start_networking(
+            engine,
+            callbacks,
+            device_id,
+            creator_iroh_key_bytes,
+            is_creator,
+            topic,
+        )) {
+            Ok(state) => {
+                debug!("MurmurHandle::start: networking started");
+                *net_guard = Some(state);
+            }
+            Err(e) => {
+                error!(error = %e, "failed to start networking");
+            }
+        }
     }
 
     /// Stop background network activity.  Idempotent.
     pub fn stop(&self) {
-        debug!("MurmurHandle::stop");
+        let mut net_guard = self.net.lock().unwrap();
+        if let Some(state) = net_guard.take() {
+            self.rt.block_on(state.close());
+            debug!("MurmurHandle::stop: networking stopped");
+        }
     }
 
     /// Approve a pending device.  `role` is `"source"`, `"backup"`, or `"full"`.
     pub fn approve_device(&self, device_id_hex: String, role: String) -> Result<(), FfiError> {
         let device_id = parse_device_id(&device_id_hex)?;
-        self.inner
+        let entry = self
+            .inner
             .lock()
             .unwrap()
             .approve_device(device_id, role_from_string(&role))?;
+        if let Some(ref net) = *self.net.lock().unwrap() {
+            let _ = net.broadcast_tx.send(entry.to_bytes());
+        }
         Ok(())
     }
 
     /// Revoke an existing device.
     pub fn revoke_device(&self, device_id_hex: String) -> Result<(), FfiError> {
         let device_id = parse_device_id(&device_id_hex)?;
-        self.inner.lock().unwrap().revoke_device(device_id)?;
+        let entry = self.inner.lock().unwrap().revoke_device(device_id)?;
+        if let Some(ref net) = *self.net.lock().unwrap() {
+            let _ = net.broadcast_tx.send(entry.to_bytes());
+        }
         Ok(())
     }
 
@@ -378,6 +429,16 @@ impl MurmurHandle {
         hex::encode(self.inner.lock().unwrap().device_id().as_bytes())
     }
 
+    /// Number of currently connected gossip peers (0 if networking not started).
+    pub fn connected_peers(&self) -> u64 {
+        self.net
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|n| n.connected_peers.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
     /// Add a file.  `blob_hash` must be blake3(`data`).
     pub fn add_file(
         &self,
@@ -405,7 +466,10 @@ impl MurmurHandle {
             created_at: metadata.created_at,
             device_origin: DeviceId::from_bytes(origin_arr),
         };
-        self.inner.lock().unwrap().add_file(file_meta, data)?;
+        let entry = self.inner.lock().unwrap().add_file(file_meta, data)?;
+        if let Some(ref net) = *self.net.lock().unwrap() {
+            let _ = net.broadcast_tx.send(entry.to_bytes());
+        }
         Ok(())
     }
 
@@ -470,6 +534,8 @@ pub fn create_network(
     let identity = NetworkIdentity::from_mnemonic(&mn, "");
     let signing_key = identity.first_device_signing_key().clone();
     let device_id = identity.first_device_id();
+    let creator_iroh_key_bytes = identity.creator_iroh_key_bytes();
+    let topic = topic_from_network_id(&identity.network_id());
 
     // Convert Box → Arc so we can share between CallbacksBridge and MurmurHandle.
     let shared: SharedCallbacks = Arc::from(callbacks);
@@ -487,9 +553,14 @@ pub fn create_network(
         message: format!("failed to create tokio runtime: {e}"),
     })?;
     Ok(Arc::new(MurmurHandle {
-        inner: Mutex::new(engine),
+        inner: Arc::new(Mutex::new(engine)),
         rt,
         ffi_callbacks: shared,
+        device_id,
+        is_creator: true,
+        creator_iroh_key_bytes,
+        topic,
+        net: Mutex::new(None),
     }))
 }
 
@@ -501,27 +572,33 @@ pub fn join_network(
     mnemonic: String,
     callbacks: Box<dyn FfiPlatformCallbacks>,
 ) -> Result<Arc<MurmurHandle>, FfiError> {
-    parse_mnemonic(&mnemonic).map_err(|e| FfiError::InvalidMnemonic {
+    let mn = parse_mnemonic(&mnemonic).map_err(|e| FfiError::InvalidMnemonic {
         message: e.to_string(),
     })?;
+    let identity = NetworkIdentity::from_mnemonic(&mn, "");
+    let creator_iroh_key_bytes = identity.creator_iroh_key_bytes();
+    let topic = topic_from_network_id(&identity.network_id());
+
     let kp = DeviceKeyPair::generate();
+    let device_id = kp.device_id();
     let shared: SharedCallbacks = Arc::from(callbacks);
     let bridge = Arc::new(CallbacksBridge {
         inner: Arc::clone(&shared),
     });
-    let engine = MurmurEngine::join_network(
-        kp.device_id(),
-        kp.signing_key().clone(),
-        device_name,
-        bridge,
-    );
+    let engine =
+        MurmurEngine::join_network(device_id, kp.signing_key().clone(), device_name, bridge);
     let rt = tokio::runtime::Runtime::new().map_err(|e| FfiError::OperationFailed {
         message: format!("failed to create tokio runtime: {e}"),
     })?;
     Ok(Arc::new(MurmurHandle {
-        inner: Mutex::new(engine),
+        inner: Arc::new(Mutex::new(engine)),
         rt,
         ffi_callbacks: shared,
+        device_id,
+        is_creator: false,
+        creator_iroh_key_bytes,
+        topic,
+        net: Mutex::new(None),
     }))
 }
 

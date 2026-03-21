@@ -24,7 +24,7 @@ crates/
   murmur-types/      Shared types (DeviceId, BlobHash, NetworkId, HLC, roles)
   murmur-seed/       BIP39 mnemonic + HKDF key derivation
   murmur-dag/        Signed append-only DAG (adapted from Shoal's LogTree, in-memory)
-  murmur-net/        Network (iroh QUIC + gossip)
+  murmur-net/        Network (iroh QUIC + gossip + shared wire utilities)
   murmur-engine/     Orchestrator (sync, approval, blob transfer, storage-agnostic)
   murmur-ipc/        IPC protocol types for daemon ↔ CLI communication
   murmur-cli/        CLI tool for managing murmurd (init, join, approve, status, etc.)

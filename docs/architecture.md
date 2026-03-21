@@ -154,7 +154,7 @@ Signed append-only DAG, adapted from Shoal's LogTree. **In-memory only** — the
 
 ### murmur-net
 
-iroh QUIC transport and gossip broadcast.
+iroh QUIC transport, gossip broadcast, and shared wire utilities.
 
 **MurmurMessage** — 12 variants covering:
 - DAG sync: `DagEntryBroadcast`, `DagSyncRequest/Response`
@@ -172,6 +172,11 @@ iroh QUIC transport and gossip broadcast.
 - TopicId derived from NetworkId
 - `subscribe_and_join()` / `broadcast_payload()`
 - ALPN isolation: each network has a unique ALPN preventing cross-network connections
+
+**Wire utilities** (`wire` module) — shared by `murmurd` and `murmur-ffi`:
+- `compress_wire()` / `decompress_wire()` — deflate compression with 1-byte flag prefix (0=raw, 1=compressed). Only compresses payloads ≥256 bytes and only if compression saves space.
+- `ChunkBuffer` — reassembly buffer for chunked blob transfers (blobs >4 MB split into 1 MB chunks)
+- Constants: `CHUNK_THRESHOLD` (4 MB), `CHUNK_SIZE` (1 MB), `COMPRESS_THRESHOLD` (256 bytes)
 
 ### murmur-engine
 
@@ -198,9 +203,10 @@ UniFFI 0.31 (proc-macro based) bindings exposing `murmur-engine` to mobile platf
 
 - FFI wrapper types: `DeviceInfoFfi`, `FileMetadataFfi`, `AccessScopeFfi`, `MurmurEventFfi`
 - `FfiPlatformCallbacks` — callback interface matching `PlatformCallbacks`
-- `MurmurHandle` — wraps `Mutex<MurmurEngine>` + owned `tokio::runtime::Runtime`. Thread-safe, synchronous FFI surface.
+- `MurmurHandle` — wraps `Arc<Mutex<MurmurEngine>>` + owned `tokio::runtime::Runtime`. Thread-safe, synchronous FFI surface. The `Arc` enables sharing the engine with async networking tasks.
 - Constructor functions: `new_mnemonic()`, `create_network()`, `join_network()`
 - Generated bindings: Kotlin (for Android), Swift (for iOS)
+- **Gossip networking**: `start()` creates an iroh endpoint, subscribes to gossip, and spawns background tasks for DAG sync and blob transfer — the same wire format as `murmurd`. `stop()` tears down networking. `connected_peers()` reports active gossip peers.
 
 **Design**: The FFI boundary is at `murmur-engine`, not at iroh. Mobile code never sees iroh types. iroh is an internal implementation detail.
 
@@ -229,7 +235,7 @@ Headless daemon for NAS, Raspberry Pi, or VPS. Pure daemon — no subcommands, m
 - Config: `~/.murmur/config.toml` (device name, role, storage paths)
 - Storage: Fjall for DAG persistence, content-addressed filesystem for blobs
 - Startup: load all DAG entries from Fjall → feed into engine → start gossip networking → listen on Unix socket
-- **Gossip networking**: creates an iroh endpoint, subscribes to a gossip topic derived from the network ID. Creator uses a deterministic iroh key (HKDF from mnemonic); joining devices use a random key and bootstrap with the creator's endpoint ID. DAG entries broadcast via gossip; new peers receive all existing entries on connect (NeighborUp catch-up).
+- **Gossip networking**: creates an iroh endpoint, subscribes to a gossip topic derived from the network ID. Creator uses a deterministic iroh key (HKDF from mnemonic); joining devices use a random key and bootstrap with the creator's endpoint ID. DAG entries broadcast via gossip with deflate compression (shared wire format from `murmur-net`). On `NeighborUp`, peers exchange `DagSyncRequest` with their tips and receive only the delta. When a `FileAdded` entry arrives, the daemon requests missing blobs via `BlobRequest`/`BlobResponse`; large blobs (>4 MB) use chunked transfer via `BlobChunk` messages.
 - **IPC socket**: accepts `CliRequest` from `murmur-cli`, produces `CliResponse`. Handles concurrent connections. Socket cleaned up on graceful shutdown; stale sockets detected and removed on startup.
 - Signal handling: graceful shutdown on SIGTERM/SIGINT
 

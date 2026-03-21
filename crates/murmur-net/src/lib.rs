@@ -6,10 +6,14 @@
 mod error;
 mod message;
 mod transport;
+mod wire;
 
 pub use error::NetError;
 pub use message::MurmurMessage;
 pub use transport::{GossipHandle, MurmurTransport};
+pub use wire::{
+    CHUNK_SIZE, CHUNK_THRESHOLD, COMPRESS_THRESHOLD, ChunkBuffer, compress_wire, decompress_wire,
+};
 
 /// Re-export low-level message helpers for tests and advanced usage.
 pub use transport::{read_message_from_recv, recv_message, send_message, write_message_to_send};

@@ -8,12 +8,12 @@ For each milestone: implement, test, `cargo clippy -- -D warnings`, `cargo fmt`,
 For architecture and design details, see [architecture.md](architecture.md).
 For a feature overview, see [features.md](features.md).
 
-## Current Status (as of 2026-03-20)
+## Current Status (as of 2026-03-21)
 
 | Milestone               | Status                                                                                                |
 | ----------------------- | ----------------------------------------------------------------------------------------------------- |
 | 0–10                    | ✅ Complete (Types, Seed, DAG, Network, Engine, Server, Integration Tests, Desktop App, FFI, Android) |
-| 11 — Daemon + CLI Split | ✅ Complete (murmur-ipc, murmur-cli, murmurd refactor, gossip networking)                             |
+| 11 — Daemon + CLI Split | ✅ Complete (murmur-ipc, murmur-cli, murmurd refactor, gossip networking, FFI networking)             |
 | 12 — Hardening          | 🔲 Planned                                                                                            |
 
 ---
