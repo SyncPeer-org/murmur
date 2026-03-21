@@ -182,7 +182,10 @@ pub async fn start_networking(
     info!(endpoint_id = %endpoint.id(), "iroh endpoint started");
 
     // Create gossip protocol.
-    let gossip = iroh_gossip::Gossip::builder().spawn(endpoint.clone());
+    // Set max gossip message size large enough for 1 MB blob chunks + overhead.
+    let gossip = iroh_gossip::Gossip::builder()
+        .max_message_size(2 * 1024 * 1024)
+        .spawn(endpoint.clone());
 
     // Accept incoming connections and route to gossip.
     let gossip_for_accept = gossip.clone();
@@ -383,18 +386,49 @@ pub async fn start_networking(
                     }
                 };
 
-                let msg = GossipMessage {
-                    nonce: rand::random(),
-                    sender: device_id,
-                    payload: GossipPayload::BlobResponse { blob_hash, data },
-                };
-                match broadcast_gossip(&sender_for_push, &msg).await {
-                    Ok(()) => {
-                        info!(%blob_hash, "push queue: blob broadcast successful, removing");
-                        let _ = storage_for_push.push_queue_remove(blob_hash);
+                if data.len() <= CHUNK_THRESHOLD {
+                    // Small blob: send as a single response.
+                    let msg = GossipMessage {
+                        nonce: rand::random(),
+                        sender: device_id,
+                        payload: GossipPayload::BlobResponse { blob_hash, data },
+                    };
+                    match broadcast_gossip(&sender_for_push, &msg).await {
+                        Ok(()) => {
+                            info!(%blob_hash, "push queue: blob broadcast successful, removing");
+                            let _ = storage_for_push.push_queue_remove(blob_hash);
+                        }
+                        Err(e) => {
+                            debug!(error = %e, %blob_hash, retry_count, "push queue: broadcast failed, will retry");
+                            let _ = storage_for_push.push_queue_increment_retry(blob_hash);
+                        }
                     }
-                    Err(e) => {
-                        debug!(error = %e, %blob_hash, retry_count, "push queue: broadcast failed, will retry");
+                } else {
+                    // Large blob: send in chunks, same as BlobRequest handler.
+                    let total_chunks = data.len().div_ceil(CHUNK_SIZE) as u32;
+                    info!(%blob_hash, size = data.len(), total_chunks, "push queue: sending blob in chunks");
+                    let mut all_ok = true;
+                    for (i, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
+                        let msg = GossipMessage {
+                            nonce: rand::random(),
+                            sender: device_id,
+                            payload: GossipPayload::BlobChunk {
+                                blob_hash,
+                                chunk_index: i as u32,
+                                total_chunks,
+                                data: chunk.to_vec(),
+                            },
+                        };
+                        if let Err(e) = broadcast_gossip(&sender_for_push, &msg).await {
+                            warn!(error = %e, %blob_hash, chunk = i, "push queue: chunk broadcast failed");
+                            all_ok = false;
+                            break;
+                        }
+                    }
+                    if all_ok {
+                        info!(%blob_hash, "push queue: chunked blob broadcast successful, removing");
+                        let _ = storage_for_push.push_queue_remove(blob_hash);
+                    } else {
                         let _ = storage_for_push.push_queue_increment_retry(blob_hash);
                     }
                 }
@@ -508,15 +542,21 @@ async fn handle_gossip_message(
         }
     };
 
-    // Sender verification: reject messages from completely unknown devices.
-    // We allow messages from pending (unapproved) devices because they need
-    // to send DeviceJoinRequest entries.
+    // Sender verification: reject non-DAG messages from completely unknown devices.
+    // DagEntry payloads are always allowed through because they may contain
+    // DeviceJoinRequest entries from new devices. The DAG authorization layer
+    // provides the definitive check for those. Other payload types (BlobRequest,
+    // BlobResponse, etc.) are blocked from unknown senders.
     {
         let eng = engine.lock().unwrap();
         let sender_known = eng.state().devices.contains_key(&gossip_msg.sender);
-        // Also allow if this is potentially a join request (DAG is small / new network).
-        // The DAG authorization layer provides the definitive check; this is early rejection.
-        if !sender_known && !eng.state().devices.is_empty() {
+        let is_dag_payload = matches!(
+            gossip_msg.payload,
+            GossipPayload::DagEntry { .. }
+                | GossipPayload::DagSyncRequest { .. }
+                | GossipPayload::DagSyncResponse { .. }
+        );
+        if !sender_known && !is_dag_payload && !eng.state().devices.is_empty() {
             debug!(sender = %gossip_msg.sender, "dropping gossip from unknown device");
             return;
         }

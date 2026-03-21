@@ -136,24 +136,50 @@ fn run_daemon(
     let platform = Arc::new(FjallPlatform::new(storage.clone()));
 
     // Create engine.
+    //
+    // Three cases:
+    // 1. Restart (has persisted DAG entries) → load from storage, no new entries.
+    // 2. First run as creator (no device.key) → create_network (auto-approves).
+    // 3. First run as joiner (has device.key) → join_network (sends join request).
     let device_role = config
         .parse_role()
         .unwrap_or(murmur_types::DeviceRole::Backup);
-    let mut engine = murmur_engine::MurmurEngine::create_network(
-        device_id,
-        signing_key,
-        config.device.name.clone(),
-        device_role,
-        platform,
-    );
+    let persisted_entries = storage.load_all_dag_entries()?;
+    let is_joiner = device_key_path.exists();
 
-    // Load persisted DAG entries.
-    let entries = storage.load_all_dag_entries()?;
-    for entry_bytes in entries {
-        if let Err(e) = engine.load_entry_bytes(&entry_bytes) {
-            warn!(error = %e, "skip loading dag entry");
+    let engine = if !persisted_entries.is_empty() {
+        // Restart: recreate engine from persisted state.
+        let dag = murmur_dag::Dag::new(device_id, signing_key);
+        let mut engine = murmur_engine::MurmurEngine::from_dag(dag, platform);
+        for entry_bytes in &persisted_entries {
+            if let Err(e) = engine.load_entry_bytes(entry_bytes) {
+                warn!(error = %e, "skip loading dag entry");
+            }
         }
-    }
+        info!(
+            entries = persisted_entries.len(),
+            "loaded persisted DAG entries"
+        );
+        engine
+    } else if is_joiner {
+        // First run as a joining device.
+        info!("joining existing network — awaiting approval");
+        murmur_engine::MurmurEngine::join_network(
+            device_id,
+            signing_key,
+            config.device.name.clone(),
+            platform,
+        )
+    } else {
+        // First run as network creator.
+        murmur_engine::MurmurEngine::create_network(
+            device_id,
+            signing_key,
+            config.device.name.clone(),
+            device_role,
+            platform,
+        )
+    };
 
     // Verify blob integrity on startup.
     let corrupted = storage.verify_all_blobs()?;

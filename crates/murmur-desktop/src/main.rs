@@ -80,9 +80,13 @@ struct App {
 
 impl Default for App {
     fn default() -> Self {
-        let data_dir = dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("murmur-desktop");
+        let data_dir = std::env::var("MURMUR_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::data_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("murmur-desktop")
+            });
 
         let mut app = Self {
             screen: Screen::Setup,
