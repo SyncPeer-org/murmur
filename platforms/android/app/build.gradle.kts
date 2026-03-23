@@ -4,21 +4,17 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
-    id("kotlin-kapt")
-}
-
-kapt {
-    correctErrorTypes = true
+    alias(libs.plugins.ksp)
 }
 
 android {
     namespace = "net.murmur.app"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "net.murmur.app"
         minSdk = 26
-        targetSdk = 35
+        targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
 
@@ -123,7 +119,7 @@ val uniffiBindgen by tasks.registering(Exec::class) {
 
 dependencies {
     // JNA is required by UniFFI-generated Kotlin bindings.
-    implementation("net.java.dev.jna:jna:5.13.0@aar")
+    implementation("net.java.dev.jna:jna:5.18.0@aar")
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
@@ -141,7 +137,7 @@ dependencies {
     // Room — DAG entry persistence.
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
-    kapt(libs.androidx.room.compiler)
+    ksp(libs.androidx.room.compiler)
 
     // Coroutines
     implementation(libs.kotlinx.coroutines.android)
