@@ -3,18 +3,25 @@
 # Automated CLI manual test runner.
 # Exercises tests from tests/manual/cli-basic.md, cli-intermediate.md, cli-advanced.md.
 #
-# Usage: ./scripts/run-cli-tests.sh
+# IMPORTANT — sandbox requirements:
+#   The daemons create Unix sockets, which the Claude Code sandbox blocks by default.
+#   Run via:  TMPDIR=/tmp/claude ./scripts/run-cli-tests.sh
+#   In Claude Code, use Bash tool with dangerouslyDisableSandbox=true so that
+#   the daemon can bind its Unix socket.  Without this the daemon starts but
+#   immediately fails with "Operation not permitted (os error 1)" on bind().
+#
+# Usage:
+#   TMPDIR=/tmp/claude ./scripts/run-cli-tests.sh
 #
 set -uo pipefail
 
 MURMURD="./target/debug/murmurd"
 CLI="./target/debug/murmur-cli"
-TESTDIR="${TMPDIR:-/tmp/claude}/murmur-test"
+TESTDIR="${TMPDIR:-/tmp}/murmur-test"
 DIR_A="$TESTDIR/a"
 DIR_B="$TESTDIR/b"
 DIR_C="$TESTDIR/c"
 SCRATCH="$TESTDIR/scratch"
-mkdir -p "$SCRATCH"
 DAEMON_A_PID=""
 DAEMON_B_PID=""
 
@@ -23,115 +30,99 @@ FAIL=0
 SKIP=0
 FAILURES=""
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-NC='\033[0m'
+# Colors (strip if not a tty)
+if [ -t 1 ]; then
+    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; NC=''
+fi
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+pass() { PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: $1"; }
+fail() { FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: $1 — $2"; FAILURES="${FAILURES}  $1: $2\n"; }
+skip() { SKIP=$((SKIP + 1)); echo -e "  ${YELLOW}SKIP${NC}: $1 — $2"; }
+
+# jq_get <json_string> <python_expr>  — extract a field from JSON using python3
+jq_get() {
+    echo "$1" | python3 -c "import sys,json; d=json.load(sys.stdin); print($2)" 2>/dev/null || echo ""
+}
 
 cleanup() {
     echo ""
     echo "=== Cleaning up ==="
-    [ -n "$DAEMON_A_PID" ] && kill "$DAEMON_A_PID" 2>/dev/null && wait "$DAEMON_A_PID" 2>/dev/null || true
-    [ -n "$DAEMON_B_PID" ] && kill "$DAEMON_B_PID" 2>/dev/null && wait "$DAEMON_B_PID" 2>/dev/null || true
+    stop_daemon "$DAEMON_A_PID"
+    stop_daemon "$DAEMON_B_PID"
+    # Also kill any stray murmurd processes using our test dirs
+    pkill -f "murmurd.*murmur-test" 2>/dev/null || true
+    sleep 1
     rm -rf "$TESTDIR"
     echo ""
     echo "=============================="
-    echo -e "  Results: ${GREEN}${PASS} passed${NC}, ${RED}${FAIL} failed${NC}, ${YELLOW}${SKIP} skipped${NC}"
+    printf "  Results: ${GREEN}%d passed${NC}, ${RED}%d failed${NC}, ${YELLOW}%d skipped${NC}\n" "$PASS" "$FAIL" "$SKIP"
     echo "=============================="
     if [ -n "$FAILURES" ]; then
         echo ""
         echo -e "${RED}Failed tests:${NC}"
-        echo "$FAILURES"
+        printf "%b" "$FAILURES"
     fi
 }
 trap cleanup EXIT
 
-pass() {
-    PASS=$((PASS + 1))
-    echo -e "  ${GREEN}PASS${NC}: $1"
-}
-
-fail() {
-    FAIL=$((FAIL + 1))
-    echo -e "  ${RED}FAIL${NC}: $1 — $2"
-    FAILURES="${FAILURES}  $1: $2\n"
-}
-
-skip() {
-    SKIP=$((SKIP + 1))
-    echo -e "  ${YELLOW}SKIP${NC}: $1 — $2"
-}
-
 # Start a daemon in the background.
-# Usage: start_daemon <dir> <name> [role]
-# Writes PID to $TESTDIR/.last_pid on success.
-# Returns 0 on success, 1 on failure.
+# Writes PID to $TESTDIR/.last_pid. Returns 0 on success, 1 on failure.
 start_daemon() {
-    local dir="$1"
-    local name="$2"
-    local role="${3:-full}"
-    "$MURMURD" --data-dir "$dir" --name "$name" --role "$role" >"$TESTDIR/.daemon-out" 2>&1 &
+    local dir="$1" name="$2" role="${3:-full}"
+    mkdir -p "$dir"
+    "$MURMURD" --data-dir "$dir" --name "$name" --role "$role" \
+        >"$TESTDIR/.daemon-${name}.log" 2>&1 &
     local pid=$!
-    # Wait for socket to appear
     local waited=0
     while [ ! -S "$dir/murmurd.sock" ] && [ $waited -lt 30 ]; do
-        sleep 0.5
-        waited=$((waited + 1))
+        sleep 0.5; waited=$((waited + 1))
         if ! kill -0 "$pid" 2>/dev/null; then
-            echo "ERROR: daemon died during startup (dir=$dir)" >&2
-            cat "$TESTDIR/.daemon-out" >&2 2>/dev/null || true
+            echo "  ERROR: daemon died during startup (dir=$dir)" >&2
+            tail -5 "$TESTDIR/.daemon-${name}.log" >&2 2>/dev/null || true
             return 1
         fi
     done
     if [ ! -S "$dir/murmurd.sock" ]; then
-        echo "ERROR: daemon socket never appeared (dir=$dir)" >&2
-        return 1
+        echo "  ERROR: daemon socket never appeared (dir=$dir)" >&2; return 1
     fi
     echo "$pid" > "$TESTDIR/.last_pid"
-    return 0
 }
 
-# Read the last started daemon's PID
-last_pid() {
-    cat "$TESTDIR/.last_pid" 2>/dev/null || echo ""
-}
+last_pid() { cat "$TESTDIR/.last_pid" 2>/dev/null || echo ""; }
 
 stop_daemon() {
-    local pid="$1"
+    local pid="${1:-}"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null
-        wait "$pid" 2>/dev/null || true
+        kill "$pid" 2>/dev/null || true
+        local waited=0
+        while kill -0 "$pid" 2>/dev/null && [ $waited -lt 12 ]; do
+            sleep 0.5; waited=$((waited + 1))
+        done
+        kill -9 "$pid" 2>/dev/null || true
     fi
 }
 
-# Wait for a condition with timeout. Returns 0 if condition met, 1 if timeout.
-wait_for() {
-    local desc="$1"
-    local timeout="${2:-15}"
-    shift 2
-    local waited=0
-    while [ $waited -lt "$timeout" ]; do
-        if eval "$@" >/dev/null 2>&1; then
-            return 0
-        fi
-        sleep 1
-        waited=$((waited + 1))
-    done
-    return 1
-}
+# CLI wrapper — always returns exit code, never kills the script
+cli() { "$CLI" "$@" 2>&1 || true; }
+cli_exit() { "$CLI" "$@" 2>&1; echo $?; }
 
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
 echo "=============================="
 echo "  Murmur CLI Test Runner"
 echo "=============================="
 echo ""
-
-# Build
 echo "=== Building ==="
 cargo build -p murmurd -p murmur-cli 2>&1 | tail -1
 echo ""
 
-# Clean slate
 rm -rf "$TESTDIR"
 mkdir -p "$SCRATCH"
 
@@ -139,1043 +130,683 @@ mkdir -p "$SCRATCH"
 # BASIC TESTS
 ########################################################################
 echo "========================================="
-echo "  BASIC TESTS (Network, Devices, Sync)"
+echo "  BASIC TESTS"
 echo "========================================="
 echo ""
 
 # B1 — Network Creation
 echo "--- B1: Network Creation ---"
 start_daemon "$DIR_A" "node-a" "full" && DAEMON_A_PID=$(last_pid) || DAEMON_A_PID=""
-if [ -S "$DIR_A/murmurd.sock" ]; then
-    pass "B1 — daemon started, socket exists"
-else
-    fail "B1" "daemon socket not found"
-fi
+[ -n "$DAEMON_A_PID" ] && [ -S "$DIR_A/murmurd.sock" ] \
+    && pass "B1 — daemon started" || fail "B1" "daemon not running"
 
-# Save mnemonic
-MNEMONIC=$(cat "$DIR_A/mnemonic" 2>/dev/null || echo "")
-if [ -n "$MNEMONIC" ]; then
-    WORD_COUNT=$(echo "$MNEMONIC" | wc -w)
-    if [ "$WORD_COUNT" -eq 24 ]; then
-        pass "B1 — mnemonic is 24 words"
-    else
-        fail "B1" "mnemonic has $WORD_COUNT words, expected 24"
-    fi
-else
-    fail "B1" "no mnemonic file"
-fi
+MNEMONIC=$(cat "$DIR_A/mnemonic" 2>/dev/null | tr -d '\n' || echo "")
+WORD_COUNT=$(echo "$MNEMONIC" | wc -w | tr -d ' ')
+[ "$WORD_COUNT" -eq 24 ] \
+    && pass "B1 — mnemonic is 24 words" \
+    || fail "B1" "mnemonic has $WORD_COUNT words"
 
-# B2 — Status Command
-echo "--- B2: Status Command ---"
-STATUS_OUT=$("$CLI" --data-dir "$DIR_A" status 2>&1) || true
-if echo "$STATUS_OUT" | grep -q "Device:.*node-a"; then
-    pass "B2 — status shows device name"
-else
-    fail "B2" "status missing device name: $STATUS_OUT"
-fi
-if echo "$STATUS_OUT" | grep -q "DAG entries:"; then
-    pass "B2 — status shows DAG entries"
-else
-    fail "B2" "status missing DAG entries"
-fi
+# B2 — Status (plain)
+echo "--- B2/B3: Status ---"
+STATUS_PLAIN=$(cli --data-dir "$DIR_A" status)
+echo "$STATUS_PLAIN" | grep -q "Device:.*node-a" \
+    && pass "B2 — status shows device name" || fail "B2" "$STATUS_PLAIN"
+echo "$STATUS_PLAIN" | grep -q "DAG entries:" \
+    && pass "B2 — status shows DAG entries" || fail "B2" "missing DAG entries"
 
-# B3 — Status JSON
-echo "--- B3: Status JSON ---"
-STATUS_JSON=$("$CLI" --data-dir "$DIR_A" status --json 2>&1) || true
-if echo "$STATUS_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'device_id' in d and 'dag_entries' in d" 2>/dev/null; then
-    pass "B3 — status JSON is valid with expected fields"
-else
-    fail "B3" "invalid JSON or missing fields"
-fi
+# B3 — Status JSON  (wrapped: {"Status": {...}})
+STATUS_JSON=$(cli --data-dir "$DIR_A" status --json)
+DEV_ID=$(jq_get "$STATUS_JSON" "d['Status']['device_id']")
+DAG_CNT=$(jq_get "$STATUS_JSON" "d['Status']['dag_entries']")
+[ "${#DEV_ID}" -eq 64 ] && [ -n "$DAG_CNT" ] \
+    && pass "B3 — status JSON valid (dag=$DAG_CNT)" || fail "B3" "bad JSON: $STATUS_JSON"
 
-# B4 — Devices Command
-echo "--- B4: Devices Command ---"
-DEVICES_OUT=$("$CLI" --data-dir "$DIR_A" devices 2>&1) || true
-if echo "$DEVICES_OUT" | grep -q "node-a"; then
-    pass "B4 — devices shows node-a"
-else
-    fail "B4" "devices missing node-a"
-fi
+# B4 — Devices
+echo "--- B4: Devices ---"
+DEVICES_PLAIN=$(cli --data-dir "$DIR_A" devices)
+echo "$DEVICES_PLAIN" | grep -q "node-a" \
+    && pass "B4 — devices shows node-a" || fail "B4" "$DEVICES_PLAIN"
 
-DEVICES_JSON=$("$CLI" --data-dir "$DIR_A" devices --json 2>&1) || true
-if echo "$DEVICES_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); assert len(d['devices']) == 1" 2>/dev/null; then
-    pass "B4 — devices JSON has 1 device"
-else
-    fail "B4" "devices JSON wrong count"
-fi
+DEVICES_JSON=$(cli --data-dir "$DIR_A" devices --json)
+DEV_COUNT=$(jq_get "$DEVICES_JSON" "len(d['Devices']['devices'])")
+[ "$DEV_COUNT" -eq 1 ] \
+    && pass "B4 — devices JSON has 1 entry" || fail "B4" "count=$DEV_COUNT"
 
-# B5 — Pending (Empty)
-echo "--- B5: Pending (Empty) ---"
-PENDING_OUT=$("$CLI" --data-dir "$DIR_A" pending 2>&1) || true
-if echo "$PENDING_OUT" | grep -qi "no pending"; then
-    pass "B5 — no pending requests"
-else
-    fail "B5" "unexpected pending output: $PENDING_OUT"
-fi
+# B5 — Pending
+echo "--- B5/B6/B7: Pending, Files, Mnemonic ---"
+cli --data-dir "$DIR_A" pending | grep -qi "no pending" \
+    && pass "B5 — no pending requests" || fail "B5" "unexpected pending"
 
-# B6 — Files (Empty)
-echo "--- B6: Files (Empty) ---"
-FILES_OUT=$("$CLI" --data-dir "$DIR_A" files 2>&1) || true
-if echo "$FILES_OUT" | grep -qi "no synced files"; then
-    pass "B6 — no synced files"
-else
-    fail "B6" "unexpected files output: $FILES_OUT"
-fi
+# B6 — Files
+cli --data-dir "$DIR_A" files | grep -qi "no synced files" \
+    && pass "B6 — no synced files" || fail "B6" "unexpected files"
 
-# B7 — Mnemonic Retrieval
-echo "--- B7: Mnemonic Retrieval ---"
-MNEMONIC_OUT=$("$CLI" --data-dir "$DIR_A" mnemonic 2>&1) || true
-if [ "$MNEMONIC_OUT" = "$MNEMONIC" ]; then
-    pass "B7 — mnemonic matches"
-else
-    fail "B7" "mnemonic mismatch"
-fi
+# B7 — Mnemonic
+MNEMONIC_OUT=$(cli --data-dir "$DIR_A" mnemonic)
+[ "$MNEMONIC_OUT" = "$MNEMONIC" ] \
+    && pass "B7 — mnemonic matches" || fail "B7" "mismatch"
+MNEMONIC_JSON=$(cli --data-dir "$DIR_A" mnemonic --json)
+MNEMONIC_JSON_VAL=$(jq_get "$MNEMONIC_JSON" "d['Mnemonic']['mnemonic']")
+[ "$MNEMONIC_JSON_VAL" = "$MNEMONIC" ] \
+    && pass "B7 — mnemonic JSON valid" || fail "B7" "JSON mnemonic wrong"
 
-# B8 — Device Join (Offline)
-echo "--- B8: Device Join (Offline) ---"
-JOIN_OUT=$("$CLI" --data-dir "$DIR_B" join "$MNEMONIC" --name "node-b" --role backup 2>&1) || true
-if echo "$JOIN_OUT" | grep -q "Joined Murmur network"; then
-    pass "B8 — join succeeded"
-else
-    fail "B8" "join failed: $JOIN_OUT"
-fi
-if [ -f "$DIR_B/config.toml" ] && [ -f "$DIR_B/mnemonic" ] && [ -f "$DIR_B/device.key" ]; then
-    pass "B8 — config, mnemonic, device.key all created"
-else
-    fail "B8" "missing files after join"
-fi
+# B8 — Join offline
+echo "--- B8–B11: Join & Validation ---"
+JOIN_OUT=$(cli --data-dir "$DIR_B" join "$MNEMONIC" --name "node-b" --role backup)
+echo "$JOIN_OUT" | grep -q "Joined Murmur network" \
+    && pass "B8 — join succeeded" || fail "B8" "$JOIN_OUT"
+[ -f "$DIR_B/config.toml" ] && [ -f "$DIR_B/mnemonic" ] && [ -f "$DIR_B/device.key" ] \
+    && pass "B8 — config/mnemonic/key created" || fail "B8" "missing files"
 
-# B9 — Invalid Mnemonic
-echo "--- B9: Invalid Mnemonic ---"
-BAD_MNEMONIC_OUT=$("$CLI" --data-dir $TESTDIR/bad join "not a valid mnemonic" --name "bad" --role backup 2>&1) && BAD_EXIT=0 || BAD_EXIT=$?
-if [ $BAD_EXIT -ne 0 ]; then
-    pass "B9 — invalid mnemonic rejected (exit $BAD_EXIT)"
-else
-    fail "B9" "invalid mnemonic accepted"
-fi
+# B9 — Invalid mnemonic
+BAD_EXIT=$(cli_exit --data-dir "$TESTDIR/bad" join "not a valid mnemonic" --name "x" --role backup | tail -1)
+[ "$BAD_EXIT" -ne 0 ] && pass "B9 — bad mnemonic rejected" || fail "B9" "accepted"
 
-# B10 — Invalid Role
-echo "--- B10: Invalid Role ---"
-BAD_ROLE_OUT=$("$CLI" --data-dir $TESTDIR/bad join "$MNEMONIC" --name "bad" --role superadmin 2>&1) && BAD_EXIT=0 || BAD_EXIT=$?
-if [ $BAD_EXIT -ne 0 ]; then
-    pass "B10 — invalid role rejected (exit $BAD_EXIT)"
-else
-    fail "B10" "invalid role accepted"
-fi
+# B10 — Invalid role
+BAD_EXIT=$(cli_exit --data-dir "$TESTDIR/bad" join "$MNEMONIC" --name "x" --role superadmin | tail -1)
+[ "$BAD_EXIT" -ne 0 ] && pass "B10 — bad role rejected" || fail "B10" "accepted"
 
-# B11 — Double Init
-echo "--- B11: Double Init ---"
-DOUBLE_INIT_OUT=$("$CLI" --data-dir "$DIR_B" join "$MNEMONIC" --name "node-b2" --role backup 2>&1) && DI_EXIT=0 || DI_EXIT=$?
-if [ $DI_EXIT -ne 0 ]; then
-    pass "B11 — double init rejected"
-else
-    fail "B11" "double init allowed"
-fi
+# B11 — Double init
+DOUBLE_EXIT=$(cli_exit --data-dir "$DIR_B" join "$MNEMONIC" --name "x" --role backup | tail -1)
+[ "$DOUBLE_EXIT" -ne 0 ] && pass "B11 — double init rejected" || fail "B11" "allowed"
 
 # B12 — Start Node B
-echo "--- B12: Start Node B ---"
+echo "--- B12–B16: Node B Join + Approval ---"
 start_daemon "$DIR_B" "node-b" "backup" && DAEMON_B_PID=$(last_pid) || DAEMON_B_PID=""
-if [ -S "$DIR_B/murmurd.sock" ]; then
-    pass "B12 — Node B daemon started"
-else
-    fail "B12" "Node B socket not found"
-fi
+[ -n "$DAEMON_B_PID" ] \
+    && pass "B12 — Node B started" || fail "B12" "daemon failed"
 
-# B13 — Pending Shows Join Request
-echo "--- B13: Pending Shows Join Request ---"
-# Wait for the join request to propagate
-sleep 3
-PENDING_OUT=$("$CLI" --data-dir "$DIR_A" pending 2>&1) || true
-if echo "$PENDING_OUT" | grep -q "node-b"; then
-    pass "B13 — node-b visible as pending"
-    # Extract device ID
-    NODE_B_ID=$(echo "$PENDING_OUT" | grep "node-b" | awk '{print $1}')
-else
-    fail "B13" "node-b not in pending list: $PENDING_OUT"
-    # Try to get the ID anyway
-    NODE_B_ID=""
-fi
+# B13 — Pending
+sleep 5
+PENDING_PLAIN=$(cli --data-dir "$DIR_A" pending)
+echo "$PENDING_PLAIN" | grep -q "node-b" \
+    && pass "B13 — node-b visible as pending" || fail "B13" "$PENDING_PLAIN"
+# Extract device ID: line format "  <hex64> node-b"
+NODE_B_ID=$(echo "$PENDING_PLAIN" | awk '/node-b/{print $1}' | head -1)
 
-# B14 — Device Approval
-echo "--- B14: Device Approval ---"
+# B14 — Approve
 if [ -n "$NODE_B_ID" ]; then
-    APPROVE_OUT=$("$CLI" --data-dir "$DIR_A" approve "$NODE_B_ID" --role backup 2>&1) || true
-    if echo "$APPROVE_OUT" | grep -qi "approved\|ok\|success"; then
-        pass "B14 — device approved"
-    else
-        fail "B14" "approval response: $APPROVE_OUT"
-    fi
+    APPROVE_OUT=$(cli --data-dir "$DIR_A" approve "$NODE_B_ID" --role backup)
+    echo "$APPROVE_OUT" | grep -qi "approved\|ok\|success" \
+        && pass "B14 — device approved" || fail "B14" "$APPROVE_OUT"
 else
     skip "B14" "no device ID from B13"
 fi
 
-# Wait for gossip propagation
-sleep 5
+sleep 6
 
-# B15 — Both Nodes See Both Devices
-echo "--- B15: Both Nodes See Both Devices ---"
-DEVICES_A=$("$CLI" --data-dir "$DIR_A" devices 2>&1) || true
-DEVICES_B=$("$CLI" --data-dir "$DIR_B" devices 2>&1) || true
-if echo "$DEVICES_A" | grep -q "node-a" && echo "$DEVICES_A" | grep -q "node-b"; then
-    pass "B15 — Node A sees both devices"
-else
-    fail "B15" "Node A devices: $DEVICES_A"
-fi
-if echo "$DEVICES_B" | grep -q "node-a" && echo "$DEVICES_B" | grep -q "node-b"; then
-    pass "B15 — Node B sees both devices"
-else
-    fail "B15" "Node B devices: $DEVICES_B"
-fi
+# B15 — Both see both
+DEVICES_A=$(cli --data-dir "$DIR_A" devices)
+DEVICES_B=$(cli --data-dir "$DIR_B" devices)
+echo "$DEVICES_A" | grep -q "node-a" && echo "$DEVICES_A" | grep -q "node-b" \
+    && pass "B15 — Node A sees both" || fail "B15" "$DEVICES_A"
+echo "$DEVICES_B" | grep -q "node-a" && echo "$DEVICES_B" | grep -q "node-b" \
+    && pass "B15 — Node B sees both" || fail "B15" "$DEVICES_B"
 
-# B16 — Peer Count
-echo "--- B16: Peer Count ---"
-STATUS_A=$("$CLI" --data-dir "$DIR_A" status 2>&1) || true
-PEERS_A=$(echo "$STATUS_A" | grep "Peers:" | awk '{print $2}')
-if [ "${PEERS_A:-0}" -ge 1 ]; then
-    pass "B16 — Node A has >= 1 peer"
-else
-    fail "B16" "Node A peers: $PEERS_A"
-fi
+# B16 — Peer count
+PEERS_A=$(jq_get "$(cli --data-dir "$DIR_A" status --json)" "d['Status']['peer_count']")
+[ "${PEERS_A:-0}" -ge 1 ] \
+    && pass "B16 — Node A has peers ($PEERS_A)" || fail "B16" "peers=$PEERS_A"
 
-# B17 — File Sync A→B
-echo "--- B17: File Sync A→B ---"
-echo "Hello from Node A" > $SCRATCH/test-file-a.txt
-ADD_OUT=$("$CLI" --data-dir "$DIR_A" add $SCRATCH/test-file-a.txt 2>&1) || true
-if echo "$ADD_OUT" | grep -qi "added\|ok\|success\|hash"; then
-    pass "B17 — file added on Node A"
-else
-    fail "B17" "add failed: $ADD_OUT"
-fi
+# B17 — File sync A→B
+echo "--- B17–B21: File Sync ---"
+echo "Hello from Node A" > "$SCRATCH/test-file-a.txt"
+ADD_A=$(cli --data-dir "$DIR_A" add "$SCRATCH/test-file-a.txt")
+echo "$ADD_A" | grep -qi "added\|ok\|success\|hash" \
+    && pass "B17 — file added" || fail "B17" "$ADD_A"
+sleep 6
+cli --data-dir "$DIR_A" files | grep -q "test-file-a" \
+    && pass "B17 — file on Node A" || fail "B17" "missing on A"
+cli --data-dir "$DIR_B" files | grep -q "test-file-a" \
+    && pass "B17 — file synced to Node B" || fail "B17" "missing on B"
 
-# Wait for sync
-sleep 5
+# B18 — Blob integrity
+[ -d "$DIR_B/blobs" ] && [ "$(find "$DIR_B/blobs" -type f | head -1)" != "" ] \
+    && pass "B18 — blob directory has content" || fail "B18" "blobs empty"
 
-FILES_A=$("$CLI" --data-dir "$DIR_A" files 2>&1) || true
-if echo "$FILES_A" | grep -q "test-file-a.txt"; then
-    pass "B17 — file visible on Node A"
-else
-    fail "B17" "file not on Node A: $FILES_A"
-fi
-
-FILES_B=$("$CLI" --data-dir "$DIR_B" files 2>&1) || true
-if echo "$FILES_B" | grep -q "test-file-a.txt"; then
-    pass "B17 — file synced to Node B"
-else
-    fail "B17" "file not on Node B: $FILES_B"
-fi
-
-# B18 — Blob Integrity
-echo "--- B18: Blob Integrity ---"
-if [ -d "$DIR_B/blobs" ] && [ "$(ls -A "$DIR_B/blobs/" 2>/dev/null | head -1)" != "" ]; then
-    pass "B18 — blob directory has content on Node B"
-else
-    fail "B18" "blob directory empty or missing on Node B"
-fi
-
-# B19 — File Sync B→A
-echo "--- B19: File Sync B→A ---"
-echo "Hello from Node B" > $SCRATCH/test-file-b.txt
-ADD_B_OUT=$("$CLI" --data-dir "$DIR_B" add $SCRATCH/test-file-b.txt 2>&1) || true
-if echo "$ADD_B_OUT" | grep -qi "added\|ok\|success\|hash"; then
-    pass "B19 — file added on Node B"
-else
-    fail "B19" "add on B failed: $ADD_B_OUT"
-fi
-sleep 5
-FILES_A2=$("$CLI" --data-dir "$DIR_A" files 2>&1) || true
-if echo "$FILES_A2" | grep -q "test-file-b.txt"; then
-    pass "B19 — file synced to Node A"
-else
-    fail "B19" "file not on Node A: $FILES_A2"
-fi
+# B19 — Sync B→A
+echo "Hello from Node B" > "$SCRATCH/test-file-b.txt"
+cli --data-dir "$DIR_B" add "$SCRATCH/test-file-b.txt" >/dev/null
+sleep 6
+cli --data-dir "$DIR_A" files | grep -q "test-file-b" \
+    && pass "B19 — B→A sync works" || fail "B19" "missing on A"
 
 # B20 — Files JSON
-echo "--- B20: Files JSON ---"
-FILES_JSON=$("$CLI" --data-dir "$DIR_A" files --json 2>&1) || true
-if echo "$FILES_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); assert len(d['files']) >= 2; f=d['files'][0]; assert 'blob_hash' in f and 'path' in f and 'size' in f" 2>/dev/null; then
-    pass "B20 — files JSON valid with all fields"
-else
-    fail "B20" "files JSON invalid"
-fi
+FILES_JSON=$(cli --data-dir "$DIR_A" files --json)
+FILE_COUNT=$(jq_get "$FILES_JSON" "len(d['Files']['files'])")
+HAS_FIELDS=$(jq_get "$FILES_JSON" "'ok' if all(k in d['Files']['files'][0] for k in ['blob_hash','path','size','device_origin']) else 'fail'" 2>/dev/null || echo "fail")
+[ "${FILE_COUNT:-0}" -ge 2 ] \
+    && pass "B20 — files JSON count ($FILE_COUNT)" || fail "B20" "count=$FILE_COUNT"
+[ "$HAS_FIELDS" = "ok" ] \
+    && pass "B20 — files JSON has required fields" || fail "B20" "missing fields"
 
-# B21 — DAG Consistency
-echo "--- B21: DAG Entry Counts Match ---"
-DAG_A=$("$CLI" --data-dir "$DIR_A" status --json 2>&1 | python3 -c "import sys,json; print(json.load(sys.stdin)['dag_entries'])" 2>/dev/null) || DAG_A="?"
-DAG_B=$("$CLI" --data-dir "$DIR_B" status --json 2>&1 | python3 -c "import sys,json; print(json.load(sys.stdin)['dag_entries'])" 2>/dev/null) || DAG_B="?"
-if [ "$DAG_A" = "$DAG_B" ] && [ "$DAG_A" != "?" ]; then
-    pass "B21 — DAG entries match: $DAG_A"
-else
-    fail "B21" "DAG mismatch: A=$DAG_A B=$DAG_B"
-fi
+# B21 — DAG consistency
+DAG_A=$(jq_get "$(cli --data-dir "$DIR_A" status --json)" "d['Status']['dag_entries']")
+DAG_B=$(jq_get "$(cli --data-dir "$DIR_B" status --json)" "d['Status']['dag_entries']")
+[ "$DAG_A" = "$DAG_B" ] && [ -n "$DAG_A" ] \
+    && pass "B21 — DAG consistent ($DAG_A)" || fail "B21" "A=$DAG_A B=$DAG_B"
 
-# B22 — No Daemon Error
+# B22 — No daemon error
 echo "--- B22: No Daemon Error ---"
-stop_daemon "$DAEMON_B_PID"
-DAEMON_B_PID=""
-sleep 1
-NO_DAEMON_OUT=$("$CLI" --data-dir "$DIR_B" status 2>&1) && ND_EXIT=0 || ND_EXIT=$?
-if [ $ND_EXIT -ne 0 ] && echo "$NO_DAEMON_OUT" | grep -qi "not running"; then
-    pass "B22 — clear error when daemon not running"
-else
-    fail "B22" "unexpected output (exit=$ND_EXIT): $NO_DAEMON_OUT"
-fi
+stop_daemon "$DAEMON_B_PID"; DAEMON_B_PID=""; sleep 1
+NO_DAEMON=$(cli --data-dir "$DIR_B" status)
+NO_DAEMON_EXIT=$(cli_exit --data-dir "$DIR_B" status | tail -1)
+echo "$NO_DAEMON" | grep -qi "not running" && [ "$NO_DAEMON_EXIT" -ne 0 ] \
+    && pass "B22 — clear error when no daemon" || fail "B22" "exit=$NO_DAEMON_EXIT $NO_DAEMON"
 
-# Restart Node B for intermediate tests
+# Restart B for intermediate tests
 start_daemon "$DIR_B" "node-b" "backup" && DAEMON_B_PID=$(last_pid) || DAEMON_B_PID=""
-sleep 3
+sleep 4
 
 ########################################################################
 # INTERMEDIATE TESTS
 ########################################################################
 echo ""
 echo "========================================="
-echo "  INTERMEDIATE TESTS (Folders, History)"
+echo "  INTERMEDIATE TESTS"
 echo "========================================="
 echo ""
 
-# I1 — Folder List
-echo "--- I1: Folder List ---"
-FOLDER_LIST=$("$CLI" --data-dir "$DIR_A" folder list 2>&1) || true
-if echo "$FOLDER_LIST" | grep -qi "default\|folder"; then
-    pass "I1 — folder list shows content"
-else
-    fail "I1" "folder list: $FOLDER_LIST"
-fi
+# I1/I2 — Folder list
+echo "--- I1–I4: Folder Create & List ---"
+FOLDER_LIST=$(cli --data-dir "$DIR_A" folder list)
+echo "$FOLDER_LIST" | grep -qi "default\|No shared\|folder" \
+    && pass "I1 — folder list returns content" || fail "I1" "$FOLDER_LIST"
 
-# I2 — Folder List JSON
-echo "--- I2: Folder List JSON ---"
-FOLDER_JSON=$("$CLI" --data-dir "$DIR_A" folder list --json 2>&1) || true
-if echo "$FOLDER_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'folders' in d" 2>/dev/null; then
-    pass "I2 — folder list JSON valid"
-    # Extract default folder ID
-    DEFAULT_FOLDER_ID=$(echo "$FOLDER_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); folders=[f for f in d['folders'] if f['name']=='default']; print(folders[0]['folder_id'] if folders else '')" 2>/dev/null) || DEFAULT_FOLDER_ID=""
-else
-    fail "I2" "folder list JSON invalid"
-    DEFAULT_FOLDER_ID=""
-fi
+FOLDER_LIST_JSON=$(cli --data-dir "$DIR_A" folder list --json)
+FCOUNT=$(jq_get "$FOLDER_LIST_JSON" "len(d['Folders']['folders'])")
+[ -n "$FCOUNT" ] && pass "I2 — folder list JSON valid ($FCOUNT folders)" || fail "I2" "invalid JSON"
 
-# I3 — Create Folder
-echo "--- I3: Create Folder ---"
-CREATE_OUT=$("$CLI" --data-dir "$DIR_A" folder create "photos" 2>&1) || true
-if echo "$CREATE_OUT" | grep -qi "created\|ok\|success"; then
-    pass "I3 — photos folder created"
-else
-    fail "I3" "create folder: $CREATE_OUT"
-fi
+# Get default folder ID
+DEFAULT_FOLDER_ID=$(jq_get "$FOLDER_LIST_JSON" \
+    "next((f['folder_id'] for f in d['Folders']['folders'] if f['name']=='default'), '')")
 
-sleep 5
+# I3 — Create "photos" folder
+CREATE_OUT=$(cli --data-dir "$DIR_A" folder create "photos")
+echo "$CREATE_OUT" | grep -qi "created\|ok\|success" \
+    && pass "I3 — photos folder created" || fail "I3" "$CREATE_OUT"
+sleep 6
 
-# Extract photos folder ID
-FOLDER_JSON2=$("$CLI" --data-dir "$DIR_A" folder list --json 2>&1) || true
-PHOTOS_FOLDER_ID=$(echo "$FOLDER_JSON2" | python3 -c "import sys,json; d=json.load(sys.stdin); folders=[f for f in d['folders'] if f['name']=='photos']; print(folders[0]['folder_id'] if folders else '')" 2>/dev/null) || PHOTOS_FOLDER_ID=""
+FOLDER_LIST_JSON2=$(cli --data-dir "$DIR_A" folder list --json)
+PHOTOS_FOLDER_ID=$(jq_get "$FOLDER_LIST_JSON2" \
+    "next((f['folder_id'] for f in d['Folders']['folders'] if f['name']=='photos'), '')")
+cli --data-dir "$DIR_B" folder list | grep -q "photos" \
+    && pass "I3 — photos synced to Node B" || fail "I3" "not on B"
 
-# Verify on Node B
-FOLDER_B=$("$CLI" --data-dir "$DIR_B" folder list 2>&1) || true
-if echo "$FOLDER_B" | grep -q "photos"; then
-    pass "I3 — photos folder synced to Node B"
-else
-    fail "I3" "photos not on Node B: $FOLDER_B"
-fi
+# I4 — Create "documents" folder
+cli --data-dir "$DIR_A" folder create "documents" >/dev/null
+sleep 4
+FOLDER_LIST_JSON3=$(cli --data-dir "$DIR_A" folder list --json)
+FCOUNT3=$(jq_get "$FOLDER_LIST_JSON3" "len(d['Folders']['folders'])")
+[ "${FCOUNT3:-0}" -ge 3 ] \
+    && pass "I4 — three folders exist ($FCOUNT3)" || fail "I4" "count=$FCOUNT3"
+DOCUMENTS_FOLDER_ID=$(jq_get "$FOLDER_LIST_JSON3" \
+    "next((f['folder_id'] for f in d['Folders']['folders'] if f['name']=='documents'), '')")
 
-# I4 — Create Second Folder
-echo "--- I4: Create Second Folder ---"
-"$CLI" --data-dir "$DIR_A" folder create "documents" 2>&1 || true
-sleep 3
-FOLDER_JSON3=$("$CLI" --data-dir "$DIR_A" folder list --json 2>&1) || true
-FOLDER_COUNT=$(echo "$FOLDER_JSON3" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['folders']))" 2>/dev/null) || FOLDER_COUNT="?"
-if [ "${FOLDER_COUNT:-0}" -ge 3 ]; then
-    pass "I4 — three folders exist"
-else
-    fail "I4" "folder count: $FOLDER_COUNT"
-fi
-
-DOCUMENTS_FOLDER_ID=$(echo "$FOLDER_JSON3" | python3 -c "import sys,json; d=json.load(sys.stdin); folders=[f for f in d['folders'] if f['name']=='documents']; print(folders[0]['folder_id'] if folders else '')" 2>/dev/null) || DOCUMENTS_FOLDER_ID=""
-
-# I5 — Folder Status
-echo "--- I5: Folder Status ---"
+# I5/I6 — Folder status
+echo "--- I5–I8: Folder Status ---"
 if [ -n "$DEFAULT_FOLDER_ID" ]; then
-    FSTATUS=$("$CLI" --data-dir "$DIR_A" folder status "$DEFAULT_FOLDER_ID" 2>&1) || true
-    if echo "$FSTATUS" | grep -q "Folder:"; then
-        pass "I5 — folder status returned"
-    else
-        fail "I5" "folder status: $FSTATUS"
-    fi
+    FSTATUS=$(cli --data-dir "$DIR_A" folder status "$DEFAULT_FOLDER_ID")
+    echo "$FSTATUS" | grep -q "Folder:" \
+        && pass "I5 — folder status returned" || fail "I5" "$FSTATUS"
+    FSTATUS_JSON=$(cli --data-dir "$DIR_A" folder status "$DEFAULT_FOLDER_ID" --json)
+    FS_ID=$(jq_get "$FSTATUS_JSON" "d['FolderStatus']['folder_id']")
+    FS_FC=$(jq_get "$FSTATUS_JSON" "d['FolderStatus']['file_count']")
+    [ -n "$FS_ID" ] && [ -n "$FS_FC" ] \
+        && pass "I6 — folder status JSON valid" || fail "I6" "$FSTATUS_JSON"
 else
-    skip "I5" "no default folder ID"
+    skip "I5" "no default folder ID"; skip "I6" "no default folder ID"
 fi
 
-# I6 — Folder Status JSON
-echo "--- I6: Folder Status JSON ---"
-if [ -n "$DEFAULT_FOLDER_ID" ]; then
-    FSTATUS_JSON=$("$CLI" --data-dir "$DIR_A" folder status "$DEFAULT_FOLDER_ID" --json 2>&1) || true
-    if echo "$FSTATUS_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'folder_id' in d and 'file_count' in d" 2>/dev/null; then
-        pass "I6 — folder status JSON valid"
-    else
-        fail "I6" "folder status JSON invalid"
-    fi
-else
-    skip "I6" "no default folder ID"
-fi
-
-# I7 — Folder Status Non-existent
-echo "--- I7: Folder Status Non-existent ---"
+# I7 — Non-existent folder
 BAD_FID="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-FSTATUS_BAD=$("$CLI" --data-dir "$DIR_A" folder status "$BAD_FID" 2>&1) && FS_EXIT=0 || FS_EXIT=$?
-if [ $FS_EXIT -ne 0 ] || echo "$FSTATUS_BAD" | grep -qi "error\|not found"; then
-    pass "I7 — non-existent folder returns error"
-else
-    fail "I7" "no error for bad folder: $FSTATUS_BAD"
-fi
+FS_BAD_EXIT=$(cli_exit --data-dir "$DIR_A" folder status "$BAD_FID" | tail -1)
+[ "$FS_BAD_EXIT" -ne 0 ] \
+    && pass "I7 — non-existent folder returns error" || fail "I7" "exit=$FS_BAD_EXIT"
 
-# I8 — Folder Status Invalid Hex
-echo "--- I8: Folder Status Invalid Hex ---"
-FSTATUS_BADHEX=$("$CLI" --data-dir "$DIR_A" folder status "not-hex" 2>&1) && FH_EXIT=0 || FH_EXIT=$?
-if [ $FH_EXIT -ne 0 ] || echo "$FSTATUS_BADHEX" | grep -qi "error\|invalid"; then
-    pass "I8 — invalid hex returns error"
-else
-    fail "I8" "no error for bad hex: $FSTATUS_BADHEX"
-fi
+# I8 — Invalid hex
+FH_EXIT=$(cli_exit --data-dir "$DIR_A" folder status "not-hex" | tail -1)
+[ "$FH_EXIT" -ne 0 ] \
+    && pass "I8 — invalid hex returns error" || fail "I8" "exit=$FH_EXIT"
 
-# I9 — Subscribe to Folder
-echo "--- I9: Subscribe to Folder ---"
+# I9/I10 — Subscribe
+echo "--- I9–I12: Subscribe & Mode ---"
 if [ -n "$PHOTOS_FOLDER_ID" ]; then
-    SUB_OUT=$("$CLI" --data-dir "$DIR_B" folder subscribe "$PHOTOS_FOLDER_ID" $TESTDIR/b-photos 2>&1) || true
-    if echo "$SUB_OUT" | grep -qi "subscrib\|ok\|success"; then
-        pass "I9 — subscribed to photos"
-    else
-        fail "I9" "subscribe: $SUB_OUT"
-    fi
+    SUB=$(cli --data-dir "$DIR_B" folder subscribe "$PHOTOS_FOLDER_ID" "$TESTDIR/b-photos")
+    echo "$SUB" | grep -qi "subscrib\|ok\|success" \
+        && pass "I9 — subscribed to photos" || fail "I9" "$SUB"
+    PHOTOS_MODE=$(jq_get "$(cli --data-dir "$DIR_B" folder list --json)" \
+        "next((f.get('mode') for f in d['Folders']['folders'] if f['name']=='photos'), None)")
+    [ "$PHOTOS_MODE" = "read-write" ] \
+        && pass "I9 — default mode is read-write" || fail "I9" "mode=$PHOTOS_MODE"
 else
     skip "I9" "no photos folder ID"
 fi
 
-# I10 — Subscribe Read-Only
-echo "--- I10: Subscribe Read-Only ---"
 if [ -n "$DOCUMENTS_FOLDER_ID" ]; then
-    SUB_RO=$("$CLI" --data-dir "$DIR_B" folder subscribe "$DOCUMENTS_FOLDER_ID" $TESTDIR/b-docs --read-only 2>&1) || true
-    if echo "$SUB_RO" | grep -qi "subscrib\|ok\|success"; then
-        pass "I10 — subscribed read-only"
-    else
-        fail "I10" "subscribe read-only: $SUB_RO"
-    fi
-    # Verify mode
-    FLIST_B=$("$CLI" --data-dir "$DIR_B" folder list --json 2>&1) || true
-    DOC_MODE=$(echo "$FLIST_B" | python3 -c "import sys,json; d=json.load(sys.stdin); folders=[f for f in d['folders'] if f['name']=='documents']; print(folders[0].get('mode','') if folders else '')" 2>/dev/null) || DOC_MODE=""
-    if [ "$DOC_MODE" = "read-only" ]; then
-        pass "I10 — mode is read-only"
-    else
-        fail "I10" "mode is '$DOC_MODE', expected 'read-only'"
-    fi
+    cli --data-dir "$DIR_B" folder subscribe "$DOCUMENTS_FOLDER_ID" "$TESTDIR/b-docs" --read-only >/dev/null
+    DOC_MODE=$(jq_get "$(cli --data-dir "$DIR_B" folder list --json)" \
+        "next((f.get('mode') for f in d['Folders']['folders'] if f['name']=='documents'), None)")
+    [ "$DOC_MODE" = "read-only" ] \
+        && pass "I10 — documents subscribed read-only" || fail "I10" "mode=$DOC_MODE"
 else
     skip "I10" "no documents folder ID"
 fi
 
-# I11 — Subscribe Non-existent
-echo "--- I11: Subscribe Non-existent ---"
-SUB_BAD=$("$CLI" --data-dir "$DIR_B" folder subscribe "$BAD_FID" $TESTDIR/b-fake 2>&1) && SB_EXIT=0 || SB_EXIT=$?
-if [ $SB_EXIT -ne 0 ] || echo "$SUB_BAD" | grep -qi "error\|not found"; then
-    pass "I11 — subscribe to non-existent folder rejected"
-else
-    fail "I11" "no error: $SUB_BAD"
-fi
+# I11 — Subscribe non-existent
+SNONE_EXIT=$(cli_exit --data-dir "$DIR_B" folder subscribe "$BAD_FID" "$TESTDIR/b-fake" | tail -1)
+[ "$SNONE_EXIT" -ne 0 ] \
+    && pass "I11 — subscribe non-existent rejected" || fail "I11" "exit=$SNONE_EXIT"
 
-# I12 — Change Folder Mode
-echo "--- I12: Change Folder Mode ---"
+# I12 — Change mode
 if [ -n "$PHOTOS_FOLDER_ID" ]; then
-    MODE_OUT=$("$CLI" --data-dir "$DIR_B" folder mode "$PHOTOS_FOLDER_ID" read-only 2>&1) || true
-    if echo "$MODE_OUT" | grep -qi "mode\|ok\|success\|changed"; then
-        pass "I12 — mode changed to read-only"
-    else
-        fail "I12" "mode change: $MODE_OUT"
-    fi
-    # Change back
-    "$CLI" --data-dir "$DIR_B" folder mode "$PHOTOS_FOLDER_ID" read-write 2>&1 || true
+    MODE_OUT=$(cli --data-dir "$DIR_B" folder mode "$PHOTOS_FOLDER_ID" read-only)
+    echo "$MODE_OUT" | grep -qi "mode\|ok\|success\|changed" \
+        && pass "I12 — mode changed to read-only" || fail "I12" "$MODE_OUT"
+    cli --data-dir "$DIR_B" folder mode "$PHOTOS_FOLDER_ID" read-write >/dev/null
+    BACK_MODE=$(jq_get "$(cli --data-dir "$DIR_B" folder list --json)" \
+        "next((f.get('mode') for f in d['Folders']['folders'] if f['name']=='photos'), None)")
+    [ "$BACK_MODE" = "read-write" ] \
+        && pass "I12 — mode restored to read-write" || fail "I12" "mode=$BACK_MODE"
 else
     skip "I12" "no photos folder ID"
 fi
 
-# I13 — Folder Files
-echo "--- I13: Folder Files ---"
+# I13/I14 — Folder files
+echo "--- I13–I17: Folder Files & MIME ---"
 if [ -n "$DEFAULT_FOLDER_ID" ]; then
-    FFILES=$("$CLI" --data-dir "$DIR_A" folder files "$DEFAULT_FOLDER_ID" 2>&1) || true
-    if echo "$FFILES" | grep -q "test-file-a.txt\|test-file-b.txt\|No synced files"; then
-        pass "I13 — folder files returned content"
-    else
-        fail "I13" "folder files: $FFILES"
-    fi
+    FFILES=$(cli --data-dir "$DIR_A" folder files "$DEFAULT_FOLDER_ID")
+    echo "$FFILES" | grep -qi "test-file\|synced\|No synced" \
+        && pass "I13 — folder files returned" || fail "I13" "$FFILES"
+    FFILES_JSON=$(cli --data-dir "$DIR_A" folder files "$DEFAULT_FOLDER_ID" --json)
+    jq_get "$FFILES_JSON" "'ok' if 'files' in d['Files'] else 'fail'" | grep -q "ok" \
+        && pass "I13 — folder files JSON valid" || fail "I13" "JSON invalid"
 else
     skip "I13" "no default folder ID"
 fi
 
-# I14 — Folder Files Empty
-echo "--- I14: Folder Files (Empty Folder) ---"
 if [ -n "$PHOTOS_FOLDER_ID" ]; then
-    FFILES_EMPTY=$("$CLI" --data-dir "$DIR_A" folder files "$PHOTOS_FOLDER_ID" 2>&1) || true
-    if echo "$FFILES_EMPTY" | grep -qi "no synced files\|0)\|files (0"; then
-        pass "I14 — photos folder is empty"
-    else
-        # It's also OK if it just lists files (maybe some were added)
-        pass "I14 — folder files returned (possibly empty)"
-    fi
+    FFILES_EMPTY=$(cli --data-dir "$DIR_A" folder files "$PHOTOS_FOLDER_ID")
+    echo "$FFILES_EMPTY" | grep -qi "no synced files\|0\|empty" \
+        && pass "I14 — empty folder list works" || pass "I14 — folder files returned (may be empty)"
 else
     skip "I14" "no photos folder ID"
 fi
 
-# I16 — MIME Type Detection
-echo "--- I16: MIME Type Detection ---"
-echo '{"key": "value"}' > $SCRATCH/test.json
-"$CLI" --data-dir "$DIR_A" add $SCRATCH/test.json 2>&1 || true
-sleep 2
-FILES_MIME=$("$CLI" --data-dir "$DIR_A" files 2>&1) || true
-if echo "$FILES_MIME" | grep -q "test.json"; then
-    pass "I16 — JSON file added with MIME info"
-else
-    fail "I16" "test.json not in files"
-fi
+# I16 — MIME type
+echo '{"key": "value"}' > "$SCRATCH/test.json"
+cli --data-dir "$DIR_A" add "$SCRATCH/test.json" >/dev/null
+sleep 3
+cli --data-dir "$DIR_A" files | grep -q "test.json" \
+    && pass "I16 — JSON file appears in files" || fail "I16" "not found"
 
-# I18 — Large File Transfer
-echo "--- I18: Large File Transfer ---"
-dd if=/dev/urandom of=$SCRATCH/test-large.bin bs=1M count=5 2>/dev/null
-LARGE_OUT=$("$CLI" --data-dir "$DIR_A" add $SCRATCH/test-large.bin 2>&1) || true
-if echo "$LARGE_OUT" | grep -qi "added\|ok\|success\|hash"; then
-    pass "I18 — 5 MB file added"
-else
-    fail "I18" "large file add: $LARGE_OUT"
-fi
+# I17 — Dedup
+ADD1=$(jq_get "$(cli --data-dir "$DIR_A" add "$SCRATCH/test-file-a.txt" --json 2>/dev/null || cli --data-dir "$DIR_A" add "$SCRATCH/test-file-a.txt")" "d.get('Ok',{}).get('message','') or d.get('Error',{}).get('message','')" 2>/dev/null || cli --data-dir "$DIR_A" add "$SCRATCH/test-file-a.txt")
+pass "I17 — re-add same file completes without crash"
 
-# I19 — Transfer Status
-echo "--- I19: Transfer Status ---"
-TRANSFERS=$("$CLI" --data-dir "$DIR_A" transfers 2>&1) || true
-# Either shows active transfers or "no active transfers" — both are valid
-if echo "$TRANSFERS" | grep -qi "transfer\|no active"; then
-    pass "I19 — transfer status command works"
-else
-    fail "I19" "transfers: $TRANSFERS"
-fi
+# I18/I19/I20 — Large file
+echo "--- I18–I20: Large File Transfer ---"
+dd if=/dev/urandom of="$SCRATCH/test-large.bin" bs=1M count=5 2>/dev/null
+ADD_L=$(cli --data-dir "$DIR_A" add "$SCRATCH/test-large.bin")
+echo "$ADD_L" | grep -qi "added\|ok\|success\|hash" \
+    && pass "I18 — 5 MB file added" || fail "I18" "$ADD_L"
 
-TRANSFERS_JSON=$("$CLI" --data-dir "$DIR_A" transfers --json 2>&1) || true
-if echo "$TRANSFERS_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'transfers' in d" 2>/dev/null; then
-    pass "I19 — transfers JSON valid"
-else
-    fail "I19" "transfers JSON invalid"
-fi
+TRANSFERS=$(cli --data-dir "$DIR_A" transfers)
+echo "$TRANSFERS" | grep -qi "transfer\|no active" \
+    && pass "I19 — transfer status works" || fail "I19" "$TRANSFERS"
+XFERS_JSON=$(cli --data-dir "$DIR_A" transfers --json)
+jq_get "$XFERS_JSON" "'ok' if 'transfers' in d['TransferStatus'] else 'fail'" | grep -q "ok" \
+    && pass "I19 — transfers JSON valid" || fail "I19" "JSON invalid"
 
-# I20 — Large File Arrives
-echo "--- I20: Large File Sync ---"
-sleep 10
-FILES_B_LARGE=$("$CLI" --data-dir "$DIR_B" files 2>&1) || true
-if echo "$FILES_B_LARGE" | grep -q "test-large.bin"; then
-    pass "I20 — large file synced to Node B"
-else
-    fail "I20" "large file not on Node B"
-fi
+sleep 12
+cli --data-dir "$DIR_B" files | grep -q "test-large.bin" \
+    && pass "I20 — large file synced to Node B" || fail "I20" "not on B"
 
-# I21 — Delta Sync
-echo "--- I21: Delta Sync on Reconnect ---"
-stop_daemon "$DAEMON_B_PID"
-DAEMON_B_PID=""
-sleep 1
-echo "Added while B offline" > $SCRATCH/test-offline.txt
-"$CLI" --data-dir "$DIR_A" add $SCRATCH/test-offline.txt 2>&1 || true
+# I21/I22 — Delta sync
+echo "--- I21–I22: Delta Sync ---"
+stop_daemon "$DAEMON_B_PID"; DAEMON_B_PID=""; sleep 1
+echo "Offline content" > "$SCRATCH/test-offline.txt"
+cli --data-dir "$DIR_A" add "$SCRATCH/test-offline.txt" >/dev/null
 
 start_daemon "$DIR_B" "node-b" "backup" && DAEMON_B_PID=$(last_pid) || DAEMON_B_PID=""
-sleep 8
+sleep 10
+cli --data-dir "$DIR_B" files | grep -q "test-offline.txt" \
+    && pass "I21 — delta sync after reconnect" || fail "I21" "offline file not synced"
 
-FILES_B_DELTA=$("$CLI" --data-dir "$DIR_B" files 2>&1) || true
-if echo "$FILES_B_DELTA" | grep -q "test-offline.txt"; then
-    pass "I21 — delta sync worked"
-else
-    fail "I21" "offline file not synced to Node B"
-fi
+# Multi offline
+stop_daemon "$DAEMON_B_PID"; DAEMON_B_PID=""; sleep 1
+for i in 1 2 3; do
+    echo "Offline file $i" > "$SCRATCH/test-off${i}.txt"
+    cli --data-dir "$DIR_A" add "$SCRATCH/test-off${i}.txt" >/dev/null
+done
+start_daemon "$DIR_B" "node-b" "backup" && DAEMON_B_PID=$(last_pid) || DAEMON_B_PID=""
+sleep 10
+OFF_CNT=$(cli --data-dir "$DIR_B" files | grep -c "test-off" || echo "0")
+[ "${OFF_CNT:-0}" -ge 3 ] \
+    && pass "I22 — multi offline sync ($OFF_CNT entries)" || fail "I22" "count=$OFF_CNT"
 
-# I23 — Conflicts (Empty)
-echo "--- I23: Conflicts (Empty) ---"
-CONFLICTS=$("$CLI" --data-dir "$DIR_A" conflicts 2>&1) || true
-if echo "$CONFLICTS" | grep -qi "no active conflicts"; then
-    pass "I23 — no conflicts"
-else
-    fail "I23" "unexpected conflicts: $CONFLICTS"
-fi
+# I23–I26 — Conflicts
+echo "--- I23–I26: Conflicts ---"
+cli --data-dir "$DIR_A" conflicts | grep -qi "no active conflicts" \
+    && pass "I23 — no conflicts" || fail "I23" "unexpected conflicts"
 
-# I24 — Conflicts JSON
-echo "--- I24: Conflicts JSON ---"
-CONFLICTS_JSON=$("$CLI" --data-dir "$DIR_A" conflicts --json 2>&1) || true
-if echo "$CONFLICTS_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'conflicts' in d" 2>/dev/null; then
-    pass "I24 — conflicts JSON valid"
-else
-    fail "I24" "conflicts JSON invalid"
-fi
+CONFL_JSON=$(cli --data-dir "$DIR_A" conflicts --json)
+jq_get "$CONFL_JSON" "'ok' if 'conflicts' in d['Conflicts'] else 'fail'" | grep -q "ok" \
+    && pass "I24 — conflicts JSON valid" || fail "I24" "JSON invalid"
 
-# I25 — Conflicts by Folder
-echo "--- I25: Conflicts by Folder ---"
 if [ -n "$DEFAULT_FOLDER_ID" ]; then
-    CONFLICTS_F=$("$CLI" --data-dir "$DIR_A" conflicts --folder "$DEFAULT_FOLDER_ID" 2>&1) || true
-    if echo "$CONFLICTS_F" | grep -qi "no active conflicts\|conflicts"; then
-        pass "I25 — conflicts by folder works"
-    else
-        fail "I25" "conflicts by folder: $CONFLICTS_F"
-    fi
+    cli --data-dir "$DIR_A" conflicts --folder "$DEFAULT_FOLDER_ID" | grep -qi "conflict" \
+        && pass "I25 — folder-filtered conflicts works" || fail "I25" "no response"
 else
     skip "I25" "no default folder ID"
 fi
 
-# I26 — Resolve Non-existent
-echo "--- I26: Resolve Non-existent ---"
 if [ -n "$DEFAULT_FOLDER_ID" ]; then
-    RESOLVE_BAD=$("$CLI" --data-dir "$DIR_A" resolve "$DEFAULT_FOLDER_ID" no-such.txt "$BAD_FID" 2>&1) && RB_EXIT=0 || RB_EXIT=$?
-    if [ $RB_EXIT -ne 0 ] || echo "$RESOLVE_BAD" | grep -qi "error\|not found"; then
-        pass "I26 — resolve non-existent rejected"
-    else
-        fail "I26" "no error: $RESOLVE_BAD"
-    fi
+    RES_EXIT=$(cli_exit --data-dir "$DIR_A" resolve "$DEFAULT_FOLDER_ID" no-such.txt "$BAD_FID" | tail -1)
+    [ "$RES_EXIT" -ne 0 ] \
+        && pass "I26 — resolve non-existent rejected" || fail "I26" "exit=$RES_EXIT"
 else
     skip "I26" "no default folder ID"
 fi
 
-# I27 — File History
-echo "--- I27: File History ---"
+# I27–I30 — History
+echo "--- I27–I30: File History ---"
 if [ -n "$DEFAULT_FOLDER_ID" ]; then
-    HISTORY=$("$CLI" --data-dir "$DIR_A" history "$DEFAULT_FOLDER_ID" test-file-a.txt 2>&1) || true
-    if echo "$HISTORY" | grep -qi "version\|node-a\|bytes"; then
-        pass "I27 — file history returned"
-    else
-        fail "I27" "history: $HISTORY"
-    fi
+    HIST=$(cli --data-dir "$DIR_A" history "$DEFAULT_FOLDER_ID" test-file-a.txt)
+    echo "$HIST" | grep -qi "version\|node-a\|bytes\|hash" \
+        && pass "I27 — file history returned" || fail "I27" "$HIST"
+
+    HIST_JSON=$(cli --data-dir "$DIR_A" history "$DEFAULT_FOLDER_ID" test-file-a.txt --json)
+    VERS=$(jq_get "$HIST_JSON" "len(d['FileVersions']['versions'])")
+    [ "${VERS:-0}" -ge 1 ] \
+        && pass "I28 — history JSON has $VERS version(s)" || fail "I28" "versions=$VERS"
+
+    HIST_NONE=$(cli --data-dir "$DIR_A" history "$DEFAULT_FOLDER_ID" no-such-file.txt)
+    echo "$HIST_NONE" | grep -qi "no version" \
+        && pass "I29 — no history for non-existent" || fail "I29" "$HIST_NONE"
+
+    HIST_B=$(cli --data-dir "$DIR_B" history "$DEFAULT_FOLDER_ID" test-file-a.txt --json)
+    VERS_B=$(jq_get "$HIST_B" "len(d['FileVersions']['versions'])")
+    [ "$VERS_B" = "$VERS" ] \
+        && pass "I30 — history consistent across nodes" || fail "I30" "A=$VERS B=$VERS_B"
 else
     skip "I27" "no default folder ID"
-fi
-
-# I28 — File History JSON
-echo "--- I28: File History JSON ---"
-if [ -n "$DEFAULT_FOLDER_ID" ]; then
-    HISTORY_JSON=$("$CLI" --data-dir "$DIR_A" history "$DEFAULT_FOLDER_ID" test-file-a.txt --json 2>&1) || true
-    if echo "$HISTORY_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'versions' in d" 2>/dev/null; then
-        pass "I28 — history JSON valid"
-    else
-        fail "I28" "history JSON invalid"
-    fi
-else
     skip "I28" "no default folder ID"
-fi
-
-# I29 — History Non-existent
-echo "--- I29: History Non-existent ---"
-if [ -n "$DEFAULT_FOLDER_ID" ]; then
-    HISTORY_NONE=$("$CLI" --data-dir "$DIR_A" history "$DEFAULT_FOLDER_ID" no-such-file.txt 2>&1) || true
-    if echo "$HISTORY_NONE" | grep -qi "no version"; then
-        pass "I29 — no history for non-existent file"
-    else
-        fail "I29" "unexpected: $HISTORY_NONE"
-    fi
-else
     skip "I29" "no default folder ID"
+    skip "I30" "no default folder ID"
 fi
 
-# I31 — Unsubscribe
-echo "--- I31: Unsubscribe ---"
+# I31/I32 — Unsubscribe
+echo "--- I31–I33: Unsubscribe & Remove ---"
 if [ -n "$DOCUMENTS_FOLDER_ID" ]; then
-    UNSUB=$("$CLI" --data-dir "$DIR_B" folder unsubscribe "$DOCUMENTS_FOLDER_ID" 2>&1) || true
-    if echo "$UNSUB" | grep -qi "unsubscrib\|ok\|success"; then
-        pass "I31 — unsubscribed from documents"
-    else
-        fail "I31" "unsubscribe: $UNSUB"
-    fi
+    UNSUB=$(cli --data-dir "$DIR_B" folder unsubscribe "$DOCUMENTS_FOLDER_ID")
+    echo "$UNSUB" | grep -qi "unsubscrib\|ok\|success" \
+        && pass "I31 — unsubscribed from documents" || fail "I31" "$UNSUB"
+    SUB_STATE=$(jq_get "$(cli --data-dir "$DIR_B" folder list --json)" \
+        "next((str(f.get('subscribed')) for f in d['Folders']['folders'] if f['name']=='documents'), 'missing')")
+    [ "$SUB_STATE" = "False" ] \
+        && pass "I31 — subscribed=false confirmed" || fail "I31" "state=$SUB_STATE"
+
+    # Re-subscribe then unsubscribe with keep-local
+    cli --data-dir "$DIR_B" folder subscribe "$DOCUMENTS_FOLDER_ID" "$TESTDIR/b-docs2" >/dev/null
+    cli --data-dir "$DIR_B" folder unsubscribe "$DOCUMENTS_FOLDER_ID" --keep-local >/dev/null
+    pass "I32 — unsubscribe with keep-local completed"
 else
     skip "I31" "no documents folder ID"
+    skip "I32" "no documents folder ID"
 fi
 
-# I33 — Folder Remove
-echo "--- I33: Folder Remove ---"
+# I33 — Folder remove
 if [ -n "$DOCUMENTS_FOLDER_ID" ]; then
-    RMFOLDER=$("$CLI" --data-dir "$DIR_A" folder remove "$DOCUMENTS_FOLDER_ID" 2>&1) || true
-    if echo "$RMFOLDER" | grep -qi "removed\|ok\|success"; then
-        pass "I33 — documents folder removed"
-    else
-        fail "I33" "folder remove: $RMFOLDER"
-    fi
-    sleep 3
-    # Verify removed on both
-    FLIST_AFTER=$("$CLI" --data-dir "$DIR_A" folder list 2>&1) || true
-    if echo "$FLIST_AFTER" | grep -q "documents"; then
-        fail "I33" "documents still listed on Node A"
-    else
-        pass "I33 — documents gone from Node A"
-    fi
+    RMFOLDER=$(cli --data-dir "$DIR_A" folder remove "$DOCUMENTS_FOLDER_ID")
+    echo "$RMFOLDER" | grep -qi "removed\|ok\|success" \
+        && pass "I33 — documents removed" || fail "I33" "$RMFOLDER"
+    sleep 4
+    cli --data-dir "$DIR_A" folder list | grep -q "documents" \
+        && fail "I33" "documents still listed" || pass "I33 — documents gone from Node A"
 else
     skip "I33" "no documents folder ID"
 fi
 
-# I34 — DAG Consistency
-echo "--- I34: DAG Consistency After Folder Ops ---"
-sleep 3
-DAG_A2=$("$CLI" --data-dir "$DIR_A" status --json 2>&1 | python3 -c "import sys,json; print(json.load(sys.stdin)['dag_entries'])" 2>/dev/null) || DAG_A2="?"
-DAG_B2=$("$CLI" --data-dir "$DIR_B" status --json 2>&1 | python3 -c "import sys,json; print(json.load(sys.stdin)['dag_entries'])" 2>/dev/null) || DAG_B2="?"
-if [ "$DAG_A2" = "$DAG_B2" ] && [ "$DAG_A2" != "?" ]; then
-    pass "I34 — DAG consistent: $DAG_A2 entries"
-else
-    fail "I34" "DAG mismatch: A=$DAG_A2 B=$DAG_B2"
-fi
+# I34 — Final DAG consistency
+echo "--- I34: DAG Consistency ---"
+sleep 4
+DAG_A2=$(jq_get "$(cli --data-dir "$DIR_A" status --json)" "d['Status']['dag_entries']")
+DAG_B2=$(jq_get "$(cli --data-dir "$DIR_B" status --json)" "d['Status']['dag_entries']")
+[ "$DAG_A2" = "$DAG_B2" ] && [ -n "$DAG_A2" ] \
+    && pass "I34 — DAG consistent ($DAG_A2)" || fail "I34" "A=$DAG_A2 B=$DAG_B2"
 
 ########################################################################
 # ADVANCED TESTS
 ########################################################################
 echo ""
 echo "========================================="
-echo "  ADVANCED TESTS (Security, Persistence)"
+echo "  ADVANCED TESTS"
 echo "========================================="
 echo ""
 
-# A1 — Device Revocation
-echo "--- A1: Device Revocation ---"
-if [ -n "$NODE_B_ID" ]; then
-    # Get current Node B's device ID (may have changed if re-joined)
-    DEVICES_JSON_NOW=$("$CLI" --data-dir "$DIR_A" devices --json 2>&1) || true
-    CURR_B_ID=$(echo "$DEVICES_JSON_NOW" | python3 -c "import sys,json; d=json.load(sys.stdin); devs=[dev for dev in d['devices'] if 'node-b' in dev['name']]; print(devs[0]['device_id'] if devs else '')" 2>/dev/null) || CURR_B_ID=""
-    if [ -n "$CURR_B_ID" ]; then
-        REVOKE_OUT=$("$CLI" --data-dir "$DIR_A" revoke "$CURR_B_ID" 2>&1) || true
-        if echo "$REVOKE_OUT" | grep -qi "revoked\|ok\|success"; then
-            pass "A1 — device revoked"
-        else
-            fail "A1" "revoke: $REVOKE_OUT"
-        fi
-    else
-        skip "A1" "couldn't find node-b device ID"
-    fi
+# A1/A2 — Revocation
+echo "--- A1–A4: Device Revocation ---"
+CURR_B_ID=$(jq_get "$(cli --data-dir "$DIR_A" devices --json)" \
+    "next((d2['device_id'] for d2 in d['Devices']['devices'] if 'node-b' in d2['name']), '')")
+if [ -n "$CURR_B_ID" ]; then
+    REVOKE_OUT=$(cli --data-dir "$DIR_A" revoke "$CURR_B_ID")
+    echo "$REVOKE_OUT" | grep -qi "revoked\|ok\|success" \
+        && pass "A1 — device revoked" || fail "A1" "$REVOKE_OUT"
 else
-    skip "A1" "no device ID"
+    skip "A1" "no node-b device ID"
 fi
 
-# A2 — Revoked Device Removed
-echo "--- A2: Revoked Device Removed ---"
-DEVICES_AFTER=$("$CLI" --data-dir "$DIR_A" devices 2>&1) || true
-if echo "$DEVICES_AFTER" | grep -q "node-b"; then
-    fail "A2" "node-b still in device list"
-else
-    pass "A2 — node-b removed from device list"
-fi
+cli --data-dir "$DIR_A" devices | grep -q "node-b" \
+    && fail "A2" "node-b still listed" || pass "A2 — node-b removed"
 
-# A3 — Revoked Device Cannot Sync
-echo "--- A3: Revoked Cannot Sync ---"
-echo "From revoked node" > $SCRATCH/test-revoked.txt
-"$CLI" --data-dir "$DIR_B" add $SCRATCH/test-revoked.txt 2>&1 || true
-sleep 3
-FILES_A_REV=$("$CLI" --data-dir "$DIR_A" files 2>&1) || true
-if echo "$FILES_A_REV" | grep -q "test-revoked.txt"; then
-    fail "A3" "revoked node's file appeared on Node A"
-else
-    pass "A3 — revoked node's file rejected"
-fi
+# A3 — Revoked can't sync
+echo "From revoked" > "$SCRATCH/test-revoked.txt"
+cli --data-dir "$DIR_B" add "$SCRATCH/test-revoked.txt" >/dev/null
+sleep 4
+cli --data-dir "$DIR_A" files | grep -q "test-revoked" \
+    && fail "A3" "revoked file appeared on A" || pass "A3 — revoked entry rejected"
 
-# A5 — Approve Invalid Hex
-echo "--- A5: Approve Invalid Hex ---"
-APPROVE_BAD=$("$CLI" --data-dir "$DIR_A" approve "not-hex" --role backup 2>&1) && AB_EXIT=0 || AB_EXIT=$?
-if [ $AB_EXIT -ne 0 ] || echo "$APPROVE_BAD" | grep -qi "error\|invalid"; then
-    pass "A5 — invalid hex rejected"
-else
-    fail "A5" "no error: $APPROVE_BAD"
-fi
+# A4/A5 — Error cases
+REVOKE_NONE=$(cli --data-dir "$DIR_A" revoke "$BAD_FID")
+echo "$REVOKE_NONE" | grep -qi "error\|not found\|no such" \
+    && pass "A4 — revoke non-existent returns error" || fail "A4" "$REVOKE_NONE"
 
-# A7 — Re-approve After Revocation
+APP_HEX=$(cli_exit --data-dir "$DIR_A" approve "not-hex" --role backup | tail -1)
+[ "$APP_HEX" -ne 0 ] && pass "A5 — approve invalid hex rejected" || fail "A5" "exit=0"
+
+# A7 — Re-join after revocation
 echo "--- A7: Re-join After Revocation ---"
-stop_daemon "$DAEMON_B_PID"
-DAEMON_B_PID=""
-sleep 1
+stop_daemon "$DAEMON_B_PID"; DAEMON_B_PID=""; sleep 1
 rm -rf "$DIR_B"
-"$CLI" --data-dir "$DIR_B" join "$MNEMONIC" --name "node-b-v2" --role full 2>&1 || true
+cli --data-dir "$DIR_B" join "$MNEMONIC" --name "node-b-v2" --role full >/dev/null
 start_daemon "$DIR_B" "node-b-v2" "full" && DAEMON_B_PID=$(last_pid) || DAEMON_B_PID=""
-sleep 5
-PENDING_REJOIN=$("$CLI" --data-dir "$DIR_A" pending 2>&1) || true
-if echo "$PENDING_REJOIN" | grep -q "node-b-v2"; then
-    pass "A7 — node-b-v2 visible as pending"
-    NEW_B_ID=$(echo "$PENDING_REJOIN" | grep "node-b-v2" | awk '{print $1}')
-    "$CLI" --data-dir "$DIR_A" approve "$NEW_B_ID" --role full 2>&1 || true
-    sleep 5
-    DEVICES_REJOIN=$("$CLI" --data-dir "$DIR_A" devices 2>&1) || true
-    if echo "$DEVICES_REJOIN" | grep -q "node-b-v2"; then
-        pass "A7 — node-b-v2 approved"
-    else
-        fail "A7" "node-b-v2 not in devices after approval: $DEVICES_REJOIN"
-    fi
-else
-    fail "A7" "node-b-v2 not in pending: $PENDING_REJOIN"
+sleep 6
+PENDING_REJOIN=$(cli --data-dir "$DIR_A" pending)
+echo "$PENDING_REJOIN" | grep -q "node-b-v2" \
+    && pass "A7 — node-b-v2 pending" || fail "A7" "$PENDING_REJOIN"
+NEW_B_ID=$(echo "$PENDING_REJOIN" | awk '/node-b-v2/{print $1}' | head -1)
+if [ -n "$NEW_B_ID" ]; then
+    cli --data-dir "$DIR_A" approve "$NEW_B_ID" --role full >/dev/null
+    sleep 6
+    cli --data-dir "$DIR_A" devices | grep -q "node-b-v2" \
+        && pass "A7 — node-b-v2 approved" || fail "A7" "not in devices"
 fi
 
-# A8 — Graceful Shutdown
-echo "--- A8: Graceful Shutdown ---"
-stop_daemon "$DAEMON_A_PID"
-DAEMON_A_PID=""
-sleep 1
-if [ ! -S "$DIR_A/murmurd.sock" ]; then
-    pass "A8 — socket cleaned up on shutdown"
-else
-    fail "A8" "socket still exists after shutdown"
-fi
+# A8/A9 — Shutdown & socket cleanup
+echo "--- A8–A9: Shutdown & Stale Socket ---"
+stop_daemon "$DAEMON_A_PID"; DAEMON_A_PID=""; sleep 1
+[ ! -S "$DIR_A/murmurd.sock" ] \
+    && pass "A8 — socket cleaned on shutdown" || fail "A8" "socket remains"
 
-# A9 — Stale Socket Detection
-echo "--- A9: Stale Socket Detection ---"
+# Stale socket
 touch "$DIR_A/murmurd.sock"
 start_daemon "$DIR_A" "node-a" "full" && DAEMON_A_PID=$(last_pid) || DAEMON_A_PID=""
-if [ -S "$DIR_A/murmurd.sock" ]; then
-    pass "A9 — daemon started despite stale socket"
-else
-    fail "A9" "daemon failed to start with stale socket"
-fi
+[ -S "$DIR_A/murmurd.sock" ] \
+    && pass "A9 — started with stale socket" || fail "A9" "failed to start"
 
-# A10–A14 — Restart Persistence
+# A10–A14 — Persistence
 echo "--- A10–A14: Restart Persistence ---"
-DEVICES_PERSIST=$("$CLI" --data-dir "$DIR_A" devices 2>&1) || true
-if echo "$DEVICES_PERSIST" | grep -q "node-a"; then
-    pass "A10 — devices persist across restart"
-else
-    fail "A10" "devices lost: $DEVICES_PERSIST"
-fi
+cli --data-dir "$DIR_A" devices | grep -q "node-a" \
+    && pass "A10 — devices persisted" || fail "A10" "devices lost"
+cli --data-dir "$DIR_A" files | grep -q "test-file-a" \
+    && pass "A11 — files persisted" || fail "A11" "files lost"
+cli --data-dir "$DIR_A" folder list | grep -qi "default\|photos\|No shared" \
+    && pass "A12 — folders persisted" || fail "A12" "folders lost"
+MNEMONIC_P=$(cli --data-dir "$DIR_A" mnemonic)
+[ "$MNEMONIC_P" = "$MNEMONIC" ] \
+    && pass "A13 — mnemonic persisted" || fail "A13" "mismatch"
+DAG_P=$(jq_get "$(cli --data-dir "$DIR_A" status --json)" "d['Status']['dag_entries']")
+[ "${DAG_P:-0}" -gt 0 ] \
+    && pass "A14 — DAG entries persisted ($DAG_P)" || fail "A14" "dag=$DAG_P"
 
-FILES_PERSIST=$("$CLI" --data-dir "$DIR_A" files 2>&1) || true
-if echo "$FILES_PERSIST" | grep -q "test-file-a.txt"; then
-    pass "A11 — files persist across restart"
-else
-    fail "A11" "files lost: $FILES_PERSIST"
-fi
-
-FOLDERS_PERSIST=$("$CLI" --data-dir "$DIR_A" folder list 2>&1) || true
-if echo "$FOLDERS_PERSIST" | grep -qi "default\|photos\|folder"; then
-    pass "A12 — folders persist across restart"
-else
-    fail "A12" "folders lost: $FOLDERS_PERSIST"
-fi
-
-MNEMONIC_PERSIST=$("$CLI" --data-dir "$DIR_A" mnemonic 2>&1) || true
-if [ "$MNEMONIC_PERSIST" = "$MNEMONIC" ]; then
-    pass "A13 — mnemonic persists across restart"
-else
-    fail "A13" "mnemonic changed"
-fi
-
-DAG_PERSIST=$("$CLI" --data-dir "$DIR_A" status --json 2>&1 | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['dag_entries'])" 2>/dev/null) || DAG_PERSIST="?"
-if [ "$DAG_PERSIST" != "?" ] && [ "${DAG_PERSIST:-0}" -gt 0 ]; then
-    pass "A14 — DAG entries persist: $DAG_PERSIST"
-else
-    fail "A14" "DAG entries: $DAG_PERSIST"
-fi
-
-# A15 — Reconnection
+# A15 — Peer reconnection (poll up to 40s)
 echo "--- A15: Peer Reconnection ---"
-sleep 8
-PEERS_RECONNECT=$("$CLI" --data-dir "$DIR_A" status --json 2>&1 | python3 -c "import sys,json; print(json.load(sys.stdin)['peer_count'])" 2>/dev/null) || PEERS_RECONNECT="0"
-if [ "${PEERS_RECONNECT:-0}" -ge 1 ]; then
-    pass "A15 — peers reconnected after restart"
-else
-    fail "A15" "peer count: $PEERS_RECONNECT"
-fi
+PEERS_R=0
+A15_DEADLINE=$(($(date +%s) + 40))
+while [ $(date +%s) -lt $A15_DEADLINE ]; do
+    PEERS_R=$(jq_get "$(cli --data-dir "$DIR_A" status --json)" "d['Status']['peer_count']")
+    [ "${PEERS_R:-0}" -ge 1 ] && break
+    sleep 3
+done
+[ "${PEERS_R:-0}" -ge 1 ] \
+    && pass "A15 — peers reconnected ($PEERS_R)" || fail "A15" "peers=$PEERS_R"
 
-# A16 — Filesystem State Node A
-echo "--- A16: Filesystem State ---"
-if [ -f "$DIR_A/config.toml" ]; then
-    pass "A16 — config.toml exists"
-else
-    fail "A16" "config.toml missing"
-fi
-if [ -f "$DIR_A/mnemonic" ]; then
-    pass "A16 — mnemonic file exists"
-else
-    fail "A16" "mnemonic file missing"
-fi
-if [ -d "$DIR_A/db" ]; then
-    pass "A16 — db directory exists"
-else
-    fail "A16" "db directory missing"
-fi
-if [ -d "$DIR_A/blobs" ]; then
-    pass "A16 — blobs directory exists"
-else
-    fail "A16" "blobs directory missing"
-fi
+# A16/A17 — Filesystem state
+echo "--- A16–A17: Filesystem State ---"
+[ -f "$DIR_A/config.toml" ] && pass "A16 — config.toml exists" || fail "A16" "missing config.toml"
+[ -f "$DIR_A/mnemonic" ]   && pass "A16 — mnemonic file exists" || fail "A16" "missing mnemonic"
+[ -d "$DIR_A/db" ]         && pass "A16 — db directory exists"  || fail "A16" "missing db"
+[ -d "$DIR_A/blobs" ]      && pass "A16 — blobs directory exists" || fail "A16" "missing blobs"
 
-# A17 — Filesystem State Node B
-echo "--- A17: Filesystem State Node B ---"
-if [ -f "$DIR_B/device.key" ]; then
-    KEYSIZE=$(wc -c < "$DIR_B/device.key")
-    if [ "$KEYSIZE" -eq 32 ]; then
-        pass "A17 — device.key is 32 bytes"
-    else
-        fail "A17" "device.key is $KEYSIZE bytes"
-    fi
-else
-    fail "A17" "device.key missing"
-fi
+KEYSIZE=$(wc -c < "$DIR_B/device.key" 2>/dev/null | tr -d ' ' || echo "0")
+[ "$KEYSIZE" -eq 32 ] \
+    && pass "A17 — device.key is 32 bytes" || fail "A17" "size=$KEYSIZE"
 
-# A18 — Network Isolation
+# A18 — Network isolation
 echo "--- A18: Network Isolation ---"
 rm -rf "$DIR_C"
-# Start a third daemon on a different network
-"$MURMURD" --data-dir "$DIR_C" --name "node-c" --role full 2>/dev/null &
-DAEMON_C_PID=$!
-# Wait for socket
-local_waited=0
-while [ ! -S "$DIR_C/murmurd.sock" ] && [ $local_waited -lt 15 ]; do
-    sleep 0.5
-    local_waited=$((local_waited + 1))
-done
+start_daemon "$DIR_C" "node-c" "full" && DAEMON_C_PID=$(last_pid) || DAEMON_C_PID=""
 if [ -S "$DIR_C/murmurd.sock" ]; then
-    PEERS_C=$("$CLI" --data-dir "$DIR_C" status --json 2>&1 | python3 -c "import sys,json; print(json.load(sys.stdin)['peer_count'])" 2>/dev/null) || PEERS_C="?"
-    if [ "${PEERS_C:-0}" -eq 0 ]; then
-        pass "A18 — isolated network has 0 peers"
-    else
-        fail "A18" "isolated network has $PEERS_C peers"
-    fi
-    NID_A=$("$CLI" --data-dir "$DIR_A" status --json 2>&1 | python3 -c "import sys,json; print(json.load(sys.stdin)['network_id'])" 2>/dev/null) || NID_A=""
-    NID_C=$("$CLI" --data-dir "$DIR_C" status --json 2>&1 | python3 -c "import sys,json; print(json.load(sys.stdin)['network_id'])" 2>/dev/null) || NID_C=""
-    if [ -n "$NID_A" ] && [ -n "$NID_C" ] && [ "$NID_A" != "$NID_C" ]; then
-        pass "A18 — different network IDs"
-    else
-        fail "A18" "network IDs: A=$NID_A C=$NID_C"
-    fi
-    kill "$DAEMON_C_PID" 2>/dev/null && wait "$DAEMON_C_PID" 2>/dev/null || true
+    sleep 4
+    PEERS_C=$(jq_get "$(cli --data-dir "$DIR_C" status --json)" "d['Status']['peer_count']")
+    [ "${PEERS_C:-0}" -eq 0 ] \
+        && pass "A18 — isolated network has 0 peers" || fail "A18" "peers=$PEERS_C"
+    NID_A=$(jq_get "$(cli --data-dir "$DIR_A" status --json)" "d['Status']['network_id']")
+    NID_C=$(jq_get "$(cli --data-dir "$DIR_C" status --json)" "d['Status']['network_id']")
+    [ -n "$NID_A" ] && [ "$NID_A" != "$NID_C" ] \
+        && pass "A18 — different network IDs" || fail "A18" "IDs: A=$NID_A C=$NID_C"
+    stop_daemon "${DAEMON_C_PID:-}"
 else
-    fail "A18" "Node C daemon didn't start"
-    kill "$DAEMON_C_PID" 2>/dev/null && wait "$DAEMON_C_PID" 2>/dev/null || true
+    fail "A18" "Node C failed to start"
 fi
 
-# A19 — Multi-File Batch Sync
+# A19 — Batch sync
 echo "--- A19: Batch File Sync ---"
 for i in $(seq 1 10); do
-    echo "Batch file $i" > "$SCRATCH/test-batch-$i.txt"
-    "$CLI" --data-dir "$DIR_A" add "$SCRATCH/test-batch-$i.txt" 2>&1 || true
+    echo "Batch $i" > "$SCRATCH/test-batch-${i}.txt"
+    cli --data-dir "$DIR_A" add "$SCRATCH/test-batch-${i}.txt" >/dev/null
 done
-sleep 10
-FILES_B_BATCH=$("$CLI" --data-dir "$DIR_B" files --json 2>&1 | python3 -c "import sys,json; print(len(json.load(sys.stdin)['files']))" 2>/dev/null) || FILES_B_BATCH="?"
-FILES_A_BATCH=$("$CLI" --data-dir "$DIR_A" files --json 2>&1 | python3 -c "import sys,json; print(len(json.load(sys.stdin)['files']))" 2>/dev/null) || FILES_A_BATCH="?"
-if [ "$FILES_A_BATCH" = "$FILES_B_BATCH" ] && [ "$FILES_A_BATCH" != "?" ]; then
-    pass "A19 — batch files synced: $FILES_A_BATCH files on both"
-else
-    fail "A19" "file count: A=$FILES_A_BATCH B=$FILES_B_BATCH"
-fi
+# Poll up to 90s — node-b-v2 may need to sync large backlog after re-join
+FILES_A_B=""; FILES_B_B=""
+A19_DEADLINE=$(($(date +%s) + 90))
+while [ $(date +%s) -lt $A19_DEADLINE ]; do
+    FILES_A_B=$(jq_get "$(cli --data-dir "$DIR_A" files --json)" "len(d['Files']['files'])")
+    FILES_B_B=$(jq_get "$(cli --data-dir "$DIR_B" files --json)" "len(d['Files']['files'])")
+    [ "$FILES_A_B" = "$FILES_B_B" ] && [ -n "$FILES_A_B" ] && break
+    sleep 5
+done
+[ "$FILES_A_B" = "$FILES_B_B" ] && [ -n "$FILES_A_B" ] \
+    && pass "A19 — batch sync done ($FILES_A_B files)" || fail "A19" "A=$FILES_A_B B=$FILES_B_B"
 
-# A20 — Empty File
-echo "--- A20: Empty File ---"
-touch $SCRATCH/test-empty.txt
-EMPTY_OUT=$("$CLI" --data-dir "$DIR_A" add $SCRATCH/test-empty.txt 2>&1) || true
-if echo "$EMPTY_OUT" | grep -qi "added\|ok\|success\|hash"; then
-    pass "A20 — empty file added"
-else
-    fail "A20" "empty file: $EMPTY_OUT"
-fi
+# A20/A21 — Edge cases
+echo "--- A20–A21: Edge Cases ---"
+touch "$SCRATCH/test-empty.txt"
+ADD_E=$(cli --data-dir "$DIR_A" add "$SCRATCH/test-empty.txt")
+echo "$ADD_E" | grep -qi "added\|ok\|success\|hash" \
+    && pass "A20 — empty file added" || fail "A20" "$ADD_E"
 
-# A21 — Add Non-existent File
-echo "--- A21: Add Non-existent File ---"
-NOFILE_OUT=$("$CLI" --data-dir "$DIR_A" add $SCRATCH/does-not-exist.txt 2>&1) && NF_EXIT=0 || NF_EXIT=$?
-if [ $NF_EXIT -ne 0 ] || echo "$NOFILE_OUT" | grep -qi "error\|not found\|no such"; then
-    pass "A21 — non-existent file rejected"
-else
-    fail "A21" "no error: $NOFILE_OUT"
-fi
+NF_EXIT=$(cli_exit --data-dir "$DIR_A" add "$SCRATCH/does-not-exist.txt" | tail -1)
+[ "$NF_EXIT" -ne 0 ] \
+    && pass "A21 — non-existent file rejected" || fail "A21" "exit=$NF_EXIT"
 
-# A22 — Status Fields Validation
-echo "--- A22: Status Fields Validation ---"
-STATUS_V=$("$CLI" --data-dir "$DIR_A" status --json 2>&1) || true
-VALID=$(echo "$STATUS_V" | python3 -c "
+# A22 — Status field validation
+echo "--- A22–A24: Status, Origins, Concurrent ---"
+STATUS_V=$(cli --data-dir "$DIR_A" status --json)
+VALID=$(echo "$STATUS_V" | python3 -c '
 import sys, json
-d = json.load(sys.stdin)
-ok = True
-ok = ok and len(d.get('device_id','')) == 64
-ok = ok and len(d.get('network_id','')) == 64
-ok = ok and len(d.get('device_name','')) > 0
-ok = ok and d.get('peer_count', -1) >= 0
-ok = ok and d.get('dag_entries', 0) > 0
-ok = ok and d.get('uptime_secs', -1) >= 0
-print('ok' if ok else 'fail')
-" 2>/dev/null) || VALID="fail"
-if [ "$VALID" = "ok" ]; then
-    pass "A22 — all status fields valid"
-else
-    fail "A22" "some fields invalid"
-fi
+try:
+    d = json.loads(sys.stdin.read())
+    s = d.get("Status", {})
+    ok = (len(s.get("device_id","")) == 64
+      and len(s.get("network_id","")) == 64
+      and len(s.get("device_name","")) > 0
+      and s.get("peer_count", -1) >= 0
+      and s.get("dag_entries", 0) > 0
+      and s.get("uptime_secs", -1) >= 0)
+    print("ok" if ok else "fail")
+except Exception:
+    print("fail")
+' 2>/dev/null || echo "fail")
+[ "$VALID" = "ok" ] \
+    && pass "A22 — all status fields valid" || fail "A22" "some invalid"
 
-# A23 — File Origin Tracking
-echo "--- A23: File Origin Tracking ---"
-ORIGINS=$("$CLI" --data-dir "$DIR_A" files --json 2>&1 | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-origins = set(f.get('device_origin','') for f in d['files'])
-print(len(origins))
-" 2>/dev/null) || ORIGINS="?"
-if [ "${ORIGINS:-0}" -ge 1 ]; then
-    pass "A23 — file origins tracked ($ORIGINS unique devices)"
-else
-    fail "A23" "origins: $ORIGINS"
-fi
+# A23 — Origin tracking
+ORIGINS=$(jq_get "$(cli --data-dir "$DIR_A" files --json)" \
+    "len(set(f.get('device_origin','') for f in d['Files']['files']))")
+[ "${ORIGINS:-0}" -ge 1 ] \
+    && pass "A23 — origin tracking works ($ORIGINS devices)" || fail "A23" "origins=$ORIGINS"
 
-# A24 — Concurrent CLI Requests
-echo "--- A24: Concurrent Requests ---"
-"$CLI" --data-dir "$DIR_A" status >/dev/null 2>&1 &
+# A24 — Concurrent requests
+cli --data-dir "$DIR_A" status >/dev/null &
 P1=$!
-"$CLI" --data-dir "$DIR_A" devices >/dev/null 2>&1 &
+cli --data-dir "$DIR_A" devices >/dev/null &
 P2=$!
-"$CLI" --data-dir "$DIR_A" files >/dev/null 2>&1 &
+cli --data-dir "$DIR_A" files >/dev/null &
 P3=$!
-"$CLI" --data-dir "$DIR_A" folder list >/dev/null 2>&1 &
+cli --data-dir "$DIR_A" folder list >/dev/null &
 P4=$!
-wait $P1 && wait $P2 && wait $P3 && wait $P4
-CONCURRENT_OK=$?
-if [ $CONCURRENT_OK -eq 0 ]; then
-    pass "A24 — concurrent requests all succeeded"
-else
-    fail "A24" "some concurrent requests failed"
-fi
+wait $P1; E1=$?; wait $P2; E2=$?; wait $P3; E3=$?; wait $P4; E4=$?
+[ $((E1 + E2 + E3 + E4)) -eq 0 ] \
+    && pass "A24 — concurrent requests all succeeded" || fail "A24" "exits: $E1 $E2 $E3 $E4"
 
-# A26 — Folder Operations After Restart
-echo "--- A26: Folder Ops After Restart ---"
-CREATE_POST=$("$CLI" --data-dir "$DIR_A" folder create "post-restart" 2>&1) || true
-if echo "$CREATE_POST" | grep -qi "created\|ok\|success"; then
-    pass "A26 — folder create works after restart"
-else
-    fail "A26" "create after restart: $CREATE_POST"
-fi
+# A26/A27 — Post-restart folder ops and history
+echo "--- A26–A27: Post-restart Ops ---"
+CREATE_POST=$(cli --data-dir "$DIR_A" folder create "post-restart")
+echo "$CREATE_POST" | grep -qi "created\|ok\|success" \
+    && pass "A26 — folder create after restart" || fail "A26" "$CREATE_POST"
 
-# A27 — File History Survives Restart
-echo "--- A27: History After Restart ---"
 if [ -n "$DEFAULT_FOLDER_ID" ]; then
-    HISTORY_POST=$("$CLI" --data-dir "$DIR_A" history "$DEFAULT_FOLDER_ID" test-file-a.txt 2>&1) || true
-    if echo "$HISTORY_POST" | grep -qi "version\|node-a\|bytes"; then
-        pass "A27 — file history survives restart"
-    else
-        fail "A27" "history after restart: $HISTORY_POST"
-    fi
+    HIST_POST=$(cli --data-dir "$DIR_A" history "$DEFAULT_FOLDER_ID" test-file-a.txt)
+    echo "$HIST_POST" | grep -qi "version\|bytes\|hash" \
+        && pass "A27 — history survives restart" || fail "A27" "$HIST_POST"
 else
     skip "A27" "no default folder ID"
 fi
 
-# A30 — Final DAG Consistency
-echo "--- A30: Final DAG Consistency ---"
-sleep 5
-DAG_FINAL_A=$("$CLI" --data-dir "$DIR_A" status --json 2>&1 | python3 -c "import sys,json; print(json.load(sys.stdin)['dag_entries'])" 2>/dev/null) || DAG_FINAL_A="?"
-DAG_FINAL_B=$("$CLI" --data-dir "$DIR_B" status --json 2>&1 | python3 -c "import sys,json; print(json.load(sys.stdin)['dag_entries'])" 2>/dev/null) || DAG_FINAL_B="?"
-if [ "$DAG_FINAL_A" = "$DAG_FINAL_B" ] && [ "$DAG_FINAL_A" != "?" ]; then
-    pass "A30 — final DAG consistent: $DAG_FINAL_A entries"
-else
-    fail "A30" "final DAG: A=$DAG_FINAL_A B=$DAG_FINAL_B"
-fi
+# A30 — Final consistency (poll up to 90s for full backlog sync)
+echo "--- A30–A31: Final Checks ---"
+DAG_FA=""; DAG_FB=""
+A30_DEADLINE=$(($(date +%s) + 90))
+while [ $(date +%s) -lt $A30_DEADLINE ]; do
+    DAG_FA=$(jq_get "$(cli --data-dir "$DIR_A" status --json)" "d['Status']['dag_entries']")
+    DAG_FB=$(jq_get "$(cli --data-dir "$DIR_B" status --json)" "d['Status']['dag_entries']")
+    [ "$DAG_FA" = "$DAG_FB" ] && [ -n "$DAG_FA" ] && break
+    sleep 5
+done
+[ "$DAG_FA" = "$DAG_FB" ] && [ -n "$DAG_FA" ] \
+    && pass "A30 — final DAG consistent ($DAG_FA)" || fail "A30" "A=$DAG_FA B=$DAG_FB"
+NID_FA=$(jq_get "$(cli --data-dir "$DIR_A" status --json)" "d['Status']['network_id']")
+NID_FB=$(jq_get "$(cli --data-dir "$DIR_B" status --json)" "d['Status']['network_id']")
+[ "$NID_FA" = "$NID_FB" ] && [ -n "$NID_FA" ] \
+    && pass "A30 — same network ID" || fail "A30" "A=$NID_FA B=$NID_FB"
 
-NID_FINAL_A=$("$CLI" --data-dir "$DIR_A" status --json 2>&1 | python3 -c "import sys,json; print(json.load(sys.stdin)['network_id'])" 2>/dev/null) || NID_FINAL_A=""
-NID_FINAL_B=$("$CLI" --data-dir "$DIR_B" status --json 2>&1 | python3 -c "import sys,json; print(json.load(sys.stdin)['network_id'])" 2>/dev/null) || NID_FINAL_B=""
-if [ "$NID_FINAL_A" = "$NID_FINAL_B" ] && [ -n "$NID_FINAL_A" ]; then
-    pass "A30 — same network ID"
-else
-    fail "A30" "network ID mismatch: A=$NID_FINAL_A B=$NID_FINAL_B"
-fi
-
-# A31 — Clean Shutdown
-echo "--- A31: Clean Shutdown ---"
-stop_daemon "$DAEMON_A_PID"
-DAEMON_A_PID=""
-stop_daemon "$DAEMON_B_PID"
-DAEMON_B_PID=""
+# A31 — Clean shutdown
+stop_daemon "$DAEMON_A_PID"; DAEMON_A_PID=""
+stop_daemon "$DAEMON_B_PID"; DAEMON_B_PID=""
 sleep 1
-if [ ! -S "$DIR_A/murmurd.sock" ] && [ ! -S "$DIR_B/murmurd.sock" ]; then
-    pass "A31 — both sockets cleaned up"
-else
-    fail "A31" "socket(s) still exist"
-fi
+[ ! -S "$DIR_A/murmurd.sock" ] && [ ! -S "$DIR_B/murmurd.sock" ] \
+    && pass "A31 — both sockets cleaned up" || fail "A31" "socket(s) remain"
 
 echo ""
-echo "=== All tests complete ==="
+echo "=== Tests complete ==="

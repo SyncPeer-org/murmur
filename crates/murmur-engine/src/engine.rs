@@ -234,6 +234,16 @@ impl MurmurEngine {
 
     /// Revoke a device.
     pub fn revoke_device(&mut self, device_id: DeviceId) -> Result<DagEntry, EngineError> {
+        let is_approved = self
+            .dag
+            .state()
+            .devices
+            .get(&device_id)
+            .map(|d| d.approved)
+            .unwrap_or(false);
+        if !is_approved {
+            return Err(EngineError::DeviceNotFound(device_id.to_string()));
+        }
         let entry = self.dag.append(Action::DeviceRevoked { device_id });
         self.callbacks.on_dag_entry(entry.to_bytes());
 
