@@ -13,42 +13,33 @@ For a feature overview, see [features.md](features.md).
 | Milestone                                                        | Status     |
 | ---------------------------------------------------------------- | ---------- |
 | 0–17 — MVP : DAG, Network, Engine, Darmon, FFI, Android, Desktop | ✅ Done    |
-| 18 — Desktop App: IPC Refactor & Core Screens                    | 🔲 Planned |
-| 19 — Zero-Config Onboarding & Default Folder                     | 🔲 Planned |
-| 20 — System Tray & Notifications                                 | 🔲 Planned |
-| 21 — Folder Discovery & Selective Sync                           | 🔲 Planned |
-| 22 — Rich Conflict Resolution                                    | 🔲 Planned |
-| 23 — Device Management Improvements                              | 🔲 Planned |
-| 24 — Sync Progress, Pause/Resume & Bandwidth                     | 🔲 Planned |
-| 25 — File Browser & Search                                       | 🔲 Planned |
-| 26 — Settings & Configuration UI                                 | 🔲 Planned |
-| 27 — Diagnostics & Network Health                                | 🔲 Planned |
+| 18a — Desktop App: IPC Refactor & Core Screens                   | ✅ Done    |
+| 18b — Desktop App: Review & Cleanup                              | 🔲 Planned |
+| 19a — Zero-Config Onboarding & Default Folder                    | 🔲 Planned |
+| 19b — Zero-Config Onboarding: Review & Cleanup                   | 🔲 Planned |
+| 20a — System Tray & Notifications                                | 🔲 Planned |
+| 20b — System Tray: Review & Cleanup                              | 🔲 Planned |
+| 21a — Folder Discovery & Selective Sync                          | 🔲 Planned |
+| 21b — Folder Discovery: Review & Cleanup                         | 🔲 Planned |
+| 22a — Rich Conflict Resolution                                   | 🔲 Planned |
+| 22b — Rich Conflict Resolution: Review & Cleanup                 | 🔲 Planned |
+| 23a — Device Management Improvements                             | 🔲 Planned |
+| 23b — Device Management: Review & Cleanup                        | 🔲 Planned |
+| 24a — Sync Progress, Pause/Resume & Bandwidth                    | 🔲 Planned |
+| 24b — Sync Progress: Review & Cleanup                            | 🔲 Planned |
+| 25a — File Browser & Search                                      | 🔲 Planned |
+| 25b — File Browser: Review & Cleanup                             | 🔲 Planned |
+| 26a — Settings & Configuration UI                                | 🔲 Planned |
+| 26b — Settings & Configuration: Review & Cleanup                 | 🔲 Planned |
+| 27a — Diagnostics & Network Health                               | 🔲 Planned |
+| 27b — Diagnostics: Review & Cleanup                              | 🔲 Planned |
 | 28 — Web Dashboard (htmx)                                        | 🔲 Planned |
-
----
-
-## Design Decisions (Milestones 13–20)
-
-These decisions were agreed upon before implementation and guide all milestones below:
-
-| Decision            | Choice                                                                              |
-| ------------------- | ----------------------------------------------------------------------------------- |
-| Folder model        | Syncthing-style shared folders mapped to real directories on each device            |
-| Selective sync      | Per-device subscribe model; choose folders on join, add/remove later                |
-| Folder permissions  | Self-selected: each device chooses read-write or read-only per folder               |
-| File modifications  | Explicit version chain (`FileModified` action in DAG, full history)                 |
-| Conflict strategy   | Fork-based: keep both versions on disk, surface to user for resolution              |
-| Filesystem watching | `notify` crate in murmurd, auto-detect changes in shared folder directories         |
-| Ignore patterns     | `.murmurignore` per folder (gitignore syntax), plus sensible defaults               |
-| Interfaces          | Desktop app (iced) + Web UI (htmx) + CLI — all thin clients calling murmurd via IPC |
-| Folder deletion     | Configurable: unsubscribing device chooses to keep or delete local files            |
-| Large files         | No hard size limit; streaming blake3, chunked storage/transfer, bounded memory      |
 
 ---
 
 ## Phase 0: MVP
 
-### Milestone 18 — Desktop App (iced) — Folders, Conflicts & Sync
+### Milestone 18a — Desktop App (iced) — Folders, Conflicts & Sync
 
 **Crate**: `murmur-desktop`
 
@@ -75,7 +66,7 @@ and networking. After this milestone, it connects to murmurd via Unix socket IPC
 3. **Folder Detail** (new): File browser with directory tree for a specific folder. Shows file sizes, modification dates, device origin. Sync progress bar.
 4. **Conflicts** (new): List of active conflicts across all folders. Each conflict shows the file path, competing versions with device names and timestamps. Buttons: "Keep this version", "Keep other", "Keep both". Preview panel if file is text/image.
 5. **File History** (new): Version list for a selected file. Shows each version's hash, device, timestamp, size. "Restore" button to revert to a previous version.
-6. **Devices** (existing, updated): Device list with per-folder subscription info. Approve/revoke. (Online/offline status and identicons are added in Milestone 23; this screen shows basic device info only.)
+6. **Devices** (existing, updated): Device list with per-folder subscription info. Approve/revoke. (Online/offline status and identicons are added in Milestone 23a; this screen shows basic device info only.)
 7. **Status** (existing, updated): Network overview — folder count, total files, total conflicts, connected peers, DAG entries, event log.
 
 **Tasks**:
@@ -109,15 +100,24 @@ and networking. After this milestone, it connects to murmurd via Unix socket IPC
 
 ---
 
+### Milestone 18b — Desktop App: Review & Cleanup
+
+**Tasks**:
+
+- [ ] Rethink all changes from Milestone 18a, and improve if possible. Ultrathink.
+- [ ] Remove Milestone 18a from plan.md and update all docs/manual tests/integration tests with the new things from this milestone. Ultrathink.
+
+---
+
 ## Phase 1: Feature Completion for Desktop App (iced)
 
 All milestones in this phase target `murmur-desktop` as the primary crate. Many also extend
 `murmur-ipc` and `murmurd` with new IPC commands required to support the new UI features.
-Each milestone depends on Milestone 18 being complete (the thin IPC client refactor).
+Each milestone depends on Milestone 18a being complete (the thin IPC client refactor).
 
 ---
 
-### Milestone 19 — Zero-Config Onboarding & Default Folder
+### Milestone 19a — Zero-Config Onboarding & Default Folder
 
 **Crates**: `murmur-desktop`, `murmur-ipc`, `murmurd`
 
@@ -157,7 +157,16 @@ effortless device pairing (scan instead of typing a 24-word mnemonic).
 
 ---
 
-### Milestone 20 — System Tray & Notifications
+### Milestone 19b — Zero-Config Onboarding: Review & Cleanup
+
+**Tasks**:
+
+- [ ] Rethink all changes from Milestone 19a, and improve if possible. Ultrathink.
+- [ ] Remove Milestone 19a from plan.md and update all docs/manual tests/integration tests with the new things from this milestone. Ultrathink.
+
+---
+
+### Milestone 20a — System Tray & Notifications
 
 **Crate**: `murmur-desktop`
 
@@ -209,7 +218,16 @@ approvals, conflicts). Window close hides to tray rather than quitting.
 
 ---
 
-### Milestone 21 — Folder Discovery & Selective Sync
+### Milestone 20b — System Tray: Review & Cleanup
+
+**Tasks**:
+
+- [ ] Rethink all changes from Milestone 20a, and improve if possible. Ultrathink.
+- [ ] Remove Milestone 20a from plan.md and update all docs/manual tests/integration tests with the new things from this milestone. Ultrathink.
+
+---
+
+### Milestone 21a — Folder Discovery & Selective Sync
 
 **Crates**: `murmur-desktop`, `murmur-ipc`, `murmurd`
 
@@ -249,7 +267,16 @@ or QR scan.
 
 ---
 
-### Milestone 22 — Rich Conflict Resolution
+### Milestone 21b — Folder Discovery: Review & Cleanup
+
+**Tasks**:
+
+- [ ] Rethink all changes from Milestone 21a, and improve if possible. Ultrathink.
+- [ ] Remove Milestone 21a from plan.md and update all docs/manual tests/integration tests with the new things from this milestone. Ultrathink.
+
+---
+
+### Milestone 22a — Rich Conflict Resolution
 
 **Crates**: `murmur-desktop`, `murmur-ipc`, `murmurd`
 
@@ -265,13 +292,13 @@ power users, and per-folder auto-resolve rules for users who never want to be in
 - `SetFolderAutoResolve { folder_id_hex, strategy }` — persisted as an `auto_resolve` field in the matching `[[folders]]` entry in `config.toml`; murmurd applies the strategy automatically when a new conflict is detected
 - `DismissConflict { folder_id_hex, path }` — removes the conflict from the active list without choosing a version; both conflict files remain on disk with their existing conflict-named suffixes; no `ConflictResolved` DAG entry is created; this is the "keep both" action
 
-Note: `BlobPreview` was already added in Milestone 18 and is reused here for conflict previews.
+Note: `BlobPreview` was already added in Milestone 18a and is reused here for conflict previews.
 
 **Tasks**:
 
 - [ ] Add `BulkResolveConflicts`, `SetFolderAutoResolve`, and `DismissConflict` to `murmur-ipc`; implement all in `murmurd`
 - [ ] Conflict detail panel: clicking a conflict expands it to show both competing versions side by side — device name, timestamp (human-readable), size, blob hash (truncated)
-- [ ] Text conflict diff: fetch both versions via `BlobPreview` (max 32 KB each, from M18), compute line-level unified diff with `similar`, render in a scrollable widget with added lines green and removed lines red
+- [ ] Text conflict diff: fetch both versions via `BlobPreview` (max 32 KB each, from M18a), compute line-level unified diff with `similar`, render in a scrollable widget with added lines green and removed lines red
 - [ ] Image conflict preview: fetch both blobs via `BlobPreview` (max 2 MB each), render as `iced::widget::image::Image` thumbnails side by side
 - [ ] Resolution buttons per conflict: "Keep this version" and "Keep other version" send `ResolveConflict` with the chosen blob hash; "Keep both" sends `DismissConflict` — removes the active conflict marker while leaving both files on disk with their existing conflict suffixes for manual handling
 - [ ] Bulk resolve toolbar: "Keep all newest", "Keep all mine", "Keep all theirs" buttons; confirmation dialog before sending `BulkResolveConflicts`
@@ -293,7 +320,16 @@ Note: `BlobPreview` was already added in Milestone 18 and is reused here for con
 
 ---
 
-### Milestone 23 — Device Management Improvements
+### Milestone 22b — Rich Conflict Resolution: Review & Cleanup
+
+**Tasks**:
+
+- [ ] Rethink all changes from Milestone 22a, and improve if possible. Ultrathink.
+- [ ] Remove Milestone 22a from plan.md and update all docs/manual tests/integration tests with the new things from this milestone. Ultrathink.
+
+---
+
+### Milestone 23a — Device Management Improvements
 
 **Crates**: `murmur-desktop`, `murmur-ipc`, `murmurd`
 
@@ -332,7 +368,16 @@ trustworthy and approachable for non-technical users.
 
 ---
 
-### Milestone 24 — Sync Progress, Pause/Resume & Bandwidth
+### Milestone 23b — Device Management: Review & Cleanup
+
+**Tasks**:
+
+- [ ] Rethink all changes from Milestone 23a, and improve if possible. Ultrathink.
+- [ ] Remove Milestone 23a from plan.md and update all docs/manual tests/integration tests with the new things from this milestone. Ultrathink.
+
+---
+
+### Milestone 24a — Sync Progress, Pause/Resume & Bandwidth
 
 **Crates**: `murmur-desktop`, `murmur-ipc`, `murmurd`
 
@@ -345,7 +390,7 @@ throttle sliders make Murmur well-behaved on metered or slow connections.
 - `PauseFolderSync { folder_id_hex }` — pauses blob send/receive for one folder; murmurd skips it when selecting blobs to push and rejects incoming chunks for it
 - `ResumeFolderSync { folder_id_hex }` — resumes blob transfer for a paused folder
 
-Note: `PauseSync` / `ResumeSync` (global) were added in Milestone 20. Bandwidth throttle (`SetThrottle`) is added in Milestone 26 alongside the Settings UI that exposes it.
+Note: `PauseSync` / `ResumeSync` (global) were added in Milestone 20a. Bandwidth throttle (`SetThrottle`) is added in Milestone 26a alongside the Settings UI that exposes it.
 
 **Tasks**:
 
@@ -354,7 +399,7 @@ Note: `PauseSync` / `ResumeSync` (global) were added in Milestone 20. Bandwidth 
 - [ ] Folder Detail: active transfers panel at the top — each in-flight file shows its name, `bytes_transferred / total_bytes`, a progress bar, and an ETA string; driven by `BlobTransferProgress` events from the event stream; ETA calculated from a 10-second sliding-window bytes/second estimate
 - [ ] Folder list card: aggregate progress indicator "12 / 47 files synced" when a folder is actively syncing; refreshed by polling `FolderStatus`
 - [ ] Pause/Resume button per folder in both the folder list card and the Folder Detail header; sends `PauseFolderSync` / `ResumeFolderSync`
-- [ ] Paused folders display a "Paused" badge and a muted sync indicator; the tray conflict badge from M20 also shows pause state
+- [ ] Paused folders display a "Paused" badge and a muted sync indicator; the tray conflict badge from M20a also shows pause state
 - [ ] Sync activity log at the bottom of the Status screen: scrollable list of engine events with timestamps — shows `FileSynced`, `BlobReceived`, `ConflictDetected`, `DagSynced`, `DeviceApproved`; live-updated via event stream; capped at 500 entries (oldest entries dropped when limit is reached)
 
 **Tests** (≥8):
@@ -370,7 +415,16 @@ Note: `PauseSync` / `ResumeSync` (global) were added in Milestone 20. Bandwidth 
 
 ---
 
-### Milestone 25 — File Browser & Search
+### Milestone 24b — Sync Progress: Review & Cleanup
+
+**Tasks**:
+
+- [ ] Rethink all changes from Milestone 24a, and improve if possible. Ultrathink.
+- [ ] Remove Milestone 24a from plan.md and update all docs/manual tests/integration tests with the new things from this milestone. Ultrathink.
+
+---
+
+### Milestone 25a — File Browser & Search
 
 **Crates**: `murmur-desktop`, `murmur-ipc`, `murmurd`
 
@@ -384,7 +438,7 @@ Cross-folder search, type/date/device filters, a file preview pane, and OS integ
 
 - `DeleteFile { folder_id_hex, path }` — creates a `FileDeleted` DAG entry; murmurd removes the blob from the local folder path on disk
 
-Note: `BlobPreview` (added in M18) is reused for the preview pane.
+Note: `BlobPreview` (added in M18a) is reused for the preview pane.
 
 **Tasks**:
 
@@ -421,7 +475,16 @@ Note: `BlobPreview` (added in M18) is reused for the preview pane.
 
 ---
 
-### Milestone 26 — Settings & Configuration UI
+### Milestone 25b — File Browser: Review & Cleanup
+
+**Tasks**:
+
+- [ ] Rethink all changes from Milestone 25a, and improve if possible. Ultrathink.
+- [ ] Remove Milestone 25a from plan.md and update all docs/manual tests/integration tests with the new things from this milestone. Ultrathink.
+
+---
+
+### Milestone 26a — Settings & Configuration UI
 
 **Crates**: `murmur-desktop`, `murmur-ipc`, `murmurd`
 
@@ -448,7 +511,7 @@ Folder Detail. A mnemonic backup flow with a verification quiz ensures users nev
   - **Device**: editable device name (sends `SetDeviceName` on save); read-only role; copy-able device ID
   - **Appearance**: Dark / Light / System theme toggle; Small / Medium / Large font size — persisted in local app config
   - **Notifications**: per-type on/off toggles (device approval request, conflict detected, sync complete) — persisted locally
-  - **Sync**: global pause toggle (sends `PauseSync` / `ResumeSync`, added in M20); auto-start murmurd on login toggle (Linux: `~/.config/autostart/*.desktop`, macOS: `~/Library/LaunchAgents/*.plist`); socket path display
+  - **Sync**: global pause toggle (sends `PauseSync` / `ResumeSync`, added in M20a); auto-start murmurd on login toggle (Linux: `~/.config/autostart/*.desktop`, macOS: `~/Library/LaunchAgents/*.plist`); socket path display
   - **Bandwidth**: upload throttle slider; download throttle slider (sends `SetThrottle`); steps: unlimited / 512 KB/s / 1 MB/s / 2 MB/s / 5 MB/s / 10 MB/s; current values loaded from `GetConfig` on screen open
   - **Network**: auto-approve toggle (sends `SetAutoApprove`); mDNS toggle (sends `SetMdns`)
   - **Storage**: data directory path; total blob storage size; "Reclaim orphaned blobs" button (sends `ReclaimOrphanedBlobs`; shows bytes-freed in a toast)
@@ -483,7 +546,16 @@ Folder Detail. A mnemonic backup flow with a verification quiz ensures users nev
 
 ---
 
-### Milestone 27 — Diagnostics & Network Health
+### Milestone 26b — Settings & Configuration: Review & Cleanup
+
+**Tasks**:
+
+- [ ] Rethink all changes from Milestone 26a, and improve if possible. Ultrathink.
+- [ ] Remove Milestone 26a from plan.md and update all docs/manual tests/integration tests with the new things from this milestone. Ultrathink.
+
+---
+
+### Milestone 27a — Diagnostics & Network Health
 
 **Crates**: `murmur-desktop`, `murmur-ipc`, `murmurd`
 
@@ -516,7 +588,7 @@ self-diagnose issues or produce a useful report.
   - Search text input: client-side filter of displayed lines
   - Scrollable log output with auto-scroll; pauses auto-scroll when user scrolls up manually
   - "Export" button: sends `ExportDiagnostics` with a timestamped filename in `~/murmur-diagnostics/`; shows file path in toast
-- [ ] Storage Inspector section in the Settings Storage tab (supplementing M26):
+- [ ] Storage Inspector section in the Settings Storage tab (supplementing M26a):
   - Table: per-folder name, file count, total bytes on disk
   - Summary row with totals
   - Orphaned blobs row: count and bytes
@@ -531,3 +603,12 @@ self-diagnose issues or produce a useful report.
 - [ ] Log search filters displayed lines by substring (case-insensitive)
 - [ ] `ExportDiagnostics` creates a file at the specified output path
 - [ ] Exported diagnostics file is valid JSON containing a `"peers"` key
+
+---
+
+### Milestone 27b — Diagnostics: Review & Cleanup
+
+**Tasks**:
+
+- [ ] Rethink all changes from Milestone 27a, and improve if possible. Ultrathink.
+- [ ] Remove Milestone 27a from plan.md and update all docs/manual tests/integration tests with the new things from this milestone. Ultrathink.

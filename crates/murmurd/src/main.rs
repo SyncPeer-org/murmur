@@ -429,6 +429,7 @@ fn run_daemon(
             broadcast_tx: net_handle.broadcast_tx.clone(),
             connected_peers: net_handle.connected_peers.clone(),
             event_broadcast: ipc_event_tx,
+            synced_folders: synced_folders_arc.clone(),
         });
 
         let accept_handle = tokio::task::spawn_blocking(move || {
@@ -513,6 +514,8 @@ struct DaemonCtx {
     connected_peers: Arc<std::sync::atomic::AtomicU64>,
     /// Broadcast channel for IPC event streaming.
     event_broadcast: tokio::sync::broadcast::Sender<murmur_engine::EngineEvent>,
+    /// Synced folder map (folder_id → local path + mode).
+    synced_folders: Arc<std::collections::HashMap<FolderId, SyncedFolder>>,
 }
 
 /// Handle a single CLI connection.
@@ -981,6 +984,87 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                 }
                 Err(e) => CliResponse::Error {
                     message: format!("{e}"),
+                },
+            }
+        }
+        CliRequest::BlobPreview {
+            blob_hash_hex,
+            max_bytes,
+        } => {
+            let blob_hash = match parse_blob_hash(&blob_hash_hex) {
+                Ok(h) => h,
+                Err(e) => return CliResponse::Error { message: e },
+            };
+            match ctx.storage.load_blob(blob_hash) {
+                Ok(Some(data)) => {
+                    let limit = max_bytes as usize;
+                    let truncated = if data.len() > limit {
+                        data[..limit].to_vec()
+                    } else {
+                        data
+                    };
+                    CliResponse::BlobData { data: truncated }
+                }
+                Ok(None) => CliResponse::Error {
+                    message: format!("blob not found: {blob_hash_hex}"),
+                },
+                Err(e) => CliResponse::Error {
+                    message: format!("load blob: {e}"),
+                },
+            }
+        }
+        CliRequest::RestoreFileVersion {
+            folder_id_hex,
+            path,
+            blob_hash_hex,
+        } => {
+            let folder_id = match parse_folder_id(&folder_id_hex) {
+                Ok(id) => id,
+                Err(e) => return CliResponse::Error { message: e },
+            };
+            let blob_hash = match parse_blob_hash(&blob_hash_hex) {
+                Ok(h) => h,
+                Err(e) => return CliResponse::Error { message: e },
+            };
+            // Look up the local path for this folder.
+            let synced = match ctx.synced_folders.get(&folder_id) {
+                Some(s) => s,
+                None => {
+                    return CliResponse::Error {
+                        message: format!("folder not subscribed locally: {folder_id_hex}"),
+                    };
+                }
+            };
+            // Load the blob data.
+            let data = match ctx.storage.load_blob(blob_hash) {
+                Ok(Some(d)) => d,
+                Ok(None) => {
+                    return CliResponse::Error {
+                        message: format!("blob not found: {blob_hash_hex}"),
+                    };
+                }
+                Err(e) => {
+                    return CliResponse::Error {
+                        message: format!("load blob: {e}"),
+                    };
+                }
+            };
+            // Write the blob to the file's local path. The filesystem watcher
+            // will pick up the change and emit a new FileModified DAG entry.
+            let file_path = synced.local_path.join(&path);
+            if let Some(parent) = file_path.parent()
+                && let Err(e) = std::fs::create_dir_all(parent)
+            {
+                return CliResponse::Error {
+                    message: format!("create parent dirs: {e}"),
+                };
+            }
+            match std::fs::write(&file_path, &data) {
+                Ok(()) => CliResponse::Ok {
+                    message: format!("Restored {path} to version {blob_hash_hex}."),
+                },
+                Err(e) => CliResponse::Error {
+                    message: format!("write file: {e}"),
                 },
             }
         }
@@ -1513,6 +1597,7 @@ mod tests {
             broadcast_tx,
             connected_peers: Arc::new(AtomicU64::new(0)),
             event_broadcast,
+            synced_folders: Arc::new(std::collections::HashMap::new()),
         }
     }
 

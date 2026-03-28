@@ -132,6 +132,25 @@ pub enum CliRequest {
         /// New sync mode: "read-write" or "read-only".
         mode: String,
     },
+
+    // -- M18 additions --
+    /// Preview the first `max_bytes` bytes of a blob stored locally.
+    BlobPreview {
+        /// Blob hash as 64-character hex string.
+        blob_hash_hex: String,
+        /// Maximum number of bytes to return.
+        max_bytes: u64,
+    },
+    /// Restore a historical file version by writing its blob to the local path.
+    RestoreFileVersion {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+        /// File path within the folder.
+        path: String,
+        /// Blob hash of the version to restore, as 64-character hex string.
+        blob_hash_hex: String,
+    },
+
     /// Subscribe to real-time engine events (long-lived connection).
     SubscribeEvents,
 }
@@ -218,6 +237,11 @@ pub enum CliResponse {
     FileVersions {
         /// Versions ordered by HLC.
         versions: Vec<FileVersionIpc>,
+    },
+    /// Raw blob data (response to `BlobPreview`).
+    BlobData {
+        /// The blob bytes (may be truncated to `max_bytes`).
+        data: Vec<u8>,
     },
     /// A real-time engine event (pushed via event stream).
     Event {
@@ -490,6 +514,15 @@ mod tests {
                 folder_id_hex: "ee".repeat(32),
                 mode: "read-only".to_string(),
             },
+            CliRequest::BlobPreview {
+                blob_hash_hex: "ff".repeat(32),
+                max_bytes: 4096,
+            },
+            CliRequest::RestoreFileVersion {
+                folder_id_hex: "aa".repeat(32),
+                path: "docs/readme.md".to_string(),
+                blob_hash_hex: "bb".repeat(32),
+            },
             CliRequest::SubscribeEvents,
         ];
         for req in variants {
@@ -666,6 +699,9 @@ mod tests {
             },
             CliResponse::Conflicts { conflicts: vec![] },
             CliResponse::FileVersions { versions: vec![] },
+            CliResponse::BlobData {
+                data: vec![0x48, 0x65, 0x6c, 0x6c, 0x6f],
+            },
             CliResponse::Event {
                 event: EngineEventIpc {
                     event_type: "test".to_string(),

@@ -424,6 +424,9 @@ fn print_plain(response: &CliResponse) {
                 }
             }
         }
+        CliResponse::BlobData { data } => {
+            println!("{} bytes of blob data", data.len());
+        }
         CliResponse::Event { event } => {
             println!("[{}] {}", event.event_type, event.data);
         }
