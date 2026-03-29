@@ -70,6 +70,9 @@ pub enum CliRequest {
     CreateFolder {
         /// Human-readable folder name.
         name: String,
+        /// Local directory path to sync. If provided, murmurd registers it in
+        /// config and starts watching for files.
+        local_path: Option<String>,
     },
     /// Remove a shared folder.
     RemoveFolder {
@@ -82,6 +85,9 @@ pub enum CliRequest {
     SubscribeFolder {
         /// Folder ID as 64-character hex string.
         folder_id_hex: String,
+        /// Human-readable folder name (optional; defaults to the folder's
+        /// original name if omitted).
+        name: Option<String>,
         /// Local directory path for the folder's files.
         local_path: String,
         /// Sync mode: "read-write" or "read-only".
@@ -153,6 +159,149 @@ pub enum CliRequest {
 
     /// Subscribe to real-time engine events (long-lived connection).
     SubscribeEvents,
+
+    // -- M19a: Zero-Config Onboarding --
+    /// Get the current daemon configuration.
+    GetConfig,
+    /// Create and subscribe to the default "Murmur" folder.
+    InitDefaultFolder {
+        /// Local path for the default folder (e.g. `~/Murmur`).
+        local_path: String,
+    },
+
+    // -- M20a: System Tray & Notifications --
+    /// Pause all blob transfers globally.
+    PauseSync,
+    /// Resume all blob transfers globally.
+    ResumeSync,
+
+    // -- M21a: Folder Discovery & Selective Sync --
+    /// List all folders on the network, including unsubscribed ones.
+    ListNetworkFolders,
+    /// List devices subscribed to a specific folder.
+    FolderSubscribers {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+    },
+
+    // -- M22a: Rich Conflict Resolution --
+    /// Resolve all conflicts in a folder with a single strategy.
+    BulkResolveConflicts {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+        /// Strategy: "keep_newest", "keep_local", or "keep_remote".
+        strategy: String,
+    },
+    /// Set auto-resolve strategy for a folder.
+    SetFolderAutoResolve {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+        /// Strategy: "none", "newest", or "mine".
+        strategy: String,
+    },
+    /// Dismiss a conflict without choosing a version (keep both files).
+    DismissConflict {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+        /// File path within the folder.
+        path: String,
+    },
+
+    // -- M23a: Device Management --
+    /// Get per-device online/offline presence.
+    GetDevicePresence,
+    /// Rename the local device.
+    SetDeviceName {
+        /// New device name.
+        name: String,
+    },
+
+    // -- M24a: Sync Progress --
+    /// Pause sync for a single folder.
+    PauseFolderSync {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+    },
+    /// Resume sync for a single folder.
+    ResumeFolderSync {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+    },
+
+    // -- M25a: File Browser --
+    /// Delete a file from a folder.
+    DeleteFile {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+        /// File path within the folder.
+        path: String,
+    },
+
+    // -- M26a: Settings & Configuration --
+    /// Toggle auto-approve for new devices.
+    SetAutoApprove {
+        /// Whether to auto-approve.
+        enabled: bool,
+    },
+    /// Toggle mDNS LAN peer discovery.
+    SetMdns {
+        /// Whether mDNS is enabled.
+        enabled: bool,
+    },
+    /// Delete orphaned blobs (no DAG entry). Returns bytes freed.
+    ReclaimOrphanedBlobs,
+    /// Change the local path for a subscribed folder.
+    SetFolderLocalPath {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+        /// New absolute local path.
+        new_local_path: String,
+    },
+    /// Rename a folder's local display name.
+    SetFolderName {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+        /// New display name.
+        name: String,
+    },
+    /// Read the `.murmurignore` file for a folder.
+    GetIgnorePatterns {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+    },
+    /// Write the `.murmurignore` file for a folder.
+    SetIgnorePatterns {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+        /// Newline-separated ignore patterns.
+        patterns: String,
+    },
+    /// Set bandwidth throttle limits.
+    SetThrottle {
+        /// Max upload bytes per second (0 = unlimited).
+        upload_bytes_per_sec: u64,
+        /// Max download bytes per second (0 = unlimited).
+        download_bytes_per_sec: u64,
+    },
+
+    // -- M26a: Settings --
+    /// Leave the network and wipe all daemon data (config, DAG, blobs, keys).
+    /// User files in synced folders on disk are NOT deleted.
+    /// The daemon shuts down after wiping.
+    LeaveNetwork,
+
+    // -- M27a: Diagnostics & Network Health --
+    /// List connected peers with connection info.
+    ListPeers,
+    /// Get storage statistics (blob counts, sizes, DAG entries).
+    StorageStats,
+    /// Test connectivity to the relay server.
+    RunConnectivityCheck,
+    /// Export diagnostics to a JSON file.
+    ExportDiagnostics {
+        /// Output file path.
+        output_path: String,
+    },
 }
 
 /// A response sent from `murmurd` to `murmur-cli`.
@@ -248,6 +397,93 @@ pub enum CliResponse {
         /// The event data.
         event: EngineEventIpc,
     },
+
+    // -- M19a: Config response --
+    /// Daemon configuration.
+    Config {
+        /// Device name.
+        device_name: String,
+        /// Device role.
+        device_role: String,
+        /// Network ID (hex).
+        network_id: String,
+        /// Folder configurations.
+        folders: Vec<FolderConfigIpc>,
+        /// Whether auto-approve is enabled.
+        auto_approve: bool,
+        /// Whether mDNS is enabled.
+        mdns: bool,
+        /// Upload throttle (bytes/sec, 0 = unlimited).
+        upload_throttle: u64,
+        /// Download throttle (bytes/sec, 0 = unlimited).
+        download_throttle: u64,
+        /// Whether sync is globally paused.
+        sync_paused: bool,
+    },
+
+    // -- M21a: Network folders --
+    /// List of all folders on the network (including unsubscribed).
+    NetworkFolders {
+        /// Folder info list with subscriber counts.
+        folders: Vec<NetworkFolderInfoIpc>,
+    },
+
+    // -- M21a: Folder subscribers --
+    /// List of devices subscribed to a folder.
+    FolderSubscriberList {
+        /// Subscriber info list.
+        subscribers: Vec<FolderSubscriberIpc>,
+    },
+
+    // -- M23a: Device presence --
+    /// Per-device online/offline presence.
+    DevicePresence {
+        /// Presence info list.
+        devices: Vec<DevicePresenceIpc>,
+    },
+
+    // -- M26a: Settings --
+    /// Ignore patterns for a folder.
+    IgnorePatterns {
+        /// The newline-separated pattern string.
+        patterns: String,
+    },
+    /// Bytes freed by orphaned-blob reclamation.
+    ReclaimedBytes {
+        /// Number of bytes freed.
+        bytes_freed: u64,
+        /// Number of blobs removed.
+        blobs_removed: u64,
+    },
+
+    // -- M27a: Diagnostics --
+    /// Connected peer list.
+    Peers {
+        /// Peer info list.
+        peers: Vec<PeerInfoIpc>,
+    },
+    /// Storage statistics.
+    StorageStatsResponse {
+        /// Per-folder storage info.
+        folders: Vec<FolderStorageIpc>,
+        /// Total blob count on disk.
+        total_blob_count: u64,
+        /// Total blob bytes on disk.
+        total_blob_bytes: u64,
+        /// Orphaned blob count.
+        orphaned_blob_count: u64,
+        /// Orphaned blob bytes.
+        orphaned_blob_bytes: u64,
+        /// DAG entry count.
+        dag_entry_count: u64,
+    },
+    /// Connectivity check result.
+    ConnectivityResult {
+        /// Whether the relay is reachable.
+        relay_reachable: bool,
+        /// Round-trip latency in milliseconds (if reachable).
+        latency_ms: Option<u64>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +546,8 @@ pub struct FolderInfoIpc {
     pub subscribed: bool,
     /// Sync mode if subscribed.
     pub mode: Option<String>,
+    /// Local directory path if subscribed.
+    pub local_path: Option<String>,
 }
 
 /// Conflict information for IPC transport.
@@ -360,6 +598,90 @@ pub struct EngineEventIpc {
     pub event_type: String,
     /// JSON-serialized event details.
     pub data: String,
+}
+
+/// Folder configuration for IPC transport (M19a).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FolderConfigIpc {
+    /// Folder ID (hex).
+    pub folder_id: String,
+    /// Human-readable folder name.
+    pub name: String,
+    /// Local path on disk.
+    pub local_path: String,
+    /// Sync mode: "read-write" or "read-only".
+    pub mode: String,
+    /// Auto-resolve strategy: "none", "newest", or "mine".
+    pub auto_resolve: String,
+}
+
+/// Network folder info for discovery (M21a).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NetworkFolderInfoIpc {
+    /// Folder ID (hex).
+    pub folder_id: String,
+    /// Folder name.
+    pub name: String,
+    /// Creator device ID (hex).
+    pub created_by: String,
+    /// Number of files.
+    pub file_count: u64,
+    /// Number of subscribers.
+    pub subscriber_count: u64,
+    /// Whether this device is subscribed.
+    pub subscribed: bool,
+    /// Sync mode if subscribed.
+    pub mode: Option<String>,
+}
+
+/// Folder subscriber info (M21a).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FolderSubscriberIpc {
+    /// Device ID (hex).
+    pub device_id: String,
+    /// Device name.
+    pub device_name: String,
+    /// Sync mode.
+    pub mode: String,
+}
+
+/// Device presence info (M23a).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DevicePresenceIpc {
+    /// Device ID (hex).
+    pub device_id: String,
+    /// Device name.
+    pub device_name: String,
+    /// Whether the device is currently online.
+    pub online: bool,
+    /// Last seen UNIX timestamp (0 if never connected).
+    pub last_seen_unix: u64,
+}
+
+/// Peer connection info (M27a).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PeerInfoIpc {
+    /// Device ID (hex).
+    pub device_id: String,
+    /// Device name.
+    pub device_name: String,
+    /// Connection type: "direct" or "relay".
+    pub connection_type: String,
+    /// Last seen UNIX timestamp.
+    pub last_seen_unix: u64,
+}
+
+/// Per-folder storage info (M27a).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FolderStorageIpc {
+    /// Folder ID (hex).
+    pub folder_id: String,
+    /// Folder name.
+    pub name: String,
+    /// Number of files.
+    pub file_count: u64,
+    /// Total bytes on disk.
+    pub total_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -478,6 +800,7 @@ mod tests {
             CliRequest::TransferStatus,
             CliRequest::CreateFolder {
                 name: "Photos".to_string(),
+                local_path: Some("/home/user/Photos".to_string()),
             },
             CliRequest::RemoveFolder {
                 folder_id_hex: "cc".repeat(32),
@@ -485,6 +808,7 @@ mod tests {
             CliRequest::ListFolders,
             CliRequest::SubscribeFolder {
                 folder_id_hex: "dd".repeat(32),
+                name: Some("Photos".to_string()),
                 local_path: "/home/user/Sync/Photos".to_string(),
                 mode: "read-write".to_string(),
             },
@@ -524,6 +848,79 @@ mod tests {
                 blob_hash_hex: "bb".repeat(32),
             },
             CliRequest::SubscribeEvents,
+            // M19a
+            CliRequest::GetConfig,
+            CliRequest::InitDefaultFolder {
+                local_path: "/home/user/Murmur".to_string(),
+            },
+            // M20a
+            CliRequest::PauseSync,
+            CliRequest::ResumeSync,
+            // M21a
+            CliRequest::ListNetworkFolders,
+            CliRequest::FolderSubscribers {
+                folder_id_hex: "aa".repeat(32),
+            },
+            // M22a
+            CliRequest::BulkResolveConflicts {
+                folder_id_hex: "bb".repeat(32),
+                strategy: "keep_newest".to_string(),
+            },
+            CliRequest::SetFolderAutoResolve {
+                folder_id_hex: "cc".repeat(32),
+                strategy: "newest".to_string(),
+            },
+            CliRequest::DismissConflict {
+                folder_id_hex: "dd".repeat(32),
+                path: "conflict.txt".to_string(),
+            },
+            // M23a
+            CliRequest::GetDevicePresence,
+            CliRequest::SetDeviceName {
+                name: "My Device".to_string(),
+            },
+            // M24a
+            CliRequest::PauseFolderSync {
+                folder_id_hex: "ee".repeat(32),
+            },
+            CliRequest::ResumeFolderSync {
+                folder_id_hex: "ff".repeat(32),
+            },
+            // M25a
+            CliRequest::DeleteFile {
+                folder_id_hex: "aa".repeat(32),
+                path: "old.txt".to_string(),
+            },
+            // M26a
+            CliRequest::SetAutoApprove { enabled: true },
+            CliRequest::SetMdns { enabled: false },
+            CliRequest::ReclaimOrphanedBlobs,
+            CliRequest::SetFolderLocalPath {
+                folder_id_hex: "aa".repeat(32),
+                new_local_path: "/new/path".to_string(),
+            },
+            CliRequest::SetFolderName {
+                folder_id_hex: "aa".repeat(32),
+                name: "Renamed".to_string(),
+            },
+            CliRequest::GetIgnorePatterns {
+                folder_id_hex: "bb".repeat(32),
+            },
+            CliRequest::SetIgnorePatterns {
+                folder_id_hex: "cc".repeat(32),
+                patterns: "*.tmp\n.DS_Store".to_string(),
+            },
+            CliRequest::SetThrottle {
+                upload_bytes_per_sec: 1_048_576,
+                download_bytes_per_sec: 0,
+            },
+            // M27a
+            CliRequest::ListPeers,
+            CliRequest::StorageStats,
+            CliRequest::RunConnectivityCheck,
+            CliRequest::ExportDiagnostics {
+                output_path: "/tmp/diag.json".to_string(),
+            },
         ];
         for req in variants {
             let bytes = postcard::to_allocvec(&req).unwrap();
@@ -589,6 +986,7 @@ mod tests {
                 file_count: 42,
                 subscribed: true,
                 mode: Some("read-write".to_string()),
+                local_path: Some("/home/user/Photos".to_string()),
             }],
         };
         let bytes = postcard::to_allocvec(&resp).unwrap();
@@ -707,6 +1105,86 @@ mod tests {
                     event_type: "test".to_string(),
                     data: "{}".to_string(),
                 },
+            },
+            // M19a
+            CliResponse::Config {
+                device_name: "NAS".to_string(),
+                device_role: "backup".to_string(),
+                network_id: "aa".repeat(32),
+                folders: vec![FolderConfigIpc {
+                    folder_id: "bb".repeat(32),
+                    name: "Murmur".to_string(),
+                    local_path: "/home/user/Murmur".to_string(),
+                    mode: "read-write".to_string(),
+                    auto_resolve: "none".to_string(),
+                }],
+                auto_approve: false,
+                mdns: true,
+                upload_throttle: 0,
+                download_throttle: 0,
+                sync_paused: false,
+            },
+            // M21a
+            CliResponse::NetworkFolders {
+                folders: vec![NetworkFolderInfoIpc {
+                    folder_id: "cc".repeat(32),
+                    name: "Photos".to_string(),
+                    created_by: "dd".repeat(32),
+                    file_count: 10,
+                    subscriber_count: 2,
+                    subscribed: true,
+                    mode: Some("read-write".to_string()),
+                }],
+            },
+            CliResponse::FolderSubscriberList {
+                subscribers: vec![FolderSubscriberIpc {
+                    device_id: "ee".repeat(32),
+                    device_name: "Phone".to_string(),
+                    mode: "read-write".to_string(),
+                }],
+            },
+            // M23a
+            CliResponse::DevicePresence {
+                devices: vec![DevicePresenceIpc {
+                    device_id: "ff".repeat(32),
+                    device_name: "NAS".to_string(),
+                    online: true,
+                    last_seen_unix: 1711700000,
+                }],
+            },
+            // M26a
+            CliResponse::IgnorePatterns {
+                patterns: "*.tmp\n.DS_Store".to_string(),
+            },
+            CliResponse::ReclaimedBytes {
+                bytes_freed: 1024,
+                blobs_removed: 3,
+            },
+            // M27a
+            CliResponse::Peers {
+                peers: vec![PeerInfoIpc {
+                    device_id: "aa".repeat(32),
+                    device_name: "Phone".to_string(),
+                    connection_type: "relay".to_string(),
+                    last_seen_unix: 1711700000,
+                }],
+            },
+            CliResponse::StorageStatsResponse {
+                folders: vec![FolderStorageIpc {
+                    folder_id: "bb".repeat(32),
+                    name: "Photos".to_string(),
+                    file_count: 42,
+                    total_bytes: 1_000_000,
+                }],
+                total_blob_count: 100,
+                total_blob_bytes: 5_000_000,
+                orphaned_blob_count: 2,
+                orphaned_blob_bytes: 50_000,
+                dag_entry_count: 200,
+            },
+            CliResponse::ConnectivityResult {
+                relay_reachable: true,
+                latency_ms: Some(42),
             },
         ];
         for resp in variants {

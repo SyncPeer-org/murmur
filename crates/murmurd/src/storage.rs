@@ -6,14 +6,12 @@ use std::sync::Arc;
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm};
 use anyhow::{Context, Result};
-use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
+use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use murmur_types::BlobHash;
 use tracing::{debug, info};
 
 /// The keyspace name for DAG entries within the Fjall database.
-const DAG_KEYSPACE: &str = "dag_entries";
-
-/// The keyspace name for the blob push queue.
+/// The keyspace name for the blob push queue within the Fjall database.
 const PUSH_QUEUE_KEYSPACE: &str = "push_queue";
 
 /// Chunk size for streaming encryption (1 MiB).
@@ -45,14 +43,19 @@ fn derive_chunk_nonce(base_nonce: &[u8; 12], chunk_index: u32) -> [u8; 12] {
     nonce
 }
 
-/// Persistent storage backed by Fjall (DAG) and filesystem (blobs).
+/// Persistent storage backed by Fjall (push queue) and filesystem (DAG + blobs).
+///
+/// DAG entries are stored in a flat append-only file (`dag.bin`) rather than
+/// Fjall, because Fjall 3.x has a journal recovery bug that loses data across
+/// process restarts.
 pub struct Storage {
-    /// Fjall database.
+    /// Fjall database (used only for the transient push queue).
+    #[allow(dead_code)]
     db: Database,
-    /// Keyspace for DAG entries (key = entry hash, value = serialized bytes).
-    dag_ks: Keyspace,
     /// Keyspace for the blob push queue (key = blob hash, value = retry count as u32 LE).
     push_queue_ks: Keyspace,
+    /// Directory containing the database.
+    data_dir: std::path::PathBuf,
     /// Directory for content-addressed blob files.
     blob_dir: std::path::PathBuf,
     /// Optional AES-256-GCM cipher for blob encryption at rest.
@@ -65,13 +68,22 @@ impl Storage {
         std::fs::create_dir_all(data_dir).context("create data_dir")?;
         std::fs::create_dir_all(blob_dir).context("create blob_dir")?;
 
-        let db = Database::builder(data_dir)
-            .open()
-            .context("open fjall database")?;
-
-        let dag_ks = db
-            .keyspace(DAG_KEYSPACE, KeyspaceCreateOptions::default)
-            .context("open dag_entries keyspace")?;
+        // Fjall is used only for the transient push queue.
+        // If Fjall fails to open (corrupt journal), wipe it — the push queue
+        // is transient and will be rebuilt from the DAG.
+        let fjall_dir = data_dir.join("fjall");
+        let db = match Database::builder(&fjall_dir).open() {
+            Ok(db) => db,
+            Err(e) => {
+                info!(error = %e, "Fjall open failed — recreating push queue DB");
+                if fjall_dir.exists() {
+                    let _ = std::fs::remove_dir_all(&fjall_dir);
+                }
+                Database::builder(&fjall_dir)
+                    .open()
+                    .context("open fjall database after wipe")?
+            }
+        };
 
         let push_queue_ks = db
             .keyspace(PUSH_QUEUE_KEYSPACE, KeyspaceCreateOptions::default)
@@ -81,8 +93,8 @@ impl Storage {
 
         Ok(Self {
             db,
-            dag_ks,
             push_queue_ks,
+            data_dir: data_dir.to_path_buf(),
             blob_dir: blob_dir.to_path_buf(),
             blob_cipher: None,
         })
@@ -94,41 +106,70 @@ impl Storage {
         info!("blob encryption at rest enabled");
     }
 
-    /// Persist a DAG entry (keyed by its hash, first 32 bytes of entry_bytes).
+    /// Persist a DAG entry to the flat append-only file `dag.bin`.
+    ///
+    /// Format: `[4 bytes LE length][entry_bytes]` repeated.
     pub fn persist_dag_entry(&self, entry_bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
         if entry_bytes.len() < 32 {
             anyhow::bail!("entry_bytes too short to contain hash");
         }
-        // The hash is the first field in the postcard-serialized DagEntry.
-        // We use the first 32 bytes as the key for content-addressable lookup.
+        let dag_path = self.data_dir.join("dag.bin");
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&dag_path)
+            .context("open dag.bin for append")?;
+        let len = (entry_bytes.len() as u32).to_le_bytes();
+        f.write_all(&len)?;
+        f.write_all(entry_bytes)?;
+        f.sync_data()?;
         let hash = &entry_bytes[..32];
-        self.dag_ks
-            .insert(hash, entry_bytes)
-            .context("persist dag entry")?;
         debug!(hash = hex_short(hash), "dag entry persisted");
         Ok(())
     }
 
-    /// Load all persisted DAG entries sorted by (HLC, DeviceId) for deterministic replay.
+    /// Load all persisted DAG entries from `dag.bin`, sorted by (HLC, DeviceId).
     ///
-    /// Fjall iteration order is not guaranteed to match insertion order, so we
-    /// deserialize each entry to extract its HLC and device ID, then sort.
-    /// This ensures dependent actions (e.g. DeviceRevoked) are always replayed
-    /// after their prerequisites (e.g. DeviceApproved).
+    /// Entries are deduplicated by hash to handle appends from multiple sessions.
     pub fn load_all_dag_entries(&self) -> Result<Vec<Vec<u8>>> {
         use murmur_dag::DagEntry;
+        use std::io::Read;
 
+        let dag_path = self.data_dir.join("dag.bin");
+        if !dag_path.exists() {
+            info!("no dag.bin — starting with empty DAG");
+            return Ok(Vec::new());
+        }
+
+        let mut f = std::fs::File::open(&dag_path).context("open dag.bin")?;
         let mut entries: Vec<(u64, murmur_types::DeviceId, Vec<u8>)> = Vec::new();
-        for guard in self.dag_ks.iter() {
-            let (_key, value) = guard.into_inner().context("iterate dag entries")?;
-            let bytes = value.to_vec();
-            let entry =
-                DagEntry::from_bytes(&bytes).context("deserialize dag entry for sorting")?;
-            entries.push((entry.hlc, entry.device_id, bytes));
+        let mut seen = std::collections::HashSet::new();
+
+        loop {
+            let mut len_buf = [0u8; 4];
+            match f.read_exact(&mut len_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+            if len == 0 || len > 1_000_000 {
+                break; // Corrupt length — stop reading.
+            }
+            let mut buf = vec![0u8; len];
+            if f.read_exact(&mut buf).is_err() {
+                break; // Truncated entry — stop.
+            }
+            if let Ok(entry) = DagEntry::from_bytes(&buf)
+                && seen.insert(entry.hash)
+            {
+                entries.push((entry.hlc, entry.device_id, buf));
+            }
         }
         entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         let sorted: Vec<Vec<u8>> = entries.into_iter().map(|(_, _, bytes)| bytes).collect();
-        info!(count = sorted.len(), "loaded dag entries from storage");
+        info!(count = sorted.len(), "loaded dag entries from dag.bin");
         Ok(sorted)
     }
 
@@ -345,9 +386,100 @@ impl Storage {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Blob directory inspection (M26a/M27a)
+    // -----------------------------------------------------------------------
+
+    /// List all blob hashes stored on disk.
+    pub fn list_all_blob_hashes(&self) -> Result<Vec<BlobHash>> {
+        let mut hashes = Vec::new();
+        if !self.blob_dir.exists() {
+            return Ok(hashes);
+        }
+        for top in std::fs::read_dir(&self.blob_dir).context("read blob_dir")? {
+            let top = top?;
+            if !top.file_type()?.is_dir() {
+                continue;
+            }
+            for mid in std::fs::read_dir(top.path())? {
+                let mid = mid?;
+                if !mid.file_type()?.is_dir() {
+                    continue;
+                }
+                for leaf in std::fs::read_dir(mid.path())? {
+                    let leaf = leaf?;
+                    if !leaf.path().is_file() {
+                        continue;
+                    }
+                    if let Some(name) = leaf.file_name().to_str()
+                        && let Ok(bytes) = hex::decode(name)
+                        && bytes.len() == 32
+                    {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        hashes.push(BlobHash::from_bytes(arr));
+                    }
+                }
+            }
+        }
+        Ok(hashes)
+    }
+
+    /// Get total blob count and bytes on disk.
+    pub fn blob_dir_stats(&self) -> Result<(u64, u64)> {
+        let mut count = 0u64;
+        let mut total_bytes = 0u64;
+        if !self.blob_dir.exists() {
+            return Ok((count, total_bytes));
+        }
+        for top in std::fs::read_dir(&self.blob_dir)? {
+            let top = top?;
+            if !top.file_type()?.is_dir() {
+                continue;
+            }
+            for mid in std::fs::read_dir(top.path())? {
+                let mid = mid?;
+                if !mid.file_type()?.is_dir() {
+                    continue;
+                }
+                for leaf in std::fs::read_dir(mid.path())? {
+                    let leaf = leaf?;
+                    if leaf.path().is_file() {
+                        count += 1;
+                        total_bytes += leaf.metadata().map(|m| m.len()).unwrap_or(0);
+                    }
+                }
+            }
+        }
+        Ok((count, total_bytes))
+    }
+
+    /// Remove a blob from disk. Returns the size of the removed file.
+    pub fn remove_blob(&self, blob_hash: BlobHash) -> Result<u64> {
+        let path = self.blob_path(blob_hash);
+        if path.exists() {
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            std::fs::remove_file(&path).context("remove blob file")?;
+            Ok(size)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Count DAG entries by loading them from the flat file.
+    pub fn dag_entry_count(&self) -> Result<u64> {
+        Ok(self.load_all_dag_entries()?.len() as u64)
+    }
+
     /// Flush the Fjall database to ensure durability.
+    ///
+    /// Fjall 3.x has a bug where `persist(SyncAll)` can leave the journal in a
+    /// state that fails recovery on the next open. We rely on Fjall's internal
+    /// journal writes for durability instead. Each `keyspace.insert()` call
+    /// writes to the journal immediately; the journal is synced to disk by
+    /// Fjall's background thread and during `Database::drop`.
     pub fn flush(&self) -> Result<()> {
-        self.db.persist(PersistMode::SyncAll)?;
+        // Intentionally a no-op. See doc comment above.
         Ok(())
     }
 

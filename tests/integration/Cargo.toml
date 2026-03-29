@@ -16,6 +16,18 @@ path = "three_device_topology.rs"
 name = "scenarios"
 path = "scenarios.rs"
 
+[[test]]
+name = "folder_management"
+path = "folder_management.rs"
+
+[[test]]
+name = "conflict_resolution"
+path = "conflict_resolution.rs"
+
+[[test]]
+name = "file_operations"
+path = "file_operations.rs"
+
 [dependencies]
 murmur-types = { workspace = true }
 murmur-seed = { workspace = true }

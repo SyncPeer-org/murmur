@@ -29,8 +29,8 @@ The first `add` command auto-creates a "default" folder.
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a folder list
 ```
 
-**Expected**: at least one folder — "default". Shows folder ID, name, file count,
-subscription status.
+**Expected**: at least one folder — "default". Shows folder ID, name, local path (if
+subscribed), file count, subscription status.
 
 ```bash
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder list
@@ -47,7 +47,8 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a folder list --json
 ```
 
 **Expected**: valid JSON with `folders` array. Each entry has: `folder_id` (64 hex),
-`name`, `created_by` (64 hex), `file_count`, `subscribed` (bool), `mode` (string or null).
+`name`, `created_by` (64 hex), `file_count`, `subscribed` (bool), `mode` (string or null),
+`local_path` (string or null).
 
 **Save the default folder ID** from this output.
 
@@ -145,10 +146,10 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a folder status "not-a-hex-
 Subscribe Node B to the "photos" folder:
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder subscribe <PHOTOS_FOLDER_ID> /tmp/murmur-b-photos
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder subscribe <PHOTOS_FOLDER_ID> /tmp/murmur-b-photos --name "photos"
 ```
 
-**Expected**: confirmation message (e.g., "Subscribed").
+**Expected**: confirmation message including the folder name (e.g., "Subscribed to folder photos (…)").
 
 Verify:
 
@@ -165,10 +166,10 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder list --json
 Subscribe Node B to "documents" in read-only mode:
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder subscribe <DOCUMENTS_FOLDER_ID> /tmp/murmur-b-docs --read-only
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder subscribe <DOCUMENTS_FOLDER_ID> /tmp/murmur-b-docs --name "documents" --read-only
 ```
 
-**Expected**: confirmation.
+**Expected**: confirmation including folder name.
 
 ```bash
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder list --json
@@ -181,7 +182,7 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder list --json
 ## I11 — Subscribe to Non-existent Folder
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder subscribe aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa /tmp/murmur-b-fake
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder subscribe aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa /tmp/murmur-b-fake --name "fake"
 ```
 
 **Expected**: error — folder not found. Non-zero exit code.
@@ -213,6 +214,27 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder mode <PHOTOS_FOLDE
 ```
 
 **Expected**: confirmation. Mode reverts to "read-write".
+
+---
+
+## I12a — Rename Folder
+
+Rename the "photos" folder on Node B:
+
+```bash
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder rename <PHOTOS_FOLDER_ID> "My Photos"
+```
+
+**Expected**: confirmation (e.g., "Folder renamed to My Photos.").
+
+Verify:
+
+```bash
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder list
+```
+
+**Expected**: folder now displays as "My Photos" with its local path. The rename is local
+to this device — Node A still sees "photos".
 
 ---
 
@@ -523,7 +545,7 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder list --json
 Subscribe first, then unsubscribe with `--keep-local`:
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder subscribe <DOCUMENTS_FOLDER_ID> /tmp/murmur-b-docs2
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder subscribe <DOCUMENTS_FOLDER_ID> /tmp/murmur-b-docs2 --name "documents"
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder unsubscribe <DOCUMENTS_FOLDER_ID> --keep-local
 ```
 
@@ -553,6 +575,32 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder list
 ```
 
 **Expected**: "documents" folder removed on Node B as well.
+
+---
+
+## I33a — Restart Daemon: Folders & Subscriptions Persist
+
+Stop Node A (Ctrl+C). Restart it:
+
+```bash
+cargo run --bin murmurd -- --data-dir /tmp/murmur-a --name node-a --role full
+```
+
+```bash
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a folder list
+```
+
+**Expected**: remaining folders are present with correct names, local paths, file
+counts, and subscription states.
+
+```bash
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a folder list --json
+```
+
+**Expected**: each subscribed folder has `local_path` set (not null), `name` non-empty,
+`subscribed: true`.
+
+**Checkpoint I33a**: Folders, names, and subscriptions survive daemon restart.
 
 ---
 

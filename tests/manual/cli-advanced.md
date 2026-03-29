@@ -240,6 +240,7 @@ cat /tmp/murmur-a/config.toml
 ```
 
 **Expected**: `name = "node-a"`, `role = "full"`, blob_dir and data_dir paths set.
+Each `[[folders]]` section should include a `name` field with the folder's display name.
 
 ```bash
 cat /tmp/murmur-a/mnemonic
@@ -509,7 +510,7 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a folder create "videos"
 Wait for sync. On Node B, subscribe to only one:
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder subscribe <MUSIC_FOLDER_ID> /tmp/murmur-b-music
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder subscribe <MUSIC_FOLDER_ID> /tmp/murmur-b-music --name "music"
 ```
 
 ```bash

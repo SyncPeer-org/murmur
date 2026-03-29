@@ -120,6 +120,9 @@ enum FolderCommand {
         folder_id: String,
         /// Local directory path for the folder's files.
         local_path: String,
+        /// Display name for the folder (defaults to folder's original name).
+        #[arg(long)]
+        name: Option<String>,
         /// Subscribe as read-only.
         #[arg(long)]
         read_only: bool,
@@ -153,6 +156,13 @@ enum FolderCommand {
         folder_id: String,
         /// New mode: read-write or read-only.
         mode: String,
+    },
+    /// Rename a folder's display name.
+    Rename {
+        /// Folder ID (64-character hex).
+        folder_id: String,
+        /// New display name.
+        name: String,
     },
 }
 
@@ -223,14 +233,19 @@ fn command_to_request(command: Command) -> CliRequest {
         Command::Add { path } => CliRequest::AddFile { path },
         Command::Transfers => CliRequest::TransferStatus,
         Command::Folder(sub) => match sub {
-            FolderCommand::Create { name } => CliRequest::CreateFolder { name },
+            FolderCommand::Create { name } => CliRequest::CreateFolder {
+                name,
+                local_path: None,
+            },
             FolderCommand::List => CliRequest::ListFolders,
             FolderCommand::Subscribe {
                 folder_id,
                 local_path,
+                name,
                 read_only,
             } => CliRequest::SubscribeFolder {
                 folder_id_hex: folder_id,
+                name,
                 local_path,
                 mode: if read_only {
                     "read-only".to_string()
@@ -257,6 +272,10 @@ fn command_to_request(command: Command) -> CliRequest {
             FolderCommand::Mode { folder_id, mode } => CliRequest::SetFolderMode {
                 folder_id_hex: folder_id,
                 mode,
+            },
+            FolderCommand::Rename { folder_id, name } => CliRequest::SetFolderName {
+                folder_id_hex: folder_id,
+                name,
             },
         },
         Command::Conflicts { folder } => CliRequest::ListConflicts {
@@ -370,9 +389,14 @@ fn print_plain(response: &CliResponse) {
                     } else {
                         "not subscribed".to_string()
                     };
+                    let path = f
+                        .local_path
+                        .as_deref()
+                        .map(|p| format!(" -> {p}"))
+                        .unwrap_or_default();
                     println!(
-                        "  {} {} ({} files, {})",
-                        f.folder_id, f.name, f.file_count, sub
+                        "  {} {}{} ({} files, {})",
+                        f.folder_id, f.name, path, f.file_count, sub
                     );
                 }
             }
@@ -429,6 +453,137 @@ fn print_plain(response: &CliResponse) {
         }
         CliResponse::Event { event } => {
             println!("[{}] {}", event.event_type, event.data);
+        }
+        CliResponse::Config {
+            device_name,
+            device_role,
+            network_id,
+            folders,
+            auto_approve,
+            mdns,
+            upload_throttle,
+            download_throttle,
+            sync_paused,
+        } => {
+            println!("Device:       {device_name} ({device_role})");
+            println!("Network:      {network_id}");
+            println!("Auto-approve: {auto_approve}");
+            println!("mDNS:         {mdns}");
+            println!("Sync paused:  {sync_paused}");
+            println!("Throttle:     up={upload_throttle} B/s, down={download_throttle} B/s");
+            if folders.is_empty() {
+                println!("Folders:      (none)");
+            } else {
+                println!("Folders:");
+                for f in folders {
+                    println!(
+                        "  {} ({}) -> {} [{}] auto_resolve={}",
+                        f.name, f.folder_id, f.local_path, f.mode, f.auto_resolve
+                    );
+                }
+            }
+        }
+        CliResponse::NetworkFolders { folders } => {
+            if folders.is_empty() {
+                println!("No folders on the network.");
+            } else {
+                println!("Network folders ({}):", folders.len());
+                for f in folders {
+                    let sub = if f.subscribed {
+                        "subscribed"
+                    } else {
+                        "available"
+                    };
+                    println!(
+                        "  {} — {} files, {} subs [{}]",
+                        f.name, f.file_count, f.subscriber_count, sub
+                    );
+                }
+            }
+        }
+        CliResponse::FolderSubscriberList { subscribers } => {
+            if subscribers.is_empty() {
+                println!("No subscribers.");
+            } else {
+                println!("Subscribers ({}):", subscribers.len());
+                for s in subscribers {
+                    println!("  {} ({}) [{}]", s.device_name, s.device_id, s.mode);
+                }
+            }
+        }
+        CliResponse::DevicePresence { devices } => {
+            if devices.is_empty() {
+                println!("No devices.");
+            } else {
+                for d in devices {
+                    let status = if d.online { "online" } else { "offline" };
+                    println!(
+                        "  {} ({}) — {} (last seen: {})",
+                        d.device_name, d.device_id, status, d.last_seen_unix
+                    );
+                }
+            }
+        }
+        // M26a
+        CliResponse::IgnorePatterns { patterns } => {
+            if patterns.is_empty() {
+                println!("(no ignore patterns)");
+            } else {
+                println!("{patterns}");
+            }
+        }
+        CliResponse::ReclaimedBytes {
+            bytes_freed,
+            blobs_removed,
+        } => {
+            println!("Reclaimed {blobs_removed} orphaned blobs, {bytes_freed} bytes freed.");
+        }
+        // M27a
+        CliResponse::Peers { peers } => {
+            if peers.is_empty() {
+                println!("No peers connected.");
+            } else {
+                println!("Peers ({}):", peers.len());
+                for p in peers {
+                    println!(
+                        "  {} ({}) [{}] last seen: {}",
+                        p.device_name, p.device_id, p.connection_type, p.last_seen_unix
+                    );
+                }
+            }
+        }
+        CliResponse::StorageStatsResponse {
+            folders,
+            total_blob_count,
+            total_blob_bytes,
+            orphaned_blob_count,
+            orphaned_blob_bytes,
+            dag_entry_count,
+        } => {
+            println!("Storage Statistics:");
+            println!("  DAG entries:     {dag_entry_count}");
+            println!("  Total blobs:     {total_blob_count} ({total_blob_bytes} bytes)");
+            println!("  Orphaned blobs:  {orphaned_blob_count} ({orphaned_blob_bytes} bytes)");
+            for f in folders {
+                println!(
+                    "  Folder {} ({}): {} files, {} bytes",
+                    f.name, f.folder_id, f.file_count, f.total_bytes
+                );
+            }
+        }
+        CliResponse::ConnectivityResult {
+            relay_reachable,
+            latency_ms,
+        } => {
+            let status = if *relay_reachable {
+                "reachable"
+            } else {
+                "unreachable"
+            };
+            let latency = latency_ms
+                .map(|ms| format!(" ({ms} ms)"))
+                .unwrap_or_default();
+            println!("Relay: {status}{latency}");
         }
         CliResponse::Ok { message } => {
             println!("{message}");

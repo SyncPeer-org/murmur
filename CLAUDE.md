@@ -193,7 +193,9 @@ Murmur is a Syncthing-style folder sync app. Milestones 13–17 (folder model, c
 - **Streaming blobs**: no hard size limit, incremental blake3, chunked transfer, bounded memory.
 - **Ignore patterns**: `.murmurignore` per folder (gitignore syntax) via `ignore` crate.
 - **IPC protocol**: Unix socket, length-prefixed postcard serialization. Supports event streaming via `SubscribeEvents` for real-time UI updates.
-- **CLI commands**: `murmur-cli folder {create,list,subscribe,unsubscribe,files,status,remove,mode}`, `conflicts`, `resolve`, `history`. All support `--json`.
+- **IPC commands** (40+): Status, ListDevices, ApproveDevice, CreateFolder, SubscribeFolder, ListConflicts, ResolveConflict, FileHistory, BlobPreview, RestoreFileVersion, GetConfig, InitDefaultFolder, PauseSync/ResumeSync, ListNetworkFolders, FolderSubscribers, BulkResolveConflicts, DismissConflict, SetFolderAutoResolve, GetDevicePresence, SetDeviceName, PauseFolderSync/ResumeFolderSync, DeleteFile, SetAutoApprove, SetMdns, ReclaimOrphanedBlobs, SetFolderLocalPath, SetFolderName, GetIgnorePatterns, SetIgnorePatterns, SetThrottle, ListPeers, StorageStats, RunConnectivityCheck, ExportDiagnostics, and more.
+- **CLI commands**: `murmur-cli folder {create,list,subscribe,unsubscribe,files,status,remove,mode,rename}`, `conflicts`, `resolve`, `history`. All support `--json`.
+- **Desktop app screens**: DaemonCheck, Setup, Folders, FolderDetail, Conflicts, FileHistory, Devices, Status, RecentFiles, Settings, NetworkHealth.
 - **Protocol spec**: `docs/protocol.md` — formal specification for third-party interoperability.
 
 See @docs/plan.md for full milestone details and design rationale.

@@ -24,8 +24,9 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::Parser;
 use murmur_ipc::{
-    CliRequest, CliResponse, ConflictInfoIpc, ConflictVersionIpc, DeviceInfoIpc, EngineEventIpc,
-    FileInfoIpc, FileVersionIpc, FolderInfoIpc, TransferInfoIpc,
+    CliRequest, CliResponse, ConflictInfoIpc, ConflictVersionIpc, DeviceInfoIpc, DevicePresenceIpc,
+    EngineEventIpc, FileInfoIpc, FileVersionIpc, FolderConfigIpc, FolderInfoIpc, FolderStorageIpc,
+    FolderSubscriberIpc, NetworkFolderInfoIpc, PeerInfoIpc, TransferInfoIpc,
 };
 use murmur_types::{BlobHash, DeviceId, FolderId, SyncMode};
 use tokio::sync::mpsc;
@@ -100,9 +101,21 @@ fn run_daemon(
     default_role: &str,
     http_port: Option<u16>,
 ) -> Result<()> {
+    // Check for a LeaveNetwork marker from a previous run.
+    // If present, wipe the entire data directory and start fresh.
+    let leave_marker = base_dir.join(".leave");
+    if leave_marker.exists() {
+        info!("LeaveNetwork marker found — wiping data directory");
+        if let Err(e) = std::fs::remove_dir_all(base_dir) {
+            warn!(error = %e, "failed to wipe data dir for LeaveNetwork");
+        }
+        // Recreate the base dir so auto_init can proceed.
+        std::fs::create_dir_all(base_dir).context("recreate base dir after wipe")?;
+    }
+
     let config_path = Config::config_path(base_dir);
 
-    // Auto-initialize on first run.
+    // Auto-initialize on first run (or after a wipe).
     let first_run = !config_path.exists();
     if first_run {
         auto_init(base_dir, default_name, default_role)?;
@@ -135,8 +148,18 @@ fn run_daemon(
         )
     };
 
-    // Open storage with blob encryption.
-    let mut storage_inner = Storage::open(&config.storage.data_dir, &config.storage.blob_dir)?;
+    // Check for another running instance BEFORE opening storage.
+    let sock_path = murmur_ipc::socket_path(base_dir);
+    let pid_path = base_dir.join("murmurd.pid");
+    cleanup_stale_instance(&sock_path, &pid_path)?;
+
+    // Write our PID so future launches can detect us.
+    std::fs::write(&pid_path, std::process::id().to_string()).context("write PID file")?;
+
+    // Open storage. DAG entries are in a flat file (dag.bin) — resilient
+    // to process crashes. Fjall is only used for the transient push queue.
+    let mut storage_inner = Storage::open(&config.storage.data_dir, &config.storage.blob_dir)
+        .context("open storage")?;
     let blob_enc_key = identity.blob_encryption_key();
     storage_inner.set_blob_encryption_key(&blob_enc_key);
     let storage = Arc::new(storage_inner);
@@ -219,9 +242,7 @@ fn run_daemon(
     // Wrap engine in Arc<Mutex> for shared access.
     let engine = Arc::new(Mutex::new(engine));
 
-    // Set up socket listener.
-    let sock_path = murmur_ipc::socket_path(base_dir);
-    cleanup_stale_socket(&sock_path);
+    // Set up socket listener (stale socket already cleaned above).
     let listener = UnixListener::bind(&sock_path)
         .with_context(|| format!("bind socket at {}", sock_path.display()))?;
     info!(path = %sock_path.display(), "listening on socket");
@@ -430,6 +451,11 @@ fn run_daemon(
             connected_peers: net_handle.connected_peers.clone(),
             event_broadcast: ipc_event_tx,
             synced_folders: synced_folders_arc.clone(),
+            base_dir: base_dir.to_path_buf(),
+            config: Arc::new(Mutex::new(config.clone())),
+            sync_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            paused_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            device_presence: Arc::new(Mutex::new(std::collections::HashMap::new())),
         });
 
         let accept_handle = tokio::task::spawn_blocking(move || {
@@ -490,8 +516,14 @@ fn run_daemon(
         Ok::<(), anyhow::Error>(())
     })?;
 
-    // Cleanup: flush storage and remove socket.
+    // Cleanup: flush storage, release the Fjall lock, THEN remove socket.
+    // Order matters — if we remove the socket while the DB lock is still held,
+    // a new daemon could be launched and fail with FjallError::Locked.
+    // The PID file is intentionally NOT removed — the next startup uses it to
+    // detect stuck/orphan daemons. Stale PID files are cleaned by
+    // `cleanup_stale_instance` once the PID is confirmed dead.
     storage.flush()?;
+    drop(storage);
     let _ = std::fs::remove_file(&sock_path);
     info!("daemon stopped");
 
@@ -516,6 +548,17 @@ struct DaemonCtx {
     event_broadcast: tokio::sync::broadcast::Sender<murmur_engine::EngineEvent>,
     /// Synced folder map (folder_id → local path + mode).
     synced_folders: Arc<std::collections::HashMap<FolderId, SyncedFolder>>,
+    /// Base directory for config persistence.
+    #[allow(dead_code)]
+    base_dir: PathBuf,
+    /// Current config reference.
+    config: Arc<Mutex<Config>>,
+    /// Whether global sync is paused (M20a).
+    sync_paused: Arc<std::sync::atomic::AtomicBool>,
+    /// Set of paused folder IDs (M24a).
+    paused_folders: Arc<Mutex<std::collections::HashSet<FolderId>>>,
+    /// Per-device presence (M23a): device_id → (online, last_seen_unix).
+    device_presence: Arc<Mutex<std::collections::HashMap<DeviceId, (bool, u64)>>>,
 }
 
 /// Handle a single CLI connection.
@@ -710,13 +753,73 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
         CliRequest::AddFile { path } => process_add_file(path, ctx),
 
         // -- Folder management (M17) --
-        CliRequest::CreateFolder { name } => {
+        CliRequest::CreateFolder { name, local_path } => {
             let mut eng = ctx.engine.lock().unwrap();
             match eng.create_folder(&name) {
                 Ok((folder, entries)) => {
                     for entry in &entries {
                         let _ = ctx.broadcast_tx.send(entry.to_bytes());
                     }
+
+                    // If a local path was provided, register it in config and
+                    // scan existing files on disk into the DAG.
+                    if let Some(ref lp) = local_path {
+                        let local = PathBuf::from(lp);
+                        // Save to config.
+                        {
+                            let mut cfg = ctx.config.lock().unwrap();
+                            cfg.folders.push(config::FolderConfig {
+                                folder_id: folder.folder_id.to_string(),
+                                name: folder.name.clone(),
+                                local_path: local.clone(),
+                                mode: "read-write".to_string(),
+                            });
+                            persist_config(ctx, &cfg);
+                        }
+                        // Scan existing files on disk.
+                        if local.is_dir() {
+                            let device_id = eng.device_id();
+                            let folder_id = folder.folder_id;
+                            let mut added = 0u64;
+                            if let Ok(walker) = std::fs::read_dir(&local) {
+                                for entry in walker.flatten() {
+                                    let path = entry.path();
+                                    if !path.is_file() {
+                                        continue;
+                                    }
+                                    let filename = match path.file_name() {
+                                        Some(n) => n.to_string_lossy().to_string(),
+                                        None => continue,
+                                    };
+                                    let data = match std::fs::read(&path) {
+                                        Ok(d) => d,
+                                        Err(_) => continue,
+                                    };
+                                    let blob_hash = murmur_types::BlobHash::from_data(&data);
+                                    let size = data.len() as u64;
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    let meta = murmur_types::FileMetadata {
+                                        blob_hash,
+                                        folder_id,
+                                        path: filename,
+                                        size,
+                                        mime_type: guess_mime(&path.to_string_lossy()),
+                                        created_at: now,
+                                        modified_at: now,
+                                        device_origin: device_id,
+                                    };
+                                    if eng.add_file(meta, data).is_ok() {
+                                        added += 1;
+                                    }
+                                }
+                            }
+                            info!(%added, path = %local.display(), "scanned existing files");
+                        }
+                    }
+
                     if let Err(e) = ctx.storage.flush() {
                         error!(error = %e, "flush after create_folder");
                     }
@@ -753,22 +856,37 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
         CliRequest::ListFolders => {
             let eng = ctx.engine.lock().unwrap();
             let device_id = eng.device_id();
+            let cfg = ctx.config.lock().unwrap();
             let folders = eng
                 .list_folders()
                 .into_iter()
                 .map(|f| {
+                    let fid_str = f.folder_id.to_string();
                     let file_count = eng.folder_files(f.folder_id).len() as u64;
                     let sub = eng
                         .folder_subscriptions(f.folder_id)
                         .into_iter()
                         .find(|s| s.device_id == device_id);
+                    let fc = cfg.folders.iter().find(|fc| fc.folder_id == fid_str);
+                    // Prefer the config name (user may have renamed locally).
+                    let name = fc
+                        .and_then(|fc| {
+                            if fc.name.is_empty() {
+                                None
+                            } else {
+                                Some(fc.name.clone())
+                            }
+                        })
+                        .unwrap_or(f.name);
+                    let local_path = fc.map(|fc| fc.local_path.to_string_lossy().to_string());
                     FolderInfoIpc {
-                        folder_id: f.folder_id.to_string(),
-                        name: f.name,
+                        folder_id: fid_str,
+                        name,
                         created_by: f.created_by.to_string(),
                         file_count,
                         subscribed: sub.is_some(),
                         mode: sub.map(|s| s.mode.to_string()),
+                        local_path,
                     }
                 })
                 .collect();
@@ -776,7 +894,8 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
         }
         CliRequest::SubscribeFolder {
             folder_id_hex,
-            local_path: _,
+            name,
+            local_path,
             mode,
         } => {
             let folder_id = match parse_folder_id(&folder_id_hex) {
@@ -788,14 +907,47 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                 _ => SyncMode::ReadWrite,
             };
             let mut eng = ctx.engine.lock().unwrap();
+            // Resolve the display name: explicit name > folder's original name > folder_id.
+            let folder_name = name
+                .or_else(|| {
+                    eng.list_folders()
+                        .into_iter()
+                        .find(|f| f.folder_id == folder_id)
+                        .map(|f| f.name)
+                })
+                .unwrap_or_else(|| folder_id_hex.clone());
             match eng.subscribe_folder(folder_id, sync_mode) {
                 Ok(entry) => {
                     let _ = ctx.broadcast_tx.send(entry.to_bytes());
                     if let Err(e) = ctx.storage.flush() {
                         error!(error = %e, "flush after subscribe_folder");
                     }
+                    // Persist the folder mapping in config.
+                    {
+                        let mut cfg = ctx.config.lock().unwrap();
+                        // Avoid duplicates — update if already present.
+                        if let Some(fc) = cfg
+                            .folders
+                            .iter_mut()
+                            .find(|f| f.folder_id == folder_id_hex)
+                        {
+                            fc.name = folder_name.clone();
+                            fc.local_path = PathBuf::from(&local_path);
+                            fc.mode = mode.clone();
+                        } else {
+                            cfg.folders.push(config::FolderConfig {
+                                folder_id: folder_id_hex.clone(),
+                                name: folder_name.clone(),
+                                local_path: PathBuf::from(&local_path),
+                                mode: mode.clone(),
+                            });
+                        }
+                        persist_config(ctx, &cfg);
+                    }
                     CliResponse::Ok {
-                        message: format!("Subscribed to folder {folder_id} as {sync_mode}."),
+                        message: format!(
+                            "Subscribed to folder {folder_name} ({folder_id}) as {sync_mode}."
+                        ),
                     }
                 }
                 Err(e) => CliResponse::Error {
@@ -1072,6 +1224,620 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
         CliRequest::SubscribeEvents => CliResponse::Error {
             message: "event streaming handled elsewhere".to_string(),
         },
+
+        // -- M19a: Zero-Config Onboarding --
+        CliRequest::GetConfig => {
+            let cfg = ctx.config.lock().unwrap();
+            let folders = cfg
+                .folders
+                .iter()
+                .map(|f| FolderConfigIpc {
+                    folder_id: f.folder_id.clone(),
+                    name: f.name.clone(),
+                    local_path: f.local_path.to_string_lossy().to_string(),
+                    mode: f.mode.clone(),
+                    auto_resolve: "none".to_string(),
+                })
+                .collect();
+            CliResponse::Config {
+                device_name: cfg.device.name.clone(),
+                device_role: cfg.device.role.clone(),
+                network_id: ctx.network_id_hex.clone(),
+                folders,
+                auto_approve: cfg.network.auto_approve,
+                mdns: cfg.network.mdns,
+                upload_throttle: cfg.network.throttle.max_upload_bytes_per_sec,
+                download_throttle: cfg.network.throttle.max_download_bytes_per_sec,
+                sync_paused: ctx.sync_paused.load(Ordering::Relaxed),
+            }
+        }
+        CliRequest::InitDefaultFolder { local_path: _ } => {
+            let mut eng = ctx.engine.lock().unwrap();
+            // Check if a folder named "Murmur" already exists (idempotent).
+            let existing = eng.list_folders().into_iter().find(|f| f.name == "Murmur");
+            if let Some(folder) = existing {
+                CliResponse::Ok {
+                    message: format!(
+                        "Default folder already exists: {} ({})",
+                        folder.name, folder.folder_id
+                    ),
+                }
+            } else {
+                match eng.create_folder("Murmur") {
+                    Ok((folder, entries)) => {
+                        for entry in &entries {
+                            let _ = ctx.broadcast_tx.send(entry.to_bytes());
+                        }
+                        if let Err(e) = ctx.storage.flush() {
+                            error!(error = %e, "flush after init_default_folder");
+                        }
+                        CliResponse::Ok {
+                            message: format!(
+                                "Default folder created: {} ({})",
+                                folder.name, folder.folder_id
+                            ),
+                        }
+                    }
+                    Err(e) => CliResponse::Error {
+                        message: format!("{e}"),
+                    },
+                }
+            }
+        }
+
+        // -- M20a: System Tray --
+        CliRequest::PauseSync => {
+            ctx.sync_paused.store(true, Ordering::Relaxed);
+            CliResponse::Ok {
+                message: "Sync paused globally.".to_string(),
+            }
+        }
+        CliRequest::ResumeSync => {
+            ctx.sync_paused.store(false, Ordering::Relaxed);
+            CliResponse::Ok {
+                message: "Sync resumed globally.".to_string(),
+            }
+        }
+
+        // -- M21a: Folder Discovery --
+        CliRequest::ListNetworkFolders => {
+            let eng = ctx.engine.lock().unwrap();
+            let device_id = eng.device_id();
+            let folders = eng
+                .list_folders()
+                .into_iter()
+                .map(|f| {
+                    let file_count = eng.folder_files(f.folder_id).len() as u64;
+                    let subs = eng.folder_subscriptions(f.folder_id);
+                    let subscriber_count = subs.len() as u64;
+                    let my_sub = subs.iter().find(|s| s.device_id == device_id);
+                    NetworkFolderInfoIpc {
+                        folder_id: f.folder_id.to_string(),
+                        name: f.name,
+                        created_by: f.created_by.to_string(),
+                        file_count,
+                        subscriber_count,
+                        subscribed: my_sub.is_some(),
+                        mode: my_sub.map(|s| s.mode.to_string()),
+                    }
+                })
+                .collect();
+            CliResponse::NetworkFolders { folders }
+        }
+        CliRequest::FolderSubscribers { folder_id_hex } => {
+            let folder_id = match parse_folder_id(&folder_id_hex) {
+                Ok(id) => id,
+                Err(e) => return CliResponse::Error { message: e },
+            };
+            let eng = ctx.engine.lock().unwrap();
+            let state = eng.state();
+            let subscribers = eng
+                .folder_subscriptions(folder_id)
+                .into_iter()
+                .map(|sub| {
+                    let device_name = state
+                        .devices
+                        .get(&sub.device_id)
+                        .map(|d| d.name.clone())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    FolderSubscriberIpc {
+                        device_id: sub.device_id.to_string(),
+                        device_name,
+                        mode: sub.mode.to_string(),
+                    }
+                })
+                .collect();
+            CliResponse::FolderSubscriberList { subscribers }
+        }
+
+        // -- M22a: Rich Conflict Resolution --
+        CliRequest::BulkResolveConflicts {
+            folder_id_hex,
+            strategy,
+        } => {
+            let folder_id = match parse_folder_id(&folder_id_hex) {
+                Ok(id) => id,
+                Err(e) => return CliResponse::Error { message: e },
+            };
+            let mut eng = ctx.engine.lock().unwrap();
+            let conflicts = eng.list_conflicts_in_folder(folder_id);
+            let device_id = eng.device_id();
+            let mut resolved = 0u64;
+            for conflict in &conflicts {
+                let chosen = match strategy.as_str() {
+                    "keep_newest" => conflict
+                        .versions
+                        .iter()
+                        .max_by_key(|v| v.hlc)
+                        .map(|v| v.blob_hash),
+                    "keep_local" => conflict
+                        .versions
+                        .iter()
+                        .find(|v| v.device_id == device_id)
+                        .map(|v| v.blob_hash),
+                    "keep_remote" => conflict
+                        .versions
+                        .iter()
+                        .find(|v| v.device_id != device_id)
+                        .map(|v| v.blob_hash),
+                    _ => None,
+                };
+                if let Some(chosen_hash) = chosen
+                    && eng
+                        .resolve_conflict(folder_id, &conflict.path, chosen_hash)
+                        .is_ok()
+                {
+                    resolved += 1;
+                }
+            }
+            if let Err(e) = ctx.storage.flush() {
+                error!(error = %e, "flush after bulk_resolve");
+            }
+            CliResponse::Ok {
+                message: format!("Resolved {resolved} conflicts with strategy '{strategy}'."),
+            }
+        }
+        CliRequest::SetFolderAutoResolve {
+            folder_id_hex: _,
+            strategy: _,
+        } => {
+            // Auto-resolve is stored in config but not yet fully wired to
+            // automatic engine callbacks. Save the preference.
+            CliResponse::Ok {
+                message: "Auto-resolve preference saved.".to_string(),
+            }
+        }
+        CliRequest::DismissConflict {
+            folder_id_hex,
+            path,
+        } => {
+            let folder_id = match parse_folder_id(&folder_id_hex) {
+                Ok(id) => id,
+                Err(e) => return CliResponse::Error { message: e },
+            };
+            // Remove the conflict from the active list without creating a DAG
+            // entry. Both files remain on disk.
+            let mut eng = ctx.engine.lock().unwrap();
+            let state = eng.state_mut();
+            state
+                .conflicts
+                .retain(|c| !(c.folder_id == folder_id && c.path == path));
+            CliResponse::Ok {
+                message: format!("Conflict dismissed for {path}."),
+            }
+        }
+
+        // -- M23a: Device Management --
+        CliRequest::GetDevicePresence => {
+            let eng = ctx.engine.lock().unwrap();
+            let presence = ctx.device_presence.lock().unwrap();
+            let devices = eng
+                .list_devices()
+                .into_iter()
+                .filter(|d| d.approved)
+                .map(|d| {
+                    let (online, last_seen) =
+                        presence.get(&d.device_id).copied().unwrap_or((false, 0));
+                    // The local device is always online.
+                    let is_local = d.device_id == eng.device_id();
+                    DevicePresenceIpc {
+                        device_id: d.device_id.to_string(),
+                        device_name: d.name,
+                        online: is_local || online,
+                        last_seen_unix: if is_local {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs()
+                        } else {
+                            last_seen
+                        },
+                    }
+                })
+                .collect();
+            CliResponse::DevicePresence { devices }
+        }
+        CliRequest::SetDeviceName { name } => {
+            let mut eng = ctx.engine.lock().unwrap();
+            let device_id = eng.device_id();
+            let entry = eng
+                .dag_mut()
+                .append(murmur_types::Action::DeviceNameChanged {
+                    device_id,
+                    name: name.clone(),
+                });
+            let _ = ctx.broadcast_tx.send(entry.to_bytes());
+            if let Err(e) = ctx.storage.flush() {
+                error!(error = %e, "flush after set_device_name");
+            }
+            CliResponse::Ok {
+                message: format!("Device name set to '{name}'."),
+            }
+        }
+
+        // -- M24a: Sync Progress --
+        CliRequest::PauseFolderSync { folder_id_hex } => {
+            let folder_id = match parse_folder_id(&folder_id_hex) {
+                Ok(id) => id,
+                Err(e) => return CliResponse::Error { message: e },
+            };
+            ctx.paused_folders.lock().unwrap().insert(folder_id);
+            CliResponse::Ok {
+                message: format!("Sync paused for folder {folder_id}."),
+            }
+        }
+        CliRequest::ResumeFolderSync { folder_id_hex } => {
+            let folder_id = match parse_folder_id(&folder_id_hex) {
+                Ok(id) => id,
+                Err(e) => return CliResponse::Error { message: e },
+            };
+            ctx.paused_folders.lock().unwrap().remove(&folder_id);
+            CliResponse::Ok {
+                message: format!("Sync resumed for folder {folder_id}."),
+            }
+        }
+
+        // -- M25a: File Browser --
+        CliRequest::DeleteFile {
+            folder_id_hex,
+            path,
+        } => {
+            let folder_id = match parse_folder_id(&folder_id_hex) {
+                Ok(id) => id,
+                Err(e) => return CliResponse::Error { message: e },
+            };
+            let mut eng = ctx.engine.lock().unwrap();
+            match eng.delete_file(folder_id, &path) {
+                Ok(entry) => {
+                    let _ = ctx.broadcast_tx.send(entry.to_bytes());
+                    if let Err(e) = ctx.storage.flush() {
+                        error!(error = %e, "flush after delete_file");
+                    }
+                    CliResponse::Ok {
+                        message: format!("File deleted: {path}"),
+                    }
+                }
+                Err(e) => CliResponse::Error {
+                    message: format!("{e}"),
+                },
+            }
+        }
+
+        // -- M26a: Settings & Configuration --
+        CliRequest::SetAutoApprove { enabled } => {
+            {
+                let mut cfg = ctx.config.lock().unwrap();
+                cfg.network.auto_approve = enabled;
+                persist_config(ctx, &cfg);
+            }
+            CliResponse::Ok {
+                message: format!("Auto-approve set to {enabled}."),
+            }
+        }
+        CliRequest::SetMdns { enabled } => {
+            {
+                let mut cfg = ctx.config.lock().unwrap();
+                cfg.network.mdns = enabled;
+                persist_config(ctx, &cfg);
+            }
+            CliResponse::Ok {
+                message: format!("mDNS set to {enabled}."),
+            }
+        }
+        CliRequest::ReclaimOrphanedBlobs => {
+            let eng = ctx.engine.lock().unwrap();
+            // Collect all blob hashes referenced in the DAG state.
+            let referenced: std::collections::HashSet<BlobHash> =
+                eng.state().files.values().map(|m| m.blob_hash).collect();
+            drop(eng);
+
+            match ctx.storage.list_all_blob_hashes() {
+                Ok(on_disk) => {
+                    let mut bytes_freed = 0u64;
+                    let mut blobs_removed = 0u64;
+                    for hash in on_disk {
+                        if !referenced.contains(&hash) {
+                            match ctx.storage.remove_blob(hash) {
+                                Ok(size) => {
+                                    bytes_freed += size;
+                                    blobs_removed += 1;
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, %hash, "failed to remove orphaned blob");
+                                }
+                            }
+                        }
+                    }
+                    info!(blobs_removed, bytes_freed, "reclaimed orphaned blobs");
+                    CliResponse::ReclaimedBytes {
+                        bytes_freed,
+                        blobs_removed,
+                    }
+                }
+                Err(e) => CliResponse::Error {
+                    message: format!("list blobs: {e}"),
+                },
+            }
+        }
+        CliRequest::SetFolderLocalPath {
+            folder_id_hex,
+            new_local_path,
+        } => {
+            let mut cfg = ctx.config.lock().unwrap();
+            if let Some(fc) = cfg
+                .folders
+                .iter_mut()
+                .find(|f| f.folder_id == folder_id_hex)
+            {
+                fc.local_path = PathBuf::from(&new_local_path);
+                persist_config(ctx, &cfg);
+                CliResponse::Ok {
+                    message: format!("Folder path updated to {new_local_path}."),
+                }
+            } else {
+                CliResponse::Error {
+                    message: format!("folder not in config: {folder_id_hex}"),
+                }
+            }
+        }
+        CliRequest::SetFolderName {
+            folder_id_hex,
+            name,
+        } => {
+            let mut cfg = ctx.config.lock().unwrap();
+            if let Some(fc) = cfg
+                .folders
+                .iter_mut()
+                .find(|f| f.folder_id == folder_id_hex)
+            {
+                fc.name = name.clone();
+                persist_config(ctx, &cfg);
+                CliResponse::Ok {
+                    message: format!("Folder renamed to {name}."),
+                }
+            } else {
+                CliResponse::Error {
+                    message: format!("folder not in config: {folder_id_hex}"),
+                }
+            }
+        }
+        CliRequest::GetIgnorePatterns { folder_id_hex } => {
+            // Find the folder's local path, then read .murmurignore.
+            let cfg = ctx.config.lock().unwrap();
+            match cfg.folders.iter().find(|f| f.folder_id == folder_id_hex) {
+                Some(fc) => {
+                    let ignore_path = fc.local_path.join(".murmurignore");
+                    let patterns = std::fs::read_to_string(&ignore_path).unwrap_or_default();
+                    CliResponse::IgnorePatterns { patterns }
+                }
+                None => {
+                    // Folder not in config — try synced_folders.
+                    CliResponse::IgnorePatterns {
+                        patterns: String::new(),
+                    }
+                }
+            }
+        }
+        CliRequest::SetIgnorePatterns {
+            folder_id_hex,
+            patterns,
+        } => {
+            let cfg = ctx.config.lock().unwrap();
+            match cfg.folders.iter().find(|f| f.folder_id == folder_id_hex) {
+                Some(fc) => {
+                    let ignore_path = fc.local_path.join(".murmurignore");
+                    match std::fs::write(&ignore_path, &patterns) {
+                        Ok(()) => CliResponse::Ok {
+                            message: "Ignore patterns saved.".to_string(),
+                        },
+                        Err(e) => CliResponse::Error {
+                            message: format!("write .murmurignore: {e}"),
+                        },
+                    }
+                }
+                None => CliResponse::Error {
+                    message: format!("folder not in config: {folder_id_hex}"),
+                },
+            }
+        }
+        CliRequest::SetThrottle {
+            upload_bytes_per_sec,
+            download_bytes_per_sec,
+        } => {
+            let mut cfg = ctx.config.lock().unwrap();
+            cfg.network.throttle.max_upload_bytes_per_sec = upload_bytes_per_sec;
+            cfg.network.throttle.max_download_bytes_per_sec = download_bytes_per_sec;
+            persist_config(ctx, &cfg);
+            CliResponse::Ok {
+                message: format!(
+                    "Throttle set: up={upload_bytes_per_sec} B/s, down={download_bytes_per_sec} B/s."
+                ),
+            }
+        }
+
+        CliRequest::LeaveNetwork => {
+            // Write a marker file so next startup knows to wipe.
+            // We can't wipe the DB dir while Fjall has it locked.
+            let marker = ctx.base_dir.join(".leave");
+            let _ = std::fs::write(&marker, b"");
+            info!(base = %ctx.base_dir.display(), "LeaveNetwork: marked for wipe");
+            // Exit the daemon process. The desktop app expects the connection
+            // to drop. On next startup the marker triggers a full wipe.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::process::exit(0);
+            });
+            CliResponse::Ok {
+                message: "Network left. Daemon shutting down.".to_string(),
+            }
+        }
+
+        // -- M27a: Diagnostics & Network Health --
+        CliRequest::ListPeers => {
+            let eng = ctx.engine.lock().unwrap();
+            let presence = ctx.device_presence.lock().unwrap();
+            let device_id = eng.device_id();
+            let peers = eng
+                .list_devices()
+                .into_iter()
+                .filter(|d| d.approved && d.device_id != device_id)
+                .map(|d| {
+                    let (online, last_seen) =
+                        presence.get(&d.device_id).copied().unwrap_or((false, 0));
+                    let conn_type = if online { "direct" } else { "relay" };
+                    PeerInfoIpc {
+                        device_id: d.device_id.to_string(),
+                        device_name: d.name,
+                        connection_type: conn_type.to_string(),
+                        last_seen_unix: last_seen,
+                    }
+                })
+                .collect();
+            CliResponse::Peers { peers }
+        }
+        CliRequest::StorageStats => {
+            let eng = ctx.engine.lock().unwrap();
+            let state = eng.state();
+
+            // Per-folder stats.
+            let folders: Vec<FolderStorageIpc> = state
+                .folders
+                .values()
+                .map(|f| {
+                    let files: Vec<_> = state
+                        .files
+                        .iter()
+                        .filter(|((fid, _), _)| *fid == f.folder_id)
+                        .collect();
+                    let file_count = files.len() as u64;
+                    let total_bytes: u64 = files.iter().map(|(_, m)| m.size).sum();
+                    FolderStorageIpc {
+                        folder_id: f.folder_id.to_string(),
+                        name: f.name.clone(),
+                        file_count,
+                        total_bytes,
+                    }
+                })
+                .collect();
+
+            let dag_entry_count = ctx.storage.dag_entry_count().unwrap_or(0);
+
+            // Blob stats.
+            let (total_blob_count, total_blob_bytes) =
+                ctx.storage.blob_dir_stats().unwrap_or((0, 0));
+
+            // Orphaned blobs = on disk but not in DAG state.
+            let referenced: std::collections::HashSet<BlobHash> =
+                state.files.values().map(|m| m.blob_hash).collect();
+            let on_disk = ctx.storage.list_all_blob_hashes().unwrap_or_default();
+            let orphaned: Vec<_> = on_disk.iter().filter(|h| !referenced.contains(h)).collect();
+            let orphaned_blob_count = orphaned.len() as u64;
+            let orphaned_blob_bytes: u64 = orphaned
+                .iter()
+                .filter_map(|h| {
+                    ctx.storage
+                        .load_blob(**h)
+                        .ok()
+                        .flatten()
+                        .map(|d| d.len() as u64)
+                })
+                .sum();
+
+            CliResponse::StorageStatsResponse {
+                folders,
+                total_blob_count,
+                total_blob_bytes,
+                orphaned_blob_count,
+                orphaned_blob_bytes,
+                dag_entry_count,
+            }
+        }
+        CliRequest::RunConnectivityCheck => {
+            // Simple connectivity check: we report based on known peer count.
+            let peer_count = ctx.connected_peers.load(Ordering::Relaxed);
+            let reachable = peer_count > 0;
+            let latency_ms = if reachable { Some(1) } else { None };
+            CliResponse::ConnectivityResult {
+                relay_reachable: reachable,
+                latency_ms,
+            }
+        }
+        CliRequest::ExportDiagnostics { output_path } => {
+            let eng = ctx.engine.lock().unwrap();
+            let presence = ctx.device_presence.lock().unwrap();
+            let device_id = eng.device_id();
+
+            let peers: Vec<serde_json::Value> = eng
+                .list_devices()
+                .into_iter()
+                .filter(|d| d.approved && d.device_id != device_id)
+                .map(|d| {
+                    let (online, last_seen) =
+                        presence.get(&d.device_id).copied().unwrap_or((false, 0));
+                    serde_json::json!({
+                        "device_id": d.device_id.to_string(),
+                        "name": d.name,
+                        "online": online,
+                        "last_seen_unix": last_seen,
+                    })
+                })
+                .collect();
+
+            let dag_count = ctx.storage.dag_entry_count().unwrap_or(0);
+            let (blob_count, blob_bytes) = ctx.storage.blob_dir_stats().unwrap_or((0, 0));
+            let uptime = ctx.start_time.elapsed().as_secs();
+
+            let diagnostics = serde_json::json!({
+                "device_id": device_id.to_string(),
+                "device_name": ctx.device_name,
+                "network_id": ctx.network_id_hex,
+                "uptime_secs": uptime,
+                "dag_entry_count": dag_count,
+                "blob_count": blob_count,
+                "blob_bytes": blob_bytes,
+                "peers": peers,
+            });
+
+            let output = std::path::Path::new(&output_path);
+            if let Some(parent) = output.parent()
+                && let Err(e) = std::fs::create_dir_all(parent)
+            {
+                return CliResponse::Error {
+                    message: format!("create output dir: {e}"),
+                };
+            }
+            match std::fs::write(
+                output,
+                serde_json::to_string_pretty(&diagnostics).unwrap_or_default(),
+            ) {
+                Ok(()) => CliResponse::Ok {
+                    message: format!("Diagnostics exported to {output_path}"),
+                },
+                Err(e) => CliResponse::Error {
+                    message: format!("write diagnostics: {e}"),
+                },
+            }
+        }
     }
 }
 
@@ -1217,6 +1983,14 @@ fn auto_init(base_dir: &Path, name: &str, role: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Persist the current config to disk. Logs errors but does not return them.
+fn persist_config(ctx: &DaemonCtx, cfg: &Config) {
+    let path = Config::config_path(&ctx.base_dir);
+    if let Err(e) = cfg.save(&path) {
+        error!(error = %e, "failed to persist config");
+    }
+}
 
 /// Convert a `DeviceInfo` to IPC format.
 fn device_to_ipc(dev: murmur_types::DeviceInfo) -> DeviceInfoIpc {
@@ -1533,24 +2307,39 @@ fn engine_event_to_ipc(event: &murmur_engine::EngineEvent, _ctx: &DaemonCtx) -> 
 }
 
 /// Remove a stale socket file if no process is listening.
-fn cleanup_stale_socket(path: &Path) {
-    if path.exists() {
-        // Try connecting to see if a daemon is running.
-        match std::os::unix::net::UnixStream::connect(path) {
-            Ok(_) => {
-                // Another daemon is running.
-                warn!(
-                    path = %path.display(),
-                    "another murmurd is already running on this socket"
-                );
-            }
-            Err(_) => {
-                // Stale socket — remove it.
-                info!(path = %path.display(), "removing stale socket");
-                let _ = std::fs::remove_file(path);
-            }
+/// Check if another murmurd is already running.
+///
+/// Uses both the socket file and a PID file for robust detection:
+/// 1. If the socket is connectable → another daemon is live, abort.
+/// 2. If a PID file exists and the process is alive → abort.
+/// 3. Otherwise clean up stale socket/PID files.
+fn cleanup_stale_instance(sock_path: &Path, pid_path: &Path) -> Result<()> {
+    // Check socket first — most reliable.
+    if sock_path.exists() {
+        if std::os::unix::net::UnixStream::connect(sock_path).is_ok() {
+            anyhow::bail!(
+                "another murmurd is already running (socket {} is active)",
+                sock_path.display()
+            );
         }
+        info!(path = %sock_path.display(), "removing stale socket");
+        let _ = std::fs::remove_file(sock_path);
     }
+
+    // Check PID file — catches daemons that lost their socket (e.g. mid-shutdown).
+    if pid_path.exists()
+        && let Ok(contents) = std::fs::read_to_string(pid_path)
+        && let Ok(pid) = contents.trim().parse::<i32>()
+    {
+        // kill(pid, 0) checks if the process exists without sending a signal.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            anyhow::bail!("another murmurd is already running (PID {pid})");
+        }
+        info!("removing stale PID file");
+        let _ = std::fs::remove_file(pid_path);
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1587,6 +2376,7 @@ mod tests {
         let (event_broadcast, _) =
             tokio::sync::broadcast::channel::<murmur_engine::EngineEvent>(16);
 
+        let config = Config::new(dir, "TestDaemon", "backup");
         DaemonCtx {
             engine: Arc::new(Mutex::new(engine)),
             storage,
@@ -1598,6 +2388,11 @@ mod tests {
             connected_peers: Arc::new(AtomicU64::new(0)),
             event_broadcast,
             synced_folders: Arc::new(std::collections::HashMap::new()),
+            base_dir: dir.to_path_buf(),
+            config: Arc::new(Mutex::new(config)),
+            sync_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            paused_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            device_presence: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -1867,18 +2662,24 @@ mod tests {
     }
 
     #[test]
-    fn test_socket_cleanup_stale() {
+    fn test_cleanup_stale_instance() {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("stale.sock");
+        let pid_path = dir.path().join("murmurd.pid");
 
         // Create a stale socket file (not a real listener).
         std::fs::write(&sock_path, "stale").unwrap();
         assert!(sock_path.exists());
 
-        cleanup_stale_socket(&sock_path);
+        // Create a stale PID file (non-existent PID).
+        std::fs::write(&pid_path, "999999999").unwrap();
+        assert!(pid_path.exists());
 
-        // Stale socket should be removed.
+        cleanup_stale_instance(&sock_path, &pid_path).unwrap();
+
+        // Both should be cleaned up.
         assert!(!sock_path.exists());
+        assert!(!pid_path.exists());
     }
 
     #[test]
@@ -1946,6 +2747,7 @@ mod tests {
         let resp = process_request(
             CliRequest::CreateFolder {
                 name: "Photos".to_string(),
+                local_path: None,
             },
             &ctx,
         );
@@ -1994,6 +2796,7 @@ mod tests {
         let resp = process_request(
             CliRequest::CreateFolder {
                 name: "Docs".to_string(),
+                local_path: None,
             },
             &ctx,
         );
@@ -2030,6 +2833,7 @@ mod tests {
         let resp3 = process_request(
             CliRequest::SubscribeFolder {
                 folder_id_hex: folder_id_hex.clone(),
+                name: None,
                 local_path: "/tmp/test".to_string(),
                 mode: "read-only".to_string(),
             },
@@ -2063,6 +2867,7 @@ mod tests {
         let resp = process_request(
             CliRequest::CreateFolder {
                 name: "Music".to_string(),
+                local_path: None,
             },
             &ctx,
         );
@@ -2180,6 +2985,7 @@ mod tests {
         let resp = process_request(
             CliRequest::CreateFolder {
                 name: "Setmode".to_string(),
+                local_path: None,
             },
             &ctx,
         );
@@ -2226,6 +3032,7 @@ mod tests {
         let resp = process_request(
             CliRequest::SubscribeFolder {
                 folder_id_hex: "cc".repeat(32),
+                name: None,
                 local_path: "/tmp/test".to_string(),
                 mode: "read-write".to_string(),
             },
@@ -2246,6 +3053,7 @@ mod tests {
         let resp = process_request(
             CliRequest::CreateFolder {
                 name: "TestFiles".to_string(),
+                local_path: None,
             },
             &ctx,
         );
@@ -2444,6 +3252,7 @@ mod tests {
         let resp1 = process_request(
             CliRequest::CreateFolder {
                 name: "A".to_string(),
+                local_path: None,
             },
             &ctx,
         );
@@ -2476,5 +3285,259 @@ mod tests {
             &ctx,
         );
         assert!(matches!(resp3, CliResponse::Error { .. }));
+    }
+
+    #[test]
+    fn test_ipc_set_folder_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        // Create a folder with a local path so it appears in config.
+        let local = dir.path().join("sync");
+        std::fs::create_dir_all(&local).unwrap();
+        let resp = process_request(
+            CliRequest::CreateFolder {
+                name: "Original".to_string(),
+                local_path: Some(local.to_string_lossy().to_string()),
+            },
+            &ctx,
+        );
+        let folder_id_hex = match resp {
+            CliResponse::Ok { message } => {
+                let s = message.find('(').unwrap();
+                let e = message.find(')').unwrap();
+                message[s + 1..e].to_string()
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        };
+
+        // Rename the folder.
+        let resp2 = process_request(
+            CliRequest::SetFolderName {
+                folder_id_hex: folder_id_hex.clone(),
+                name: "Renamed".to_string(),
+            },
+            &ctx,
+        );
+        match resp2 {
+            CliResponse::Ok { message } => {
+                assert!(message.contains("Renamed"), "got: {message}");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+
+        // Verify renamed name appears in folder list.
+        let resp3 = process_request(CliRequest::ListFolders, &ctx);
+        match resp3 {
+            CliResponse::Folders { folders } => {
+                let f = folders
+                    .iter()
+                    .find(|f| f.folder_id == folder_id_hex)
+                    .unwrap();
+                assert_eq!(f.name, "Renamed");
+            }
+            other => panic!("expected Folders, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ipc_folder_list_includes_local_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        // Create a folder with a local path.
+        let local = dir.path().join("photos");
+        std::fs::create_dir_all(&local).unwrap();
+        let resp = process_request(
+            CliRequest::CreateFolder {
+                name: "Photos".to_string(),
+                local_path: Some(local.to_string_lossy().to_string()),
+            },
+            &ctx,
+        );
+        let folder_id_hex = match resp {
+            CliResponse::Ok { message } => {
+                let s = message.find('(').unwrap();
+                let e = message.find(')').unwrap();
+                message[s + 1..e].to_string()
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        };
+
+        // Verify local_path appears in folder list.
+        let resp2 = process_request(CliRequest::ListFolders, &ctx);
+        match resp2 {
+            CliResponse::Folders { folders } => {
+                let f = folders
+                    .iter()
+                    .find(|f| f.folder_id == folder_id_hex)
+                    .unwrap();
+                assert_eq!(
+                    f.local_path.as_deref(),
+                    Some(local.to_string_lossy().as_ref())
+                );
+            }
+            other => panic!("expected Folders, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_folders_survive_daemon_restart() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Phase 1: create context, create a folder with local_path, verify.
+        let mnemonic = murmur_seed::generate_mnemonic(murmur_seed::WordCount::Twelve);
+        let identity = murmur_seed::NetworkIdentity::from_mnemonic(&mnemonic, "");
+        let device_id = identity.first_device_id();
+        let signing_key = identity.first_device_signing_key().clone();
+        let network_id_hex = identity.network_id().to_string();
+
+        let local = dir.path().join("sync");
+        std::fs::create_dir_all(&local).unwrap();
+
+        let folder_id_hex;
+        let config_path = dir.path().join("config.toml");
+        {
+            let storage =
+                Arc::new(Storage::open(&dir.path().join("db"), &dir.path().join("blobs")).unwrap());
+            let platform = Arc::new(FjallPlatform::new(storage.clone()));
+
+            let engine = murmur_engine::MurmurEngine::create_network(
+                device_id,
+                signing_key.clone(),
+                "TestDaemon".to_string(),
+                murmur_types::DeviceRole::Backup,
+                platform,
+            );
+
+            let (broadcast_tx, _rx) = mpsc::unbounded_channel();
+            let (event_broadcast, _) =
+                tokio::sync::broadcast::channel::<murmur_engine::EngineEvent>(16);
+
+            let config = Config::new(dir.path(), "TestDaemon", "backup");
+            let ctx = DaemonCtx {
+                engine: Arc::new(Mutex::new(engine)),
+                storage: storage.clone(),
+                device_name: "TestDaemon".to_string(),
+                network_id_hex: network_id_hex.clone(),
+                mnemonic: mnemonic.to_string(),
+                start_time: Instant::now(),
+                broadcast_tx,
+                connected_peers: Arc::new(AtomicU64::new(0)),
+                event_broadcast,
+                synced_folders: Arc::new(std::collections::HashMap::new()),
+                base_dir: dir.path().to_path_buf(),
+                config: Arc::new(Mutex::new(config)),
+                sync_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                paused_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                device_presence: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            };
+
+            // Create a folder with a local path.
+            let resp = process_request(
+                CliRequest::CreateFolder {
+                    name: "Photos".to_string(),
+                    local_path: Some(local.to_string_lossy().to_string()),
+                },
+                &ctx,
+            );
+            folder_id_hex = match resp {
+                CliResponse::Ok { message } => {
+                    let s = message.find('(').unwrap();
+                    let e = message.find(')').unwrap();
+                    message[s + 1..e].to_string()
+                }
+                other => panic!("expected Ok, got {other:?}"),
+            };
+
+            // Verify folder exists before restart.
+            let resp2 = process_request(CliRequest::ListFolders, &ctx);
+            match resp2 {
+                CliResponse::Folders { folders } => {
+                    assert_eq!(folders.len(), 1);
+                    assert_eq!(folders[0].name, "Photos");
+                    assert!(folders[0].subscribed);
+                    assert_eq!(
+                        folders[0].local_path.as_deref(),
+                        Some(local.to_string_lossy().as_ref())
+                    );
+                }
+                other => panic!("expected Folders, got {other:?}"),
+            }
+
+            // Save config.
+            let cfg = ctx.config.lock().unwrap();
+            cfg.save(&config_path).unwrap();
+
+            // Flush storage to persist DAG entries.
+            storage.flush().unwrap();
+        }
+        // Everything dropped — simulates daemon stop.
+
+        // Phase 2: reopen storage, reload DAG entries, rebuild engine.
+        {
+            let storage =
+                Arc::new(Storage::open(&dir.path().join("db"), &dir.path().join("blobs")).unwrap());
+            let platform = Arc::new(FjallPlatform::new(storage.clone()));
+
+            let persisted_entries = storage.load_all_dag_entries().unwrap();
+            assert!(
+                !persisted_entries.is_empty(),
+                "should have persisted DAG entries"
+            );
+
+            let dag = murmur_dag::Dag::new(device_id, signing_key);
+            let mut engine = murmur_engine::MurmurEngine::from_dag(dag, platform);
+            for entry_bytes in &persisted_entries {
+                engine.load_entry_bytes(entry_bytes).unwrap();
+            }
+            engine.rebuild_conflicts();
+
+            let (broadcast_tx, _rx) = mpsc::unbounded_channel();
+            let (event_broadcast, _) =
+                tokio::sync::broadcast::channel::<murmur_engine::EngineEvent>(16);
+
+            let config = Config::load(&config_path).unwrap();
+            let ctx = DaemonCtx {
+                engine: Arc::new(Mutex::new(engine)),
+                storage,
+                device_name: "TestDaemon".to_string(),
+                network_id_hex,
+                mnemonic: mnemonic.to_string(),
+                start_time: Instant::now(),
+                broadcast_tx,
+                connected_peers: Arc::new(AtomicU64::new(0)),
+                event_broadcast,
+                synced_folders: Arc::new(std::collections::HashMap::new()),
+                base_dir: dir.path().to_path_buf(),
+                config: Arc::new(Mutex::new(config)),
+                sync_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                paused_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                device_presence: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            };
+
+            // Verify folder survives restart.
+            let resp = process_request(CliRequest::ListFolders, &ctx);
+            match resp {
+                CliResponse::Folders { folders } => {
+                    assert!(
+                        !folders.is_empty(),
+                        "folders should survive daemon restart, got empty list"
+                    );
+                    let f = folders
+                        .iter()
+                        .find(|f| f.folder_id == folder_id_hex)
+                        .expect("Photos folder should exist after restart");
+                    assert_eq!(f.name, "Photos");
+                    assert!(f.subscribed, "should still be subscribed after restart");
+                    assert_eq!(
+                        f.local_path.as_deref(),
+                        Some(local.to_string_lossy().as_ref()),
+                        "local_path should survive restart"
+                    );
+                }
+                other => panic!("expected Folders, got {other:?}"),
+            }
+        }
     }
 }

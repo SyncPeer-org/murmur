@@ -1113,6 +1113,12 @@ impl MurmurEngine {
         &self.dag
     }
 
+    /// Mutable access to the DAG (for advanced operations like appending
+    /// entries directly).
+    pub fn dag_mut(&mut self) -> &mut Dag {
+        &mut self.dag
+    }
+
     /// This device's ID.
     pub fn device_id(&self) -> DeviceId {
         self.dag.device_id()
@@ -1121,6 +1127,12 @@ impl MurmurEngine {
     /// The materialized state.
     pub fn state(&self) -> &murmur_dag::MaterializedState {
         self.dag.state()
+    }
+
+    /// Mutable access to the materialized state (for direct modifications
+    /// like dismissing conflicts without creating DAG entries).
+    pub fn state_mut(&mut self) -> &mut murmur_dag::MaterializedState {
+        self.dag.state_mut()
     }
 
     /// All DAG entries (for full sync to a new peer).

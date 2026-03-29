@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-metrics = ["dep:prometheus", "dep:axum", "dep:serde_json"]
+metrics = ["dep:prometheus", "dep:axum"]
 
 [dependencies]
 murmur-types = { workspace = true }
@@ -34,11 +34,12 @@ aes-gcm = { workspace = true }
 argon2 = { workspace = true }
 prometheus = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+serde_json = { workspace = true }
 mdns-sd = { workspace = true }
 hostname = { workspace = true }
 notify = { workspace = true }
 ignore = { workspace = true }
+libc = "0.2"
 
 [dependencies.rand]
 workspace = true

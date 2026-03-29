@@ -12,3 +12,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 iced = { version = "0.14", features = ["tokio"] }
+rfd = "0.15"
+libc = "0.2"

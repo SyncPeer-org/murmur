@@ -24,6 +24,9 @@ pub struct Config {
 pub struct FolderConfig {
     /// The hex-encoded folder ID.
     pub folder_id: String,
+    /// Human-readable folder name.
+    #[serde(default)]
+    pub name: String,
     /// Absolute path to the local directory for this folder.
     pub local_path: PathBuf,
     /// Sync mode: "read-write" or "read-only".
@@ -110,7 +113,6 @@ impl Config {
     }
 
     /// Save config to a TOML file.
-    #[cfg(test)]
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let contents = toml::to_string_pretty(self)?;
         if let Some(parent) = path.parent() {
@@ -229,22 +231,26 @@ data_dir = "/data/db"
 
 [[folders]]
 folder_id = "abc123"
+name = "Photos"
 local_path = "/home/user/Sync/Photos"
 mode = "read-write"
 
 [[folders]]
 folder_id = "def456"
+name = "Documents"
 local_path = "/home/user/Sync/Documents"
 mode = "read-only"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.folders.len(), 2);
         assert_eq!(config.folders[0].folder_id, "abc123");
+        assert_eq!(config.folders[0].name, "Photos");
         assert_eq!(
             config.folders[0].local_path,
             PathBuf::from("/home/user/Sync/Photos")
         );
         assert_eq!(config.folders[0].mode, "read-write");
+        assert_eq!(config.folders[1].name, "Documents");
         assert_eq!(config.folders[1].mode, "read-only");
     }
 
@@ -280,6 +286,8 @@ local_path = "/home/user/Sync/Photos"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.folders[0].mode, "read-write");
+        // name defaults to empty when omitted from TOML (backwards compat).
+        assert_eq!(config.folders[0].name, "");
     }
 
     #[test]

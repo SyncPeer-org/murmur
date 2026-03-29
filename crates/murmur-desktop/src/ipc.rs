@@ -29,9 +29,13 @@ fn send_sync(socket_path: &Path, request: &CliRequest) -> Result<CliResponse, St
 
 /// Check whether the daemon socket is connectable.
 pub async fn daemon_is_running(socket_path: PathBuf) -> bool {
-    tokio::task::spawn_blocking(move || UnixStream::connect(&socket_path).is_ok())
-        .await
-        .unwrap_or(false)
+    tokio::task::spawn_blocking(move || {
+        let ok = UnixStream::connect(&socket_path).is_ok();
+        tracing::info!(socket = %socket_path.display(), ok, "daemon_is_running check");
+        ok
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Subscribe to the daemon event stream.
@@ -62,13 +66,32 @@ fn build_event_stream(
                     return;
                 }
             };
+            // Set a read timeout so this thread doesn't block forever when the
+            // app is shutting down. The loop retries on timeout.
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
             if let Err(e) = murmur_ipc::send_message(&mut stream, &CliRequest::SubscribeEvents) {
                 tracing::warn!(error = %e, "event stream send failed");
                 return;
             }
-            while let Ok(resp) = murmur_ipc::recv_message::<_, CliResponse>(&mut stream) {
-                if tx.blocking_send(resp).is_err() {
-                    break;
+            loop {
+                match murmur_ipc::recv_message::<_, CliResponse>(&mut stream) {
+                    Ok(resp) => {
+                        if tx.blocking_send(resp).is_err() {
+                            break; // receiver dropped (app shutting down)
+                        }
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("timed out") || msg.contains("WouldBlock") {
+                            // Read timeout — check if the channel is still open.
+                            if tx.is_closed() {
+                                break;
+                            }
+                            continue;
+                        }
+                        // Real error (daemon died, socket closed).
+                        break;
+                    }
                 }
             }
         });
