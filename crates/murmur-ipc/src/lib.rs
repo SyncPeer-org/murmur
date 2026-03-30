@@ -1198,6 +1198,194 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Serialization stability (golden-byte) tests
+    //
+    // These catch wire-format breaking changes. If you intentionally change
+    // a type's layout, update the expected bytes here — but understand that
+    // you are breaking compatibility between daemon and CLI binaries.
+    // -----------------------------------------------------------------------
+
+    /// Helper: hex-encode bytes for readable assertion messages.
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn test_request_wire_stability() {
+        // Snapshot: every CliRequest variant's postcard encoding.
+        // The enum discriminant is a varint index; field order is declaration order.
+        let cases: Vec<(CliRequest, &str)> = vec![
+            // Status = variant 0, no fields
+            (CliRequest::Status, "00"),
+            // ListDevices = variant 1
+            (CliRequest::ListDevices, "01"),
+            // ListPending = variant 2
+            (CliRequest::ListPending, "02"),
+            // PauseSync = variant 25
+            (CliRequest::PauseSync, "19"),
+            // ResumeSync = variant 26
+            (CliRequest::ResumeSync, "1a"),
+        ];
+        for (req, expected_hex) in cases {
+            let bytes = postcard::to_allocvec(&req).unwrap();
+            assert_eq!(
+                hex(&bytes),
+                expected_hex,
+                "wire format changed for {req:?} — this breaks IPC compatibility"
+            );
+        }
+    }
+
+    #[test]
+    fn test_response_wire_stability() {
+        // Snapshot: CliResponse variants with known encodings.
+        let cases: Vec<(CliResponse, &str)> = vec![
+            // Ok { message: "ok" } = variant 5, string "ok" (len 2 + bytes)
+            (
+                CliResponse::Ok {
+                    message: "ok".to_string(),
+                },
+                "05026f6b",
+            ),
+            // Error { message: "e" } = variant 7, string "e" (len 1 + byte)
+            (
+                CliResponse::Error {
+                    message: "e".to_string(),
+                },
+                "070165",
+            ),
+            // Files { files: [] } = variant 4, empty vec (len 0)
+            (CliResponse::Files { files: vec![] }, "0400"),
+            // Devices { devices: [] } = variant 1, empty vec
+            (CliResponse::Devices { devices: vec![] }, "0100"),
+        ];
+        for (resp, expected_hex) in cases {
+            let bytes = postcard::to_allocvec(&resp).unwrap();
+            assert_eq!(
+                hex(&bytes),
+                expected_hex,
+                "wire format changed for {resp:?} — this breaks IPC compatibility"
+            );
+        }
+    }
+
+    #[test]
+    fn test_file_info_wire_stability() {
+        // A FileInfoIpc with known field values — catches field reordering,
+        // additions, or type changes.
+        let info = FileInfoIpc {
+            blob_hash: "aa".to_string(),
+            folder_id: "bb".to_string(),
+            path: "c".to_string(),
+            size: 1,
+            mime_type: None,
+            device_origin: "dd".to_string(),
+        };
+        let bytes = postcard::to_allocvec(&info).unwrap();
+        let expected = "02616102626201630100026464";
+        assert_eq!(
+            hex(&bytes),
+            expected,
+            "FileInfoIpc wire format changed — this breaks IPC compatibility"
+        );
+
+        // Also verify None vs Some(mime_type) encoding differs correctly.
+        let with_mime = FileInfoIpc {
+            mime_type: Some("x".to_string()),
+            ..info.clone()
+        };
+        let bytes2 = postcard::to_allocvec(&with_mime).unwrap();
+        assert_ne!(bytes, bytes2);
+        // The Option discriminant byte should be 0x01 (Some) instead of 0x00 (None).
+        let expected_with_mime = "026161026262016301010178026464";
+        assert_eq!(
+            hex(&bytes2),
+            expected_with_mime,
+            "FileInfoIpc (with mime) wire format changed"
+        );
+    }
+
+    #[test]
+    fn test_folder_info_wire_stability() {
+        let info = FolderInfoIpc {
+            folder_id: "a".to_string(),
+            name: "b".to_string(),
+            created_by: "c".to_string(),
+            file_count: 0,
+            subscribed: false,
+            mode: None,
+            local_path: None,
+            sync_status: String::new(),
+        };
+        let bytes = postcard::to_allocvec(&info).unwrap();
+        let expected = "0161016201630000000000";
+        assert_eq!(
+            hex(&bytes),
+            expected,
+            "FolderInfoIpc wire format changed — this breaks IPC compatibility"
+        );
+    }
+
+    #[test]
+    fn test_response_variant_count_guard() {
+        // If someone adds or removes a CliResponse variant, this test
+        // forces them to also update the golden-byte tests above.
+        //
+        // Serialize the LAST variant (ConnectivityResult) — if a new variant
+        // is appended, its discriminant will differ from what we expect here.
+        let last = CliResponse::ConnectivityResult {
+            relay_reachable: true,
+            latency_ms: None,
+        };
+        let bytes = postcard::to_allocvec(&last).unwrap();
+        // Variant index 22 = 0x16, then bool true = 0x01, Option None = 0x00
+        assert_eq!(
+            hex(&bytes),
+            "160100",
+            "CliResponse variant count changed — update golden-byte tests for new variants"
+        );
+    }
+
+    #[test]
+    fn test_request_variant_count_guard() {
+        let last = CliRequest::ExportDiagnostics {
+            output_path: "x".to_string(),
+        };
+        let bytes = postcard::to_allocvec(&last).unwrap();
+        // Variant index 49 = 0x31, then string "x" (len 1 + byte)
+        assert_eq!(
+            hex(&bytes),
+            "310178",
+            "CliRequest variant count changed — update golden-byte tests for new variants"
+        );
+    }
+
+    #[test]
+    fn test_cross_version_deserialization_detects_mismatch() {
+        // Simulate what happens when a daemon sends bytes from a different
+        // type layout: deserializing garbage at an Option field should fail
+        // (the original user-reported bug).
+        //
+        // Craft bytes where the Option<String> discriminant is 0x02 (invalid).
+        let bad_bytes: &[u8] = &[
+            0x02, 0x61, 0x61, // blob_hash: "aa"
+            0x02, 0x62, 0x62, // folder_id: "bb"
+            0x01, 0x63, // path: "c"
+            0x01, // size: 1
+            0x02, // <-- invalid Option discriminant (not 0 or 1)
+            0x01, 0x78, // would-be string
+            0x02, 0x64, 0x64, // device_origin: "dd"
+        ];
+        let result = postcard::from_bytes::<FileInfoIpc>(bad_bytes);
+        assert!(result.is_err(), "should reject invalid Option discriminant");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Option"),
+            "error should mention Option, got: {err_msg}"
+        );
+    }
+
     #[test]
     fn test_socket_path_default() {
         let path = default_socket_path();

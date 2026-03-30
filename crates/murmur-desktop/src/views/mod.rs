@@ -206,8 +206,8 @@ impl App {
                 Space::new().height(28),
                 // Primary nav
                 self.nav_button("\u{25A6}", "Folders", Screen::Folders),
-                self.nav_button("\u{26A0}", &conflict_label, Screen::Conflicts),
                 self.nav_button("\u{2B21}", &devices_label, Screen::Devices),
+                self.nav_button("\u{26A0}", &conflict_label, Screen::Conflicts),
                 self.nav_button("\u{2630}", "Recent Files", Screen::RecentFiles),
                 self.nav_button("\u{2261}", "Status", Screen::Status),
                 // Push bottom section down

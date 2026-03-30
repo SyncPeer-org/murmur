@@ -41,11 +41,16 @@ pub struct NetworkHandle {
     pub upload_throttle: Arc<TokenBucket>,
     /// The iroh endpoint (kept alive for the duration of the daemon).
     endpoint: iroh::Endpoint,
+    /// Background task handles that must be aborted on shutdown.
+    background_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl NetworkHandle {
-    /// Gracefully close the iroh endpoint, notifying peers.
+    /// Gracefully close the iroh endpoint and abort background tasks.
     pub async fn close(self) {
+        for handle in &self.background_tasks {
+            handle.abort();
+        }
         self.endpoint.close().await;
         info!("networking stopped");
     }
@@ -103,7 +108,7 @@ pub async fn start_networking(
     // Accept incoming connections and route to gossip.
     let gossip_for_accept = gossip.clone();
     let ep_for_accept = endpoint.clone();
-    tokio::spawn(async move {
+    let accept_task = tokio::spawn(async move {
         loop {
             let Some(incoming) = ep_for_accept.accept().await else {
                 break;
@@ -142,7 +147,7 @@ pub async fn start_networking(
     // compresses, and sends via gossip.
     let sender_for_broadcast = sender.clone();
     let device_id_for_broadcast = device_id;
-    tokio::spawn(async move {
+    let broadcast_task = tokio::spawn(async move {
         while let Some(entry_bytes) = broadcast_rx.recv().await {
             let gossip_msg = GossipMessage {
                 nonce: rand::random(),
@@ -170,7 +175,7 @@ pub async fn start_networking(
     let storage_for_recv = storage.clone();
     let sender_for_recv = sender.clone();
     let device_id_for_recv = device_id;
-    tokio::spawn(async move {
+    let recv_task = tokio::spawn(async move {
         let engine = engine_for_recv;
         let mut chunk_buffers: HashMap<BlobHash, ChunkBuffer> = HashMap::new();
         while let Some(event) = receiver.next().await {
@@ -243,7 +248,7 @@ pub async fn start_networking(
     let storage_for_push = storage.clone();
     let sender_for_push = sender.clone();
     let peers_for_push = connected_peers.clone();
-    tokio::spawn(async move {
+    let push_queue_task = tokio::spawn(async move {
         const CHECK_INTERVAL_SECS: u64 = 10;
         const BASE_DELAY_SECS: u64 = 5;
         const MAX_DELAY_SECS: u64 = 30 * 60; // 30 minutes
@@ -370,6 +375,7 @@ pub async fn start_networking(
         connected_peers,
         upload_throttle,
         endpoint,
+        background_tasks: vec![accept_task, broadcast_task, recv_task, push_queue_task],
     })
 }
 

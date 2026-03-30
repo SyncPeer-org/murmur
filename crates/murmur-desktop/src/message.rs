@@ -44,6 +44,7 @@ pub enum Message {
     /// Directory picker returned a path for subscribing.
     PickedFolderPath(String, String, Option<PathBuf>),
     UnsubscribeFolder(String),
+    RemoveFolder(String),
     SelectFolder(FolderInfoIpc),
     ResolveConflict {
         folder_id: String,

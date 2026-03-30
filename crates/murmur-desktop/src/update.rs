@@ -281,6 +281,20 @@ impl App {
                     Message::GotGeneric,
                 );
             }
+            Message::RemoveFolder(fid) => {
+                let p = self.socket_path.clone();
+                self.selected_folder = None;
+                self.screen = Screen::Folders;
+                return Task::perform(
+                    ipc::send(
+                        p,
+                        CliRequest::RemoveFolder {
+                            folder_id_hex: fid,
+                        },
+                    ),
+                    Message::GotGeneric,
+                );
+            }
             Message::SelectFolder(folder) => {
                 let fid = folder.folder_id.clone();
                 self.selected_folder = Some(folder);

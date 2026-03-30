@@ -245,6 +245,10 @@ fn run_daemon(
     // Set up socket listener (stale socket already cleaned above).
     let listener = UnixListener::bind(&sock_path)
         .with_context(|| format!("bind socket at {}", sock_path.display()))?;
+    // Capture the raw fd so we can unblock the accept loop on shutdown.
+    // The fd remains valid while the listener lives inside the spawn_blocking task.
+    use std::os::unix::io::AsRawFd;
+    let accept_fd = listener.as_raw_fd();
     info!(path = %sock_path.display(), "listening on socket");
 
     // Determine if this device is the network creator (first device).
@@ -274,15 +278,19 @@ fn run_daemon(
 
         // Optionally start HTTP health/metrics server.
         #[cfg(feature = "metrics")]
-        if let Some(port) = http_port {
+        let _http_task = if let Some(port) = http_port {
             let http_state = http::server::HttpState {
                 engine: engine.clone(),
                 storage: storage.clone(),
                 connected_peers: net_handle.connected_peers.clone(),
                 start_time,
             };
-            tokio::spawn(http::server::start_http_server(http_state, port));
-        }
+            Some(tokio::spawn(http::server::start_http_server(
+                http_state, port,
+            )))
+        } else {
+            None
+        };
         #[cfg(not(feature = "metrics"))]
         if http_port.is_some() {
             warn!("--http-port requires the `metrics` feature; ignoring");
@@ -387,7 +395,7 @@ fn run_daemon(
         // Spawn debounce poll task (drains ready events every 100ms).
         let watcher_pending = Arc::new(Mutex::new(folder_watcher));
         let watcher_for_poll = watcher_pending.clone();
-        tokio::spawn(async move {
+        let debounce_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
             loop {
                 interval.tick().await;
@@ -399,7 +407,7 @@ fn run_daemon(
         let engine_for_forward = engine.clone();
         let synced_folders_arc = Arc::new(synced_folders);
         let folders_for_forward = synced_folders_arc.clone();
-        tokio::spawn(async move {
+        let forward_sync_task = tokio::spawn(async move {
             while let Some(event) = watcher_rx.recv().await {
                 let folders = folders_for_forward.clone();
                 let eng = engine_for_forward.clone();
@@ -421,7 +429,7 @@ fn run_daemon(
         let storage_for_reverse = storage.clone();
         let folders_for_reverse = synced_folders_arc.clone();
         let echo_for_reverse = echo_suppressor.clone();
-        tokio::spawn(async move {
+        let reverse_sync_task = tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
                 // Forward to IPC event subscribers (best-effort, ignore if no subscribers).
                 let _ = ipc_event_tx_for_forward.send(event.clone());
@@ -502,19 +510,40 @@ fn run_daemon(
         shutdown.await?;
         info!("shutting down…");
 
-        // Abort the accept loop (drop the listener).
+        // Unblock the IPC accept loop: shutdown the listener socket so the
+        // blocking accept() call in spawn_blocking returns an error and exits.
+        // SAFETY: accept_fd is valid while the accept_handle task is alive.
+        unsafe {
+            libc::shutdown(accept_fd, libc::SHUT_RDWR);
+        }
         accept_handle.abort();
+
+        // Abort daemon background tasks (debounce poll, sync tasks).
+        debounce_task.abort();
+        forward_sync_task.abort();
+        reverse_sync_task.abort();
+
+        // Abort HTTP server if running.
+        #[cfg(feature = "metrics")]
+        if let Some(task) = _http_task {
+            task.abort();
+        }
 
         // Stop mDNS if running.
         if let Some(handle) = _mdns_handle {
             handle.shutdown();
         }
 
-        // Close the iroh endpoint gracefully so peers see us leave.
+        // Close the iroh endpoint and abort networking tasks.
         net_handle.close().await;
 
         Ok::<(), anyhow::Error>(())
     })?;
+
+    // Explicitly shutdown the runtime with a timeout. This is needed because
+    // the IPC accept loop uses spawn_blocking, and Runtime::drop would wait
+    // indefinitely for blocking tasks to finish.
+    rt.shutdown_timeout(std::time::Duration::from_secs(2));
 
     // Cleanup: drop storage (DAG is already durable via sync_data per write),
     // then remove socket and PID.
@@ -893,7 +922,10 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                     } else {
                         let conflicts = eng.list_conflicts_in_folder(f.folder_id).len();
                         if conflicts > 0 {
-                            format!("{conflicts} conflict{}", if conflicts == 1 { "" } else { "s" })
+                            format!(
+                                "{conflicts} conflict{}",
+                                if conflicts == 1 { "" } else { "s" }
+                            )
                         } else {
                             "Up to date".to_string()
                         }

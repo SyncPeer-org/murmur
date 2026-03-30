@@ -206,6 +206,10 @@ impl App {
                 .on_press(Message::UnsubscribeFolder(folder.folder_id.clone()))
                 .style(destructive_btn)
                 .padding(6),
+            button(text("Remove").size(13))
+                .on_press(Message::RemoveFolder(folder.folder_id.clone()))
+                .style(destructive_btn)
+                .padding(6),
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center);
