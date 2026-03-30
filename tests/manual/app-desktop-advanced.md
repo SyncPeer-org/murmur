@@ -386,6 +386,22 @@ Click **"Start daemon & join"**.
 
 ---
 
+## DA18a — Join Network: Mnemonic Preserved in Settings
+
+After completing DA18 (Leave → Join), navigate to **Settings** in the sidebar.
+
+**Expected**:
+- The **Network Mnemonic** section displays the exact mnemonic you entered in the
+  Join form (DA18) — **not** a different randomly generated mnemonic
+- The mnemonic words and order match exactly what you typed
+
+This verifies that the Leave → Join flow preserves the user-provided mnemonic
+across the data directory wipe triggered by LeaveNetwork.
+
+**Checkpoint DA18a**: Settings mnemonic matches the one entered during Join.
+
+---
+
 ## DA19 — Setup Wizard: Back Navigation
 
 From the setup form (step 2), click **"Back"**.
@@ -449,5 +465,6 @@ rm -rf ~/murmur-diagnostics
 | DA16 | Leave: cancel          | Confirmation shows, cancel dismisses it                |
 | DA17 | Leave: confirm         | Data wiped, daemon stops, app resets to Setup          |
 | DA18 | Join network           | Mnemonic + name form, daemon joins, Folders shown      |
+| DA18a| Join: mnemonic kept    | Settings shows the mnemonic entered during Join        |
 | DA19 | Setup back nav         | Back buttons work through all setup steps              |
 | DA20 | Auto-launch daemon     | App starts daemon automatically when config exists     |

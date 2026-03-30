@@ -64,11 +64,11 @@ impl NetworkHandle {
 /// Start the networking layer: iroh endpoint, gossip subscription, and
 /// background receive/broadcast tasks.
 ///
-/// - `device_id`: this device's ID (included in gossip messages for sender verification).
-/// - `creator_iroh_key_bytes`: 32-byte secret key for the network creator's
-///   iroh endpoint. All peers derive the same bytes from the mnemonic.
-/// - `is_creator`: whether this device is the network creator.
-/// - `topic`: gossip topic derived from the network ID.
+/// Returns the [`NetworkHandle`] and a receiver that yields the
+/// [`BlobHash`] of every blob stored from a peer. Spawn a task consuming
+/// that receiver to write files whose blob wasn't available when
+/// reverse-sync first ran.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_networking(
     engine: Arc<Mutex<murmur_engine::MurmurEngine>>,
     storage: Arc<Storage>,
@@ -77,7 +77,8 @@ pub async fn start_networking(
     is_creator: bool,
     topic: iroh_gossip::TopicId,
     throttle: ThrottleConfig,
-) -> Result<NetworkHandle> {
+    device_presence: Arc<Mutex<std::collections::HashMap<DeviceId, (bool, u64)>>>,
+) -> Result<(NetworkHandle, mpsc::UnboundedReceiver<BlobHash>)> {
     // Derive the creator's endpoint ID (all peers can compute this).
     let creator_secret = iroh::SecretKey::from_bytes(&creator_iroh_key_bytes);
     let creator_endpoint_id = creator_secret.public();
@@ -175,11 +176,18 @@ pub async fn start_networking(
     let connected_peers = Arc::new(AtomicU64::new(0));
     let peers_for_recv = connected_peers.clone();
 
+    // Channel for notifying the daemon when a new blob has been stored from a
+    // peer. The receiver is handed back to main and drives deferred file writes
+    // for files whose blob wasn't available during the initial reverse-sync.
+    let (blob_arrived_tx, blob_arrived_rx) = mpsc::unbounded_channel::<BlobHash>();
+
     // Receive task: processes incoming gossip events.
     let engine_for_recv = engine.clone();
     let storage_for_recv = storage.clone();
     let sender_for_recv = sender.clone();
     let device_id_for_recv = device_id;
+    let presence_for_recv = device_presence;
+    let blob_tx_for_recv = blob_arrived_tx;
     let recv_task = tokio::spawn(async move {
         let engine = engine_for_recv;
         let mut chunk_buffers: HashMap<BlobHash, ChunkBuffer> = HashMap::new();
@@ -200,6 +208,8 @@ pub async fn start_networking(
                         &sender_for_recv,
                         device_id_for_recv,
                         &mut chunk_buffers,
+                        &presence_for_recv,
+                        &blob_tx_for_recv,
                     )
                     .await;
                 }
@@ -375,13 +385,13 @@ pub async fn start_networking(
         );
     }
 
-    Ok(NetworkHandle {
+    Ok((NetworkHandle {
         broadcast_tx,
         connected_peers,
         upload_throttle,
         endpoint,
         background_tasks: vec![accept_task, broadcast_task, recv_task, push_queue_task],
-    })
+    }, blob_arrived_rx))
 }
 
 /// Simple token-bucket rate limiter.
@@ -457,6 +467,7 @@ async fn broadcast_gossip(
 ///
 /// Deserializes the [`GossipMessage`] envelope, verifies the sender is a
 /// known device (approved or pending), then processes the payload.
+#[allow(clippy::too_many_arguments)]
 async fn handle_gossip_message(
     content: &[u8],
     engine: &Arc<Mutex<murmur_engine::MurmurEngine>>,
@@ -464,6 +475,8 @@ async fn handle_gossip_message(
     gossip_sender: &iroh_gossip::api::GossipSender,
     our_device_id: DeviceId,
     chunk_buffers: &mut HashMap<BlobHash, ChunkBuffer>,
+    device_presence: &Arc<Mutex<std::collections::HashMap<DeviceId, (bool, u64)>>>,
+    blob_arrived_tx: &mpsc::UnboundedSender<BlobHash>,
 ) {
     let gossip_msg: GossipMessage = match postcard::from_bytes(content) {
         Ok(m) => m,
@@ -490,6 +503,18 @@ async fn handle_gossip_message(
         if !sender_known && !is_dag_payload && !eng.state().devices.is_empty() {
             debug!(sender = %gossip_msg.sender, "dropping gossip from unknown device");
             return;
+        }
+
+        // Update device presence whenever we hear from a known device.
+        if sender_known {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            device_presence
+                .lock()
+                .unwrap()
+                .insert(gossip_msg.sender, (true, now));
         }
     }
 
@@ -585,18 +610,57 @@ async fn handle_gossip_message(
             // Received a batch of entries from a peer's delta computation.
             info!(count = entries.len(), "received sync response");
             let sync_start = std::time::Instant::now();
-            let mut eng = engine.lock().unwrap();
-            for entry_bytes in entries {
-                match DagEntry::from_bytes(&entry_bytes) {
-                    Ok(entry) => {
-                        if let Err(e) = eng.receive_entry(entry) {
-                            debug!(error = %e, "sync response entry skipped");
+            let mut blobs_to_request: Vec<BlobHash> = Vec::new();
+            {
+                let mut eng = engine.lock().unwrap();
+                for entry_bytes in entries {
+                    match DagEntry::from_bytes(&entry_bytes) {
+                        Ok(entry) => {
+                            // Before inserting, check whether we're missing the blob
+                            // for a FileAdded entry — but only if receive_entry succeeds
+                            // (i.e., this is genuinely a new entry we hadn't seen before).
+                            let missing_blob =
+                                if let Action::FileAdded { ref metadata } = entry.action {
+                                    let h = metadata.blob_hash;
+                                    if !matches!(storage.load_blob(h), Ok(Some(_))) {
+                                        Some(h)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+
+                            match eng.receive_entry(entry) {
+                                Ok(_) => {
+                                    if let Some(h) = missing_blob {
+                                        blobs_to_request.push(h);
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!(error = %e, "sync response entry skipped");
+                                }
+                            }
                         }
+                        Err(e) => warn!(error = %e, "invalid entry in sync response"),
                     }
-                    Err(e) => warn!(error = %e, "invalid entry in sync response"),
                 }
             }
             metrics::observe_sync_duration(sync_start.elapsed().as_secs_f64());
+
+            // Request any blobs we're missing from the sync batch.
+            for blob_hash in blobs_to_request {
+                let req = GossipMessage {
+                    nonce: rand::random(),
+                    sender: our_device_id,
+                    payload: GossipPayload::BlobRequest { blob_hash },
+                };
+                if let Err(e) = broadcast_gossip(gossip_sender, &req).await {
+                    warn!(error = %e, %blob_hash, "sync blob request broadcast failed");
+                } else {
+                    debug!(%blob_hash, "requested missing blob from sync response");
+                }
+            }
         }
         GossipPayload::BlobRequest { blob_hash } => {
             // A peer is requesting a blob. If we have it, send it.
@@ -691,6 +755,7 @@ async fn handle_gossip_message(
                     } else {
                         metrics::record_blob_transfer_bytes("download", data.len() as u64);
                         info!(%blob_hash, size = data.len(), "blob received and stored");
+                        let _ = blob_arrived_tx.send(blob_hash);
                     }
                 }
             }
@@ -746,6 +811,7 @@ async fn handle_gossip_message(
                             chunks = total_chunks,
                             "streaming blob received and stored"
                         );
+                        let _ = blob_arrived_tx.send(blob_hash);
                     }
                     Err(e) => {
                         warn!(error = %e, %blob_hash, "streaming blob verification/storage failed");

@@ -103,14 +103,22 @@ fn run_daemon(
 ) -> Result<()> {
     // Check for a LeaveNetwork marker from a previous run.
     // If present, wipe the entire data directory and start fresh.
+    // Preserve any mnemonic the desktop app pre-wrote for a Join flow.
     let leave_marker = base_dir.join(".leave");
     if leave_marker.exists() {
         info!("LeaveNetwork marker found — wiping data directory");
+        let mnemonic_path = Config::mnemonic_path(base_dir);
+        let preserved_mnemonic = std::fs::read(&mnemonic_path).ok();
         if let Err(e) = std::fs::remove_dir_all(base_dir) {
             warn!(error = %e, "failed to wipe data dir for LeaveNetwork");
         }
         // Recreate the base dir so auto_init can proceed.
         std::fs::create_dir_all(base_dir).context("recreate base dir after wipe")?;
+        // Restore the mnemonic if the desktop app wrote one for a Join flow.
+        if let Some(bytes) = preserved_mnemonic {
+            std::fs::write(&mnemonic_path, bytes)
+                .context("restore pre-written mnemonic after leave wipe")?;
+        }
     }
 
     let config_path = Config::config_path(base_dir);
@@ -262,7 +270,12 @@ fn run_daemon(
         let topic = murmur_net::topic_from_network_id(&network_id);
         let creator_iroh_key = identity.creator_iroh_key_bytes();
 
-        let net_handle = networking::start_networking(
+        // Create device_presence before networking so both the gossip receive
+        // task and DaemonCtx share the same map.
+        let device_presence: Arc<Mutex<std::collections::HashMap<DeviceId, (bool, u64)>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        let (net_handle, blob_arrived_rx) = networking::start_networking(
             engine.clone(),
             storage.clone(),
             device_id,
@@ -270,6 +283,7 @@ fn run_daemon(
             is_creator,
             topic,
             config.network.throttle.clone(),
+            device_presence.clone(),
         )
         .await
         .context("start networking")?;
@@ -447,6 +461,61 @@ fn run_daemon(
             }
         });
 
+        // Spawn blob-arrived task: when the gossip layer stores a new blob from
+        // a peer, write any locally-subscribed files that reference that blob.
+        // This handles the case where reverse-sync ran before the blob arrived
+        // (which is always true for a newly joined device catching up via
+        // DagSyncResponse).
+        let mut blob_arrived_rx = blob_arrived_rx;
+        let engine_for_blob = engine.clone();
+        let storage_for_blob = storage.clone();
+        let folders_for_blob = synced_folders_arc.clone();
+        let echo_for_blob = echo_suppressor.clone();
+        let blob_arrived_task = tokio::spawn(async move {
+            while let Some(blob_hash) = blob_arrived_rx.recv().await {
+                // Collect (folder_id, path) pairs for files that reference this blob
+                // and are in a locally-synced folder.
+                let pending: Vec<(murmur_types::FolderId, String)> = {
+                    let eng = engine_for_blob.lock().unwrap();
+                    folders_for_blob
+                        .iter()
+                        .flat_map(|(fid, _)| {
+                            let fid = *fid;
+                            eng.folder_files(fid)
+                                .into_iter()
+                                .filter(move |m| m.blob_hash == blob_hash)
+                                .map(move |m| (fid, m.path.clone()))
+                        })
+                        .collect()
+                };
+
+                for (folder_id, path) in pending {
+                    if let Some(folder) = folders_for_blob.get(&folder_id) {
+                        if let Err(e) = sync::reverse_sync_file(
+                            folder,
+                            &path,
+                            blob_hash,
+                            &storage_for_blob,
+                            &echo_for_blob,
+                        ) {
+                            warn!(
+                                error = %e,
+                                %blob_hash,
+                                path = %path,
+                                "blob_arrived: failed to write file"
+                            );
+                        } else {
+                            info!(
+                                %blob_hash,
+                                path = %path,
+                                "blob_arrived: wrote file to disk"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
         // Spawn a task to accept socket connections.
         let ctx = Arc::new(DaemonCtx {
             engine: engine.clone(),
@@ -464,7 +533,7 @@ fn run_daemon(
             config: Arc::new(Mutex::new(config.clone())),
             sync_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             paused_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            device_presence: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            device_presence: device_presence.clone(),
         });
 
         let accept_handle = tokio::task::spawn_blocking(move || {
@@ -527,10 +596,11 @@ fn run_daemon(
         }
         accept_handle.abort();
 
-        // Abort daemon background tasks (debounce poll, sync tasks).
+        // Abort daemon background tasks (debounce poll, sync tasks, blob writes).
         debounce_task.abort();
         forward_sync_task.abort();
         reverse_sync_task.abort();
+        blob_arrived_task.abort();
 
         // Abort HTTP server if running.
         #[cfg(feature = "metrics")]
@@ -1506,6 +1576,13 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
 
         // -- M23a: Device Management --
         CliRequest::GetDevicePresence => {
+            // A device is considered "online" if we received a gossip message
+            // from it within the last 60 seconds.
+            const ONLINE_THRESHOLD_SECS: u64 = 60;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             let eng = ctx.engine.lock().unwrap();
             let presence = ctx.device_presence.lock().unwrap();
             let devices = eng
@@ -1513,22 +1590,17 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                 .into_iter()
                 .filter(|d| d.approved)
                 .map(|d| {
-                    let (online, last_seen) =
+                    let (_, last_seen) =
                         presence.get(&d.device_id).copied().unwrap_or((false, 0));
-                    // The local device is always online.
                     let is_local = d.device_id == eng.device_id();
+                    let online = is_local
+                        || (last_seen > 0
+                            && now.saturating_sub(last_seen) < ONLINE_THRESHOLD_SECS);
                     DevicePresenceIpc {
                         device_id: d.device_id.to_string(),
                         device_name: d.name,
-                        online: is_local || online,
-                        last_seen_unix: if is_local {
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs()
-                        } else {
-                            last_seen
-                        },
+                        online,
+                        last_seen_unix: if is_local { now } else { last_seen },
                     }
                 })
                 .collect();
@@ -1771,6 +1843,11 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
 
         // -- M27a: Diagnostics & Network Health --
         CliRequest::ListPeers => {
+            const ONLINE_THRESHOLD_SECS: u64 = 60;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             let eng = ctx.engine.lock().unwrap();
             let presence = ctx.device_presence.lock().unwrap();
             let device_id = eng.device_id();
@@ -1779,8 +1856,10 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                 .into_iter()
                 .filter(|d| d.approved && d.device_id != device_id)
                 .map(|d| {
-                    let (online, last_seen) =
+                    let (_, last_seen) =
                         presence.get(&d.device_id).copied().unwrap_or((false, 0));
+                    let online = last_seen > 0
+                        && now.saturating_sub(last_seen) < ONLINE_THRESHOLD_SECS;
                     let conn_type = if online { "direct" } else { "relay" };
                     PeerInfoIpc {
                         device_id: d.device_id.to_string(),
@@ -1869,6 +1948,11 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
             }
         }
         CliRequest::ExportDiagnostics { output_path } => {
+            const ONLINE_THRESHOLD_SECS: u64 = 60;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             let eng = ctx.engine.lock().unwrap();
             let presence = ctx.device_presence.lock().unwrap();
             let device_id = eng.device_id();
@@ -1878,8 +1962,10 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                 .into_iter()
                 .filter(|d| d.approved && d.device_id != device_id)
                 .map(|d| {
-                    let (online, last_seen) =
+                    let (_, last_seen) =
                         presence.get(&d.device_id).copied().unwrap_or((false, 0));
+                    let online = last_seen > 0
+                        && now.saturating_sub(last_seen) < ONLINE_THRESHOLD_SECS;
                     serde_json::json!({
                         "device_id": d.device_id.to_string(),
                         "name": d.name,
@@ -2033,32 +2119,50 @@ fn process_add_file(path: String, ctx: &DaemonCtx) -> CliResponse {
 
 /// Initialize a new network on first run.
 fn auto_init(base_dir: &Path, name: &str, role: &str) -> Result<()> {
-    info!("first run — creating new network");
-
     std::fs::create_dir_all(base_dir).context("create base directory")?;
 
-    // Generate mnemonic.
-    let mnemonic = murmur_seed::generate_mnemonic(murmur_seed::WordCount::TwentyFour);
+    // Use existing mnemonic (written by desktop join flow) or generate a new one.
+    let mnemonic_path = Config::mnemonic_path(base_dir);
+    let joining = mnemonic_path.exists();
+    let mnemonic = if joining {
+        info!("first run — joining existing network");
+        let s = std::fs::read_to_string(&mnemonic_path).context("read existing mnemonic")?;
+        murmur_seed::parse_mnemonic(s.trim())?
+    } else {
+        info!("first run — creating new network");
+        let m = murmur_seed::generate_mnemonic(murmur_seed::WordCount::TwentyFour);
+        std::fs::write(&mnemonic_path, m.to_string().as_bytes()).context("save mnemonic")?;
+        m
+    };
     let identity = murmur_seed::NetworkIdentity::from_mnemonic(&mnemonic, "");
-    let device_id = identity.first_device_id();
 
-    // Save mnemonic.
-    std::fs::write(
-        Config::mnemonic_path(base_dir),
-        mnemonic.to_string().as_bytes(),
-    )
-    .context("save mnemonic")?;
+    // For a joining device, generate a unique device key and write it to disk.
+    // murmurd detects this file on startup to decide whether to call
+    // join_network() (joiner, pending approval) vs create_network() (creator).
+    let device_id = if joining {
+        let kp = murmur_seed::DeviceKeyPair::generate();
+        let id = kp.device_id();
+        std::fs::write(Config::device_key_path(base_dir), kp.to_bytes())
+            .context("save device key")?;
+        id
+    } else {
+        identity.first_device_id()
+    };
 
     // Write config.
     let config = Config::new(base_dir, name, role);
     let toml_str = toml::to_string_pretty(&config).context("serialize config")?;
     std::fs::write(Config::config_path(base_dir), toml_str).context("write config")?;
 
-    println!("New Murmur network created.");
-    println!();
-    println!("IMPORTANT — Write down your mnemonic and store it safely:");
-    println!();
-    println!("  {mnemonic}");
+    if joining {
+        println!("Joined existing Murmur network.");
+    } else {
+        println!("New Murmur network created.");
+        println!();
+        println!("IMPORTANT — Write down your mnemonic and store it safely:");
+        println!();
+        println!("  {mnemonic}");
+    }
     println!();
     println!("Device ID: {device_id}");
     println!();
@@ -2787,6 +2891,88 @@ mod tests {
         // Mnemonic should be valid.
         let mnemonic_str = std::fs::read_to_string(Config::mnemonic_path(dir.path())).unwrap();
         murmur_seed::parse_mnemonic(mnemonic_str.trim()).unwrap();
+    }
+
+    /// Reproduce: Leave network → Join with new mnemonic → Settings shows wrong mnemonic.
+    ///
+    /// The desktop app writes the mnemonic to disk *before* spawning murmurd.
+    /// If a `.leave` marker exists from a previous LeaveNetwork, `run_daemon`
+    /// wipes the data dir (including the just-written mnemonic) before
+    /// `auto_init` runs, so `auto_init` generates a fresh mnemonic instead of
+    /// using the one the user provided.
+    #[test]
+    fn test_leave_then_join_preserves_provided_mnemonic() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        // Simulate a previous LeaveNetwork: .leave marker exists.
+        std::fs::write(base.join(".leave"), b"").unwrap();
+
+        // Simulate the desktop app writing the user's mnemonic before
+        // spawning murmurd (this is what launch_and_wait does).
+        let user_mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        std::fs::write(Config::mnemonic_path(base), user_mnemonic).unwrap();
+
+        // --- Replicate what run_daemon does at startup ---
+
+        // 1. Check for .leave marker and wipe (preserving mnemonic).
+        let leave_marker = base.join(".leave");
+        if leave_marker.exists() {
+            let mnemonic_path = Config::mnemonic_path(base);
+            let preserved = std::fs::read(&mnemonic_path).ok();
+            let _ = std::fs::remove_dir_all(base);
+            std::fs::create_dir_all(base).unwrap();
+            if let Some(bytes) = preserved {
+                std::fs::write(&mnemonic_path, bytes).unwrap();
+            }
+        }
+
+        // 2. auto_init (first_run because config.toml is gone after wipe).
+        auto_init(base, "JoinDevice", "backup").unwrap();
+
+        // The mnemonic on disk must be the one the user entered, not a random one.
+        let on_disk = std::fs::read_to_string(Config::mnemonic_path(base)).unwrap();
+        assert_eq!(
+            on_disk.trim(),
+            user_mnemonic,
+            "mnemonic on disk should be the user-provided one, not a newly generated one"
+        );
+
+        // A device.key must have been generated so murmurd treats this as a
+        // joiner and calls join_network() instead of create_network().
+        assert!(
+            Config::device_key_path(base).exists(),
+            "joining device must have a device.key so is_joiner is true"
+        );
+    }
+
+    /// Verify that auto_init in join mode generates a device.key file.
+    ///
+    /// Without device.key, run_daemon sets is_joiner = false and calls
+    /// create_network() — producing a duplicate device ID and no visible state
+    /// on either device.
+    #[test]
+    fn test_auto_init_join_creates_device_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        // Simulate the desktop app writing the mnemonic before spawning murmurd.
+        let user_mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        std::fs::write(Config::mnemonic_path(base), user_mnemonic).unwrap();
+
+        auto_init(base, "JoiningDevice", "full").unwrap();
+
+        // device.key must exist so is_joiner = true.
+        assert!(
+            Config::device_key_path(base).exists(),
+            "join auto_init must write device.key"
+        );
+        // device.key must be 32 bytes.
+        let key_bytes = std::fs::read(Config::device_key_path(base)).unwrap();
+        assert_eq!(key_bytes.len(), 32, "device.key must be 32 bytes");
+        // Mnemonic is preserved unchanged.
+        let on_disk = std::fs::read_to_string(Config::mnemonic_path(base)).unwrap();
+        assert_eq!(on_disk.trim(), user_mnemonic);
     }
 
     #[test]

@@ -78,7 +78,7 @@ pub fn handle_reverse_sync_event(
 }
 
 /// Write a blob to a local file, skipping if the file already has the correct content.
-fn reverse_sync_file(
+pub(crate) fn reverse_sync_file(
     folder: &SyncedFolder,
     relative_path: &str,
     blob_hash: BlobHash,
