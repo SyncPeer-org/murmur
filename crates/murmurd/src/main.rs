@@ -510,6 +510,14 @@ fn run_daemon(
         shutdown.await?;
         info!("shutting down…");
 
+        // Hard exit deadline: if graceful shutdown stalls (blocked mDNS,
+        // slow iroh endpoint close, etc.), force-exit after 5 seconds.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            warn!("graceful shutdown timed out — forcing exit");
+            std::process::exit(0);
+        });
+
         // Unblock the IPC accept loop: shutdown the listener socket so the
         // blocking accept() call in spawn_blocking returns an error and exits.
         // SAFETY: accept_fd is valid while the accept_handle task is alive.
