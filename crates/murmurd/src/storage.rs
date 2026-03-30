@@ -1,4 +1,5 @@
-//! Storage backend for murmurd: Fjall for DAG entries, filesystem for blobs.
+//! Storage backend for murmurd: flat file for DAG entries, filesystem for blobs,
+//! Fjall for the transient blob push queue.
 
 use std::path::Path;
 use std::sync::Arc;

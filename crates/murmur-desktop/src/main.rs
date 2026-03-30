@@ -614,6 +614,8 @@ impl App {
             }
             Message::UnsubscribeFolder(fid) => {
                 let p = self.socket_path.clone();
+                self.selected_folder = None;
+                self.screen = Screen::Folders;
                 return Task::perform(
                     ipc::send(
                         p,
@@ -1272,51 +1274,27 @@ impl App {
         ]
         .spacing(8);
         let subscribed: Vec<_> = self.folders.iter().filter(|f| f.subscribed).collect();
-        if !subscribed.is_empty() {
-            col = col.push(text("My Folders").size(18));
-            for f in subscribed {
-                let is_renaming = self.renaming_folder_id.as_deref() == Some(&f.folder_id);
-                // Name row: inline rename or display with rename button.
-                let name_col: Element<'_, Message> = if is_renaming {
-                    row![
-                        text_input("Folder name", &self.rename_input)
-                            .on_input(Message::RenameInputChanged)
-                            .on_submit(Message::SubmitRenameFolder)
-                            .padding(4)
-                            .width(Length::Fill),
-                        button(text("Save")).on_press(Message::SubmitRenameFolder),
-                        button(text("Cancel")).on_press(Message::CancelRenameFolder),
-                    ]
-                    .spacing(4)
-                    .into()
-                } else {
-                    row![
-                        text(&f.name).size(16),
-                        button(text("Rename")).on_press(Message::StartRenameFolder(
-                            f.folder_id.clone(),
-                            f.name.clone()
-                        )),
-                    ]
-                    .spacing(4)
-                    .into()
-                };
-                // Path line (shown below name).
-                let path_text = f.local_path.as_deref().unwrap_or("(no local path)");
-                let info = column![name_col, text(path_text).size(11),]
-                    .spacing(2)
-                    .width(Length::Fill);
-                col = col.push(
+        for f in &subscribed {
+            let path_text = f.local_path.as_deref().unwrap_or("(no local path)");
+            let info = column![
+                text(&f.name).size(16),
+                text(path_text).size(11),
+            ]
+            .spacing(2)
+            .width(Length::Fill);
+            col = col.push(
+                button(
                     row![
                         info,
-                        text(format!("{} files", f.file_count)).width(Length::Fixed(100.0)),
-                        text(f.mode.as_deref().unwrap_or("--")).width(Length::Fixed(100.0)),
-                        button(text("Open")).on_press(Message::SelectFolder(f.clone())),
-                        button(text("Unsub"))
-                            .on_press(Message::UnsubscribeFolder(f.folder_id.clone())),
+                        text(&f.sync_status).size(12).width(Length::Shrink),
                     ]
-                    .spacing(8),
-                );
-            }
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center),
+                )
+                .on_press(Message::SelectFolder((*f).clone()))
+                .width(Length::Fill)
+                .style(iced::widget::button::secondary),
+            );
         }
         let available: Vec<_> = self
             .network_folders
@@ -1331,7 +1309,6 @@ impl App {
                 col = col.push(
                     row![
                         text(&f.name).size(16).width(Length::Fill),
-                        text(format!("{} files", f.file_count)).width(Length::Fixed(100.0)),
                         text(format!("{} subs", f.subscriber_count)).width(Length::Fixed(80.0)),
                         button(text("Subscribe")).on_press(Message::SubscribeFolder(
                             f.folder_id.clone(),
@@ -1342,10 +1319,10 @@ impl App {
                 );
             }
         }
-        if self.folders.is_empty() && self.network_folders.is_empty() {
+        if subscribed.is_empty() && self.network_folders.is_empty() {
             col = col.push(text("No folders yet. Create one to get started.").size(14));
         }
-        scrollable(col).into()
+        scrollable(col.padding(iced::Padding { top: 0.0, right: 15.0, bottom: 0.0, left: 0.0 })).into()
     }
 
     fn view_folder_detail(&self) -> Element<'_, Message> {
@@ -1358,19 +1335,47 @@ impl App {
         } else {
             "Pause"
         };
+        // Header row: Back, name (or inline rename), action buttons.
+        let is_renaming = self.renaming_folder_id.as_deref() == Some(&folder.folder_id);
+        let name_el: Element<'_, Message> = if is_renaming {
+            row![
+                text_input("Folder name", &self.rename_input)
+                    .on_input(Message::RenameInputChanged)
+                    .on_submit(Message::SubmitRenameFolder)
+                    .padding(4)
+                    .width(Length::Fill),
+                button(text("Save")).on_press(Message::SubmitRenameFolder),
+                button(text("Cancel")).on_press(Message::CancelRenameFolder),
+            ]
+            .spacing(4)
+            .into()
+        } else {
+            row![
+                text(&folder.name).size(24).width(Length::Fill),
+                button(text("Rename")).on_press(Message::StartRenameFolder(
+                    folder.folder_id.clone(),
+                    folder.name.clone()
+                )),
+            ]
+            .spacing(4)
+            .into()
+        };
         let mut col = column![
             row![
                 button(text("Back")).on_press(Message::Navigate(Screen::Folders)),
-                text(&folder.name).size(24).width(Length::Fill),
+                name_el,
                 button(text(pause_label))
                     .on_press(Message::ToggleFolderSync(folder.folder_id.clone())),
+                button(text("Unsub"))
+                    .on_press(Message::UnsubscribeFolder(folder.folder_id.clone())),
             ]
             .spacing(8),
             text(format!(
-                "ID: {}  |  {} files  |  Mode: {}",
+                "ID: {}  |  {} files  |  Mode: {}  |  {}",
                 &folder.folder_id[..16],
                 folder.file_count,
-                folder.mode.as_deref().unwrap_or("--")
+                folder.mode.as_deref().unwrap_or("--"),
+                folder.local_path.as_deref().unwrap_or("(no local path)")
             ))
             .size(12),
         ]
@@ -1479,7 +1484,7 @@ impl App {
                 );
             }
         }
-        scrollable(col).into()
+        scrollable(col.padding(iced::Padding { top: 0.0, right: 15.0, bottom: 0.0, left: 0.0 })).into()
     }
 
     fn view_conflicts(&self) -> Element<'_, Message> {
@@ -1540,7 +1545,7 @@ impl App {
                 col = col.push(rule::horizontal(1));
             }
         }
-        scrollable(col).into()
+        scrollable(col.padding(iced::Padding { top: 0.0, right: 15.0, bottom: 0.0, left: 0.0 })).into()
     }
 
     fn view_file_history(&self) -> Element<'_, Message> {
@@ -1577,7 +1582,7 @@ impl App {
                 );
             }
         }
-        scrollable(col).into()
+        scrollable(col.padding(iced::Padding { top: 0.0, right: 15.0, bottom: 0.0, left: 0.0 })).into()
     }
 
     fn view_devices(&self) -> Element<'_, Message> {
@@ -1658,7 +1663,7 @@ impl App {
             col = col.push(text("Other Devices").size(18));
             col = col.push(text("No other devices on this network.").size(14));
         }
-        scrollable(col).into()
+        scrollable(col.padding(iced::Padding { top: 0.0, right: 15.0, bottom: 0.0, left: 0.0 })).into()
     }
 
     fn view_status(&self) -> Element<'_, Message> {
@@ -1704,7 +1709,7 @@ impl App {
                 col = col.push(text(ev).size(12));
             }
         }
-        scrollable(col).into()
+        scrollable(col.padding(iced::Padding { top: 0.0, right: 15.0, bottom: 0.0, left: 0.0 })).into()
     }
 
     fn view_recent_files(&self) -> Element<'_, Message> {
@@ -1721,7 +1726,7 @@ impl App {
         } else {
             col = col.push(text(format!("Searching for: {}", self.search_query)).size(14));
         }
-        scrollable(col).into()
+        scrollable(col.padding(iced::Padding { top: 0.0, right: 15.0, bottom: 0.0, left: 0.0 })).into()
     }
 
     // -- Settings (M26a) --
@@ -1846,7 +1851,7 @@ impl App {
             );
         }
 
-        scrollable(col).into()
+        scrollable(col.padding(iced::Padding { top: 0.0, right: 15.0, bottom: 0.0, left: 0.0 })).into()
     }
 
     // -- Network Health (M27a) --

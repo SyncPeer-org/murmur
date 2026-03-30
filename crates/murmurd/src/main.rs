@@ -516,15 +516,11 @@ fn run_daemon(
         Ok::<(), anyhow::Error>(())
     })?;
 
-    // Cleanup: flush storage, release the Fjall lock, THEN remove socket.
-    // Order matters — if we remove the socket while the DB lock is still held,
-    // a new daemon could be launched and fail with FjallError::Locked.
-    // The PID file is intentionally NOT removed — the next startup uses it to
-    // detect stuck/orphan daemons. Stale PID files are cleaned by
-    // `cleanup_stale_instance` once the PID is confirmed dead.
-    storage.flush()?;
+    // Cleanup: drop storage (DAG is already durable via sync_data per write),
+    // then remove socket and PID.
     drop(storage);
     let _ = std::fs::remove_file(&sock_path);
+    let _ = std::fs::remove_file(&pid_path);
     info!("daemon stopped");
 
     Ok(())
@@ -844,6 +840,15 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                     if let Err(e) = ctx.storage.flush() {
                         error!(error = %e, "flush after remove_folder");
                     }
+                    // Remove the folder mapping from local config.
+                    {
+                        let mut cfg = ctx.config.lock().unwrap();
+                        let before = cfg.folders.len();
+                        cfg.folders.retain(|f| f.folder_id != folder_id_hex);
+                        if cfg.folders.len() != before {
+                            persist_config(ctx, &cfg);
+                        }
+                    }
                     CliResponse::Ok {
                         message: format!("Folder {folder_id} removed."),
                     }
@@ -857,6 +862,8 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
             let eng = ctx.engine.lock().unwrap();
             let device_id = eng.device_id();
             let cfg = ctx.config.lock().unwrap();
+            let paused_set = ctx.paused_folders.lock().unwrap();
+            let global_paused = ctx.sync_paused.load(std::sync::atomic::Ordering::Relaxed);
             let folders = eng
                 .list_folders()
                 .into_iter()
@@ -879,6 +886,18 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                         })
                         .unwrap_or(f.name);
                     let local_path = fc.map(|fc| fc.local_path.to_string_lossy().to_string());
+                    let sync_status = if sub.is_none() {
+                        "Not subscribed".to_string()
+                    } else if global_paused || paused_set.contains(&f.folder_id) {
+                        "Paused".to_string()
+                    } else {
+                        let conflicts = eng.list_conflicts_in_folder(f.folder_id).len();
+                        if conflicts > 0 {
+                            format!("{conflicts} conflict{}", if conflicts == 1 { "" } else { "s" })
+                        } else {
+                            "Up to date".to_string()
+                        }
+                    };
                     FolderInfoIpc {
                         folder_id: fid_str,
                         name,
@@ -887,6 +906,7 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                         subscribed: sub.is_some(),
                         mode: sub.map(|s| s.mode.to_string()),
                         local_path,
+                        sync_status,
                     }
                 })
                 .collect();
@@ -969,6 +989,15 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                     let _ = ctx.broadcast_tx.send(entry.to_bytes());
                     if let Err(e) = ctx.storage.flush() {
                         error!(error = %e, "flush after unsubscribe_folder");
+                    }
+                    // Remove the folder mapping from local config.
+                    {
+                        let mut cfg = ctx.config.lock().unwrap();
+                        let before = cfg.folders.len();
+                        cfg.folders.retain(|f| f.folder_id != folder_id_hex);
+                        if cfg.folders.len() != before {
+                            persist_config(ctx, &cfg);
+                        }
                     }
                     CliResponse::Ok {
                         message: format!("Unsubscribed from folder {folder_id}."),
@@ -1306,12 +1335,17 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
             let folders = eng
                 .list_folders()
                 .into_iter()
-                .map(|f| {
+                .filter_map(|f| {
                     let file_count = eng.folder_files(f.folder_id).len() as u64;
                     let subs = eng.folder_subscriptions(f.folder_id);
                     let subscriber_count = subs.len() as u64;
                     let my_sub = subs.iter().find(|s| s.device_id == device_id);
-                    NetworkFolderInfoIpc {
+                    // Only include folders we're subscribed to, or that have
+                    // at least one other subscriber (i.e. actually on the network).
+                    if my_sub.is_none() && subscriber_count == 0 {
+                        return None;
+                    }
+                    Some(NetworkFolderInfoIpc {
                         folder_id: f.folder_id.to_string(),
                         name: f.name,
                         created_by: f.created_by.to_string(),
@@ -1319,7 +1353,7 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                         subscriber_count,
                         subscribed: my_sub.is_some(),
                         mode: my_sub.map(|s| s.mode.to_string()),
-                    }
+                    })
                 })
                 .collect();
             CliResponse::NetworkFolders { folders }

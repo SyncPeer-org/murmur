@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+fn default_true() -> bool {
+    true
+}
+
 /// Top-level configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {
@@ -52,12 +56,12 @@ pub struct DeviceConfig {
 pub struct StorageConfig {
     /// Directory for content-addressed blobs.
     pub blob_dir: PathBuf,
-    /// Directory for Fjall database (DAG persistence).
+    /// Directory for DAG storage (`dag.bin`) and Fjall push queue.
     pub data_dir: PathBuf,
 }
 
 /// Network behaviour options.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetworkConfig {
     /// Automatically approve new devices with the correct network ID.
     #[serde(default)]
@@ -65,9 +69,19 @@ pub struct NetworkConfig {
     /// Bandwidth throttle configuration.
     #[serde(default)]
     pub throttle: ThrottleConfig,
-    /// Enable mDNS LAN peer discovery.
-    #[serde(default)]
+    /// Enable mDNS LAN peer discovery (on by default).
+    #[serde(default = "default_true")]
     pub mdns: bool,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            auto_approve: false,
+            throttle: ThrottleConfig::default(),
+            mdns: true,
+        }
+    }
 }
 
 /// Bandwidth throttle settings.

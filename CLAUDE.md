@@ -62,7 +62,8 @@ Desktop only (in `murmurd`, the server daemon):
 
 | Purpose     | Crate                        |
 | ----------- | ---------------------------- |
-| Metadata DB | `fjall` v3 (DAG persistence) |
+| DAG storage | Flat append-only file (`dag.bin`) |
+| Push queue  | `fjall` v3 (transient blob queue) |
 | CLI         | `clap`                       |
 | FS watching | `notify` 8                   |
 | Ignore      | `ignore` 0.4                 |
@@ -84,7 +85,7 @@ protocol, logic, networking, and cryptography. It **never writes to disk**. It p
 serialized bytes (DagEntry, blobs) and hands them to the platform via callbacks. Each
 platform (desktop, Android, iOS) decides how to persist.
 
-- `murmurd` (desktop): uses Fjall for DAG, filesystem for blobs, axum for Web UI
+- `murmurd` (desktop): flat file for DAG (`dag.bin`), filesystem for blobs, axum for Web UI
 - Android (future): Room/SQLite for DAG, MediaStore for blobs
 - iOS (future): Core Data for DAG, app container for blobs
 
@@ -97,7 +98,7 @@ Murmur adapts several Shoal components. When implementing, reference the Shoal s
 
 | Murmur crate   | Shoal source                             | What changes                                                                   |
 | -------------- | ---------------------------------------- | ------------------------------------------------------------------------------ |
-| `murmur-dag`   | `shoal-logtree/`                         | Different `Action` enum, in-memory only (no DagStore/Fjall), platform persists |
+| `murmur-dag`   | `shoal-logtree/`                         | Different `Action` enum, in-memory only, platform persists to flat file        |
 | `murmur-net`   | `shoal-net/` + `shoal-cluster/gossip.rs` | Blob push/pull instead of shard transfer                                       |
 | `murmur-types` | `shoal-types/`                           | DeviceId/BlobHash instead of ShardId/ObjectId                                  |
 

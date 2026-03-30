@@ -33,7 +33,7 @@ All mutations (device joins, file additions, access grants) are recorded in a **
 └─────────────────────────────────────────────────────────────┘
 ```
 
-The core never writes to disk. It produces serialized bytes and hands them to the platform via callbacks. Each platform decides how to persist (Fjall, SQLite, Core Data, etc.).
+The core never writes to disk. It produces serialized bytes and hands them to the platform via callbacks. Each platform decides how to persist (flat files, SQLite, Core Data, etc.).
 
 ## Workspace layout
 
@@ -96,7 +96,7 @@ cargo install --path crates/murmur-desktop
 | mDNS           | mdns-sd          |
 | UI (desktop)   | iced 0.14        |
 
-Desktop/server (`murmurd`, `murmur-cli`, `murmur-desktop`): fjall v3 (metadata DB), clap (CLI).
+Desktop/server (`murmurd`, `murmur-cli`, `murmur-desktop`): flat-file DAG persistence (`dag.bin`), fjall v3 (transient push queue), clap (CLI).
 
 No dependency requires C/C++ compilation in the core crates.
 

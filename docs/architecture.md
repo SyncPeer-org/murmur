@@ -32,7 +32,7 @@ The Rust core is **protocol and logic only** — it handles networking, the DAG,
 │  ┌───────────┐  ┌───────────┐   ┌─────────────────────┐ │
 │  │ Android   │  │   iOS     │   │  Desktop (murmurd)  │ │
 │  │ Kotlin    │  │  Swift    │   │  Rust CLI + iced UI │ │
-│  │ Room/SQL  │  │ CoreData  │   │  Fjall + filesystem │ │
+│  │ Room/SQL  │  │ CoreData  │   │  flat file + fs     │ │
 │  │ SAF       │  │ FileProv  │   │                     │ │
 │  └─────┬─────┘  └─────┬─────┘   └──────────┬──────────┘ │
 │        │              │                    │            │
@@ -269,8 +269,8 @@ Headless daemon for NAS, Raspberry Pi, or VPS. Pure daemon — no subcommands, m
 
 - On first run (no config): auto-initializes — generates mnemonic, writes `config.toml`, prints mnemonic
 - Config: `~/.murmur/config.toml` (device name, role, storage paths)
-- Storage: Fjall for DAG persistence, content-addressed filesystem for blobs
-- Startup: load all DAG entries from Fjall → feed into engine → clean up stale streaming temp files → start gossip networking → listen on Unix socket
+- Storage: append-only flat file (`dag.bin`) for DAG persistence, content-addressed filesystem for blobs, Fjall for transient push queue only
+- Startup: load all DAG entries from `dag.bin` → feed into engine → clean up stale streaming temp files → start gossip networking → listen on Unix socket
 - **Gossip networking**: creates an iroh endpoint, subscribes to a gossip topic derived from the network ID. Creator uses a deterministic iroh key (HKDF from mnemonic); joining devices use a random key and bootstrap with the creator's endpoint ID. DAG entries broadcast via gossip with deflate compression (shared wire format from `murmur-net`). On `NeighborUp`, peers exchange `DagSyncRequest` with their tips and receive only the delta. When a `FileAdded` entry arrives, the daemon requests missing blobs via `BlobRequest`/`BlobResponse`; large blobs (>4 MiB) use chunked transfer via `BlobChunk` messages with 5ms pacing between chunks.
 - **Streaming blob storage**: incoming `BlobChunk` messages are written directly to a temp file (`~/.murmur/blobs/.tmp/`) instead of being reassembled in memory. On completion, streaming blake3 verification runs without loading the full file. For unencrypted blobs, atomic rename to final path. For encrypted blobs, chunked AEAD encryption (1 MiB chunks, per-chunk derived nonces, MCv1 format) keeps memory bounded.
 - **Blob encryption at rest**: AES-256-GCM. Legacy blobs use single-nonce format (12-byte nonce + ciphertext). Streaming blobs use chunked MCv1 format (magic header + base nonce + per-chunk nonces derived via XOR). Both formats are transparently handled on read.
@@ -290,7 +290,7 @@ iced 0.14 GUI desktop app for linux desktops.
 - **Devices tab**: approved devices with revoke, pending requests with approve
 - **Files tab**: file list with metadata, add file by path
 - **Status tab**: device ID, DAG entry count, event log
-- Storage: same Fjall + filesystem pattern as murmurd
+- Storage: thin IPC client to murmurd — no local storage
 
 ---
 
@@ -314,7 +314,7 @@ The engine provides:
 
 | Concern          | Implementation                                                                              |
 | ---------------- | ------------------------------------------------------------------------------------------- |
-| DAG persistence  | Fjall v3 (embedded key-value store)                                                         |
+| DAG persistence  | Append-only flat file (`dag.bin`, length-prefixed entries, fsync per write)                  |
 | Blob storage     | Content-addressed filesystem (`~/.murmur/blobs/ab/cd/...`)                                  |
 | Blob encryption  | AES-256-GCM at rest (single-nonce for small blobs, chunked MCv1 AEAD for streaming blobs)   |
 | Streaming blobs  | Temp dir (`~/.murmur/blobs/.tmp/`), streaming blake3 verify, atomic rename on complete       |
@@ -444,7 +444,7 @@ Action::Snapshot { state_hash }
 
 | Purpose     | Crate        |
 | ----------- | ------------ |
-| Metadata DB | `fjall` v3   |
+| Push queue  | `fjall` v3   |
 | CLI         | `clap` v4    |
 | Desktop UI  | `iced` 0.14  |
 | FS watching | `notify` 8   |
@@ -468,7 +468,7 @@ Action::Snapshot { state_hash }
 | BIP39 over random secret | Users can write down 12/24 words on paper. Same UX as Bitcoin wallets.                  |
 | HKDF over BIP32          | No hierarchical derivation needed. HKDF with domain separation is simpler.              |
 | iroh for networking      | QUIC with built-in hole punching and relay fallback. `NodeId` is already Ed25519.       |
-| No storage in core       | Each platform has optimal storage (Fjall, Room, Core Data). Core deals with bytes only. |
+| No storage in core       | Each platform has optimal storage (flat file, Room, Core Data). Core deals with bytes only. |
 | FFI at engine, not iroh  | Mobile code never touches iroh types. Stable, simple FFI surface.                       |
 | UniFFI proc-macro        | No UDL file needed. Generates Kotlin + Swift from Rust annotations.                     |
 | In-memory DAG            | Platform persists and feeds entries on startup. Core doesn't know how storage works.    |

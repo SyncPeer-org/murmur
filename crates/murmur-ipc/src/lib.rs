@@ -548,6 +548,9 @@ pub struct FolderInfoIpc {
     pub mode: Option<String>,
     /// Local directory path if subscribed.
     pub local_path: Option<String>,
+    /// Short sync status label (e.g. "Up to date", "Syncing", "Paused", "Conflicts").
+    #[serde(default)]
+    pub sync_status: String,
 }
 
 /// Conflict information for IPC transport.
@@ -987,6 +990,7 @@ mod tests {
                 subscribed: true,
                 mode: Some("read-write".to_string()),
                 local_path: Some("/home/user/Photos".to_string()),
+                sync_status: "Up to date".to_string(),
             }],
         };
         let bytes = postcard::to_allocvec(&resp).unwrap();

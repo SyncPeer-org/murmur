@@ -237,7 +237,9 @@ cargo fmt --check                   # format check
 ├── mnemonic           # BIP39 seed phrase (24 words)
 ├── device.key         # ed25519 signing key
 ├── murmurd.sock       # Unix socket (runtime only)
-├── db/                # Fjall database (DAG entries)
+├── db/                # DAG storage (dag.bin) + Fjall push queue
+│   ├── dag.bin        # append-only DAG entry file
+│   └── fjall/         # Fjall DB (transient push queue only)
 └── blobs/             # content-addressed file storage
 ```
 
