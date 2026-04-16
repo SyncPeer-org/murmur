@@ -25,7 +25,7 @@ use murmur_engine::{EngineEvent, MurmurEngine, PlatformCallbacks};
 use murmur_net::topic_from_network_id;
 use murmur_seed::WordCount;
 use murmur_seed::{DeviceKeyPair, NetworkIdentity, generate_mnemonic, parse_mnemonic};
-use murmur_types::{AccessScope, BlobHash, DeviceId, DeviceRole, FileMetadata, FolderId};
+use murmur_types::{AccessScope, BlobHash, DeviceId, FileMetadata, FolderId};
 use tracing::{debug, error};
 
 // ---------------------------------------------------------------------------
@@ -73,8 +73,6 @@ pub struct DeviceInfoFfi {
     pub device_id: Vec<u8>,
     /// Human-readable device name.
     pub name: String,
-    /// Role string: `"source"`, `"backup"`, or `"full"`.
-    pub role: String,
     /// Whether this device has been approved.
     pub approved: bool,
     /// Raw 32-byte approving device ID, or `None`.
@@ -121,7 +119,7 @@ pub enum MurmurEventFfi {
     /// A device sent a join request.
     DeviceJoinRequested { device_id: Vec<u8>, name: String },
     /// A device was approved.
-    DeviceApproved { device_id: Vec<u8>, role: String },
+    DeviceApproved { device_id: Vec<u8> },
     /// A device was revoked.
     DeviceRevoked { device_id: Vec<u8> },
     /// A folder was created.
@@ -176,27 +174,10 @@ pub enum MurmurEventFfi {
 // Conversion helpers
 // ---------------------------------------------------------------------------
 
-fn role_to_string(role: DeviceRole) -> String {
-    match role {
-        DeviceRole::Source => "source".to_string(),
-        DeviceRole::Backup => "backup".to_string(),
-        DeviceRole::Full => "full".to_string(),
-    }
-}
-
-fn role_from_string(s: &str) -> DeviceRole {
-    match s {
-        "source" => DeviceRole::Source,
-        "backup" => DeviceRole::Backup,
-        _ => DeviceRole::Full,
-    }
-}
-
 fn device_info_to_ffi(d: &murmur_types::DeviceInfo) -> DeviceInfoFfi {
     DeviceInfoFfi {
         device_id: d.device_id.as_bytes().to_vec(),
         name: d.name.clone(),
-        role: role_to_string(d.role),
         approved: d.approved,
         approved_by: d.approved_by.map(|id| id.as_bytes().to_vec()),
         joined_at: d.joined_at,
@@ -211,9 +192,8 @@ fn engine_event_to_ffi(event: EngineEvent) -> MurmurEventFfi {
                 name,
             }
         }
-        EngineEvent::DeviceApproved { device_id, role } => MurmurEventFfi::DeviceApproved {
+        EngineEvent::DeviceApproved { device_id } => MurmurEventFfi::DeviceApproved {
             device_id: device_id.as_bytes().to_vec(),
-            role: role_to_string(role),
         },
         EngineEvent::DeviceRevoked { device_id } => MurmurEventFfi::DeviceRevoked {
             device_id: device_id.as_bytes().to_vec(),
@@ -443,13 +423,9 @@ impl MurmurHandle {
     }
 
     /// Approve a pending device.  `role` is `"source"`, `"backup"`, or `"full"`.
-    pub fn approve_device(&self, device_id_hex: String, role: String) -> Result<(), FfiError> {
+    pub fn approve_device(&self, device_id_hex: String) -> Result<(), FfiError> {
         let device_id = parse_device_id(&device_id_hex)?;
-        let entry = self
-            .inner
-            .lock()
-            .unwrap()
-            .approve_device(device_id, role_from_string(&role))?;
+        let entry = self.inner.lock().unwrap().approve_device(device_id)?;
         if let Some(ref net) = *self.net.lock().unwrap() {
             let _ = net.broadcast_tx.send(entry.to_bytes());
         }
@@ -615,13 +591,7 @@ pub fn create_network(
     let bridge = Arc::new(CallbacksBridge {
         inner: Arc::clone(&shared),
     });
-    let engine = MurmurEngine::create_network(
-        device_id,
-        signing_key,
-        device_name,
-        DeviceRole::Full,
-        bridge,
-    );
+    let engine = MurmurEngine::create_network(device_id, signing_key, device_name, bridge);
     let rt = tokio::runtime::Runtime::new().map_err(|e| FfiError::OperationFailed {
         message: format!("failed to create tokio runtime: {e}"),
     })?;
@@ -768,14 +738,12 @@ mod tests {
         let info = DeviceInfoFfi {
             device_id: id.to_vec(),
             name: "Phone".to_string(),
-            role: "source".to_string(),
             approved: true,
             approved_by: Some([2u8; 32].to_vec()),
             joined_at: 42,
         };
         assert_eq!(info.device_id, id);
         assert_eq!(info.name, "Phone");
-        assert_eq!(info.role, "source");
         assert!(info.approved);
         assert_eq!(info.approved_by.unwrap(), [2u8; 32]);
         assert_eq!(info.joined_at, 42);
@@ -834,7 +802,6 @@ mod tests {
         let devices = handle.list_devices();
         assert_eq!(devices.len(), 1);
         assert!(devices[0].approved);
-        assert_eq!(devices[0].role, "full");
     }
 
     // -----------------------------------------------------------------------
@@ -855,7 +822,7 @@ mod tests {
     #[test]
     fn test_approve_device_non_hex_error() {
         let (handle, _state) = make_handle();
-        let result = handle.approve_device("ZZZZ-not-hex!".to_string(), "full".to_string());
+        let result = handle.approve_device("ZZZZ-not-hex!".to_string());
         assert!(matches!(result, Err(FfiError::InvalidDeviceId { .. })));
     }
 
@@ -863,10 +830,7 @@ mod tests {
     fn test_approve_device_short_hex_error() {
         let (handle, _state) = make_handle();
         // 16 bytes → 32 hex chars — valid hex but wrong length.
-        let result = handle.approve_device(
-            "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
-            "full".to_string(),
-        );
+        let result = handle.approve_device("deadbeefdeadbeefdeadbeefdeadbeef".to_string());
         assert!(matches!(result, Err(FfiError::InvalidDeviceId { .. })));
     }
 
@@ -929,9 +893,7 @@ mod tests {
         handle1.receive_sync_entries(join_bytes).unwrap();
 
         // Approve via FFI.
-        handle1
-            .approve_device(id2.clone(), "source".to_string())
-            .unwrap();
+        handle1.approve_device(id2.clone()).unwrap();
 
         let found = handle1
             .list_devices()
@@ -940,7 +902,6 @@ mod tests {
         assert!(found.is_some());
         let dev = found.unwrap();
         assert!(dev.approved);
-        assert_eq!(dev.role, "source");
     }
 
     // -----------------------------------------------------------------------

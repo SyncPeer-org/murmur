@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use ed25519_dalek::SigningKey;
 use murmur_engine::{EngineEvent, MurmurEngine, PlatformCallbacks};
 use murmur_types::{
-    AccessGrant, AccessScope, BlobHash, DeviceId, DeviceRole, FileMetadata, FolderId, SyncMode,
+    AccessGrant, AccessScope, BlobHash, DeviceId, FileMetadata, FolderId, SyncMode,
 };
 
 /// Test platform callbacks that capture all events, entries, and blobs.
@@ -40,11 +40,11 @@ impl PlatformCallbacks for TestCallbacks {
 }
 
 /// Create a new engine as the first device in a network.
-pub fn create_engine(name: &str, role: DeviceRole) -> (MurmurEngine, Arc<TestCallbacks>) {
+pub fn create_engine(name: &str) -> (MurmurEngine, Arc<TestCallbacks>) {
     let sk = SigningKey::from_bytes(&rand::random());
     let device_id = DeviceId::from_verifying_key(&sk.verifying_key());
     let cb = Arc::new(TestCallbacks::default());
-    let engine = MurmurEngine::create_network(device_id, sk, name.to_string(), role, cb.clone());
+    let engine = MurmurEngine::create_network(device_id, sk, name.to_string(), cb.clone());
     (engine, cb)
 }
 
@@ -84,10 +84,9 @@ pub fn join_approve_sync(
     approver: &mut MurmurEngine,
     joiner: &mut MurmurEngine,
     joiner_id: DeviceId,
-    role: DeviceRole,
 ) {
     sync_engines(joiner, approver);
-    approver.approve_device(joiner_id, role).unwrap();
+    approver.approve_device(joiner_id).unwrap();
     bidirectional_sync(approver, joiner);
 }
 
@@ -132,17 +131,15 @@ pub fn make_file(
 
 /// Create a default shared folder on an engine and return its `FolderId`.
 ///
-/// The engine that creates the folder is auto-subscribed as ReadWrite.
+/// The engine that creates the folder is auto-subscribed as Full.
 pub fn create_test_folder(engine: &mut MurmurEngine) -> FolderId {
     let (folder, _) = engine.create_folder("test").unwrap();
     folder.folder_id
 }
 
-/// Subscribe an engine to a folder as ReadWrite.
+/// Subscribe an engine to a folder as Full sync.
 ///
 /// The folder must already exist in the engine's DAG (i.e., synced from the creator).
 pub fn subscribe_test_folder(engine: &mut MurmurEngine, folder_id: FolderId) {
-    engine
-        .subscribe_folder(folder_id, SyncMode::ReadWrite)
-        .unwrap();
+    engine.subscribe_folder(folder_id, SyncMode::Full).unwrap();
 }

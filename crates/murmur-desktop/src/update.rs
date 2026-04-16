@@ -104,9 +104,7 @@ impl App {
                     Screen::Conflicts => self.fetch_conflicts(),
                     Screen::Devices => Task::batch([self.fetch_devices(), self.fetch_presence()]),
                     Screen::Status => self.fetch_status(),
-                    Screen::Settings => {
-                        Task::batch([self.fetch_config(), self.fetch_mnemonic()])
-                    }
+                    Screen::Settings => Task::batch([self.fetch_config(), self.fetch_mnemonic()]),
                     Screen::NetworkHealth => {
                         Task::batch([self.fetch_peers(), self.fetch_storage_stats()])
                     }
@@ -267,7 +265,7 @@ impl App {
                             folder_id_hex: fid,
                             name: Some(fname),
                             local_path,
-                            mode: "read-write".to_string(),
+                            mode: "full".to_string(),
                         },
                     ),
                     Message::GotGeneric,
@@ -296,12 +294,7 @@ impl App {
                 self.selected_folder = None;
                 self.screen = Screen::Folders;
                 return Task::perform(
-                    ipc::send(
-                        p,
-                        CliRequest::RemoveFolder {
-                            folder_id_hex: fid,
-                        },
-                    ),
+                    ipc::send(p, CliRequest::RemoveFolder { folder_id_hex: fid }),
                     Message::GotGeneric,
                 );
             }
@@ -471,13 +464,7 @@ impl App {
             Message::ApproveDevice(did) => {
                 let s = self.socket_path.clone();
                 return Task::perform(
-                    ipc::send(
-                        s,
-                        CliRequest::ApproveDevice {
-                            device_id_hex: did,
-                            role: "full".to_string(),
-                        },
-                    ),
+                    ipc::send(s, CliRequest::ApproveDevice { device_id_hex: did }),
                     Message::GotGeneric,
                 );
             }
@@ -500,6 +487,23 @@ impl App {
                 };
                 self.folder_paused = !self.folder_paused;
                 return Task::perform(ipc::send(s, req), Message::GotGeneric);
+            }
+            Message::SetFolderMode(fid, mode) => {
+                let s = self.socket_path.clone();
+                // Update the local selected_folder mode optimistically.
+                if let Some(ref mut f) = self.selected_folder {
+                    f.mode = Some(mode.clone());
+                }
+                return Task::perform(
+                    ipc::send(
+                        s,
+                        CliRequest::SetFolderMode {
+                            folder_id_hex: fid,
+                            mode,
+                        },
+                    ),
+                    Message::GotGeneric,
+                );
             }
             // Settings
             Message::ToggleAutoApprove => {

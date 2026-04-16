@@ -845,7 +845,7 @@ mod tests {
 
         let entry = dag.append(Action::DeviceApproved {
             device_id,
-            role: DeviceRole::Backup,
+            role: DeviceRole::ReceiveOnly,
         });
         let entry_bytes = entry.to_bytes();
 
@@ -871,7 +871,7 @@ mod tests {
 
         let e1 = dag.append(Action::DeviceApproved {
             device_id,
-            role: DeviceRole::Backup,
+            role: DeviceRole::ReceiveOnly,
         });
         let e2 = dag.append(Action::DeviceNameChanged {
             device_id,
@@ -1046,7 +1046,7 @@ mod tests {
 
         let entry = dag.append(Action::DeviceApproved {
             device_id,
-            role: DeviceRole::Backup,
+            role: DeviceRole::ReceiveOnly,
         });
 
         use murmur_engine::PlatformCallbacks;

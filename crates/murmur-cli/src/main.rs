@@ -43,9 +43,6 @@ enum Command {
         /// Device name.
         #[arg(long, default_value = "murmurd")]
         name: String,
-        /// Device role: source, backup, or full.
-        #[arg(long, default_value = "backup")]
-        role: String,
     },
     /// Show daemon status.
     Status,
@@ -57,9 +54,6 @@ enum Command {
     Approve {
         /// Device ID (64-character hex).
         device_id: String,
-        /// Role to assign: source, backup, or full.
-        #[arg(long, default_value = "backup")]
-        role: String,
     },
     /// Revoke an approved device.
     Revoke {
@@ -123,9 +117,9 @@ enum FolderCommand {
         /// Display name for the folder (defaults to folder's original name).
         #[arg(long)]
         name: Option<String>,
-        /// Subscribe as read-only.
-        #[arg(long)]
-        read_only: bool,
+        /// Sync mode: full (default), send-only, or receive-only.
+        #[arg(long, default_value = "full")]
+        mode: String,
     },
     /// Unsubscribe from a folder.
     Unsubscribe {
@@ -154,7 +148,7 @@ enum FolderCommand {
     Mode {
         /// Folder ID (64-character hex).
         folder_id: String,
-        /// New mode: read-write or read-only.
+        /// New mode: full, send-only, or receive-only.
         mode: String,
     },
     /// Rename a folder's display name.
@@ -170,11 +164,7 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Command::Join {
-            mnemonic,
-            name,
-            role,
-        } => offline::cmd_join(&cli.data_dir, &mnemonic, &name, &role),
+        Command::Join { mnemonic, name } => offline::cmd_join(&cli.data_dir, &mnemonic, &name),
         // All online commands go through the socket.
         cmd => run_online(&cli.data_dir, cmd, cli.json),
     };
@@ -221,9 +211,8 @@ fn command_to_request(command: Command) -> CliRequest {
         Command::Status => CliRequest::Status,
         Command::Devices => CliRequest::ListDevices,
         Command::Pending => CliRequest::ListPending,
-        Command::Approve { device_id, role } => CliRequest::ApproveDevice {
+        Command::Approve { device_id } => CliRequest::ApproveDevice {
             device_id_hex: device_id,
-            role,
         },
         Command::Revoke { device_id } => CliRequest::RevokeDevice {
             device_id_hex: device_id,
@@ -242,16 +231,12 @@ fn command_to_request(command: Command) -> CliRequest {
                 folder_id,
                 local_path,
                 name,
-                read_only,
+                mode,
             } => CliRequest::SubscribeFolder {
                 folder_id_hex: folder_id,
                 name,
                 local_path,
-                mode: if read_only {
-                    "read-only".to_string()
-                } else {
-                    "read-write".to_string()
-                },
+                mode,
             },
             FolderCommand::Unsubscribe {
                 folder_id,
@@ -332,7 +317,7 @@ fn print_plain(response: &CliResponse) {
             } else {
                 println!("Approved devices ({}):", devices.len());
                 for dev in devices {
-                    println!("  {} {} ({})", dev.device_id, dev.name, dev.role);
+                    println!("  {} {}", dev.device_id, dev.name);
                 }
             }
         }
@@ -456,7 +441,6 @@ fn print_plain(response: &CliResponse) {
         }
         CliResponse::Config {
             device_name,
-            device_role,
             network_id,
             folders,
             auto_approve,
@@ -465,7 +449,7 @@ fn print_plain(response: &CliResponse) {
             download_throttle,
             sync_paused,
         } => {
-            println!("Device:       {device_name} ({device_role})");
+            println!("Device:       {device_name}");
             println!("Network:      {network_id}");
             println!("Auto-approve: {auto_approve}");
             println!("mDNS:         {mdns}");

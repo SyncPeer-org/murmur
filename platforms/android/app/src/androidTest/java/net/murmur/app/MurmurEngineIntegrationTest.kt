@@ -101,7 +101,7 @@ class MurmurEngineIntegrationTest {
         engine2.loadPersistedEntries()
 
         // Approve engine2 from engine1.
-        engine1.approveDevice(engine2Id, "source")
+        engine1.approveDevice(engine2Id)
 
         // engine1's device list should include engine2 as approved.
         val devices = engine1.listDevices()
@@ -118,7 +118,7 @@ class MurmurEngineIntegrationTest {
         val engine2 = MurmurEngine.joinNetwork(context, "Phone", validMnemonic)
         val id2 = engine2.deviceIdHex()
 
-        engine.approveDevice(id2, "full")
+        engine.approveDevice(id2)
         var devices = engine.listDevices()
         val before = devices.find {
             it.deviceId.joinToString("") { b -> "%02x".format(b.toByte()) } == id2

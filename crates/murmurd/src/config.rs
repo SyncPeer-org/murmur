@@ -33,22 +33,23 @@ pub struct FolderConfig {
     pub name: String,
     /// Absolute path to the local directory for this folder.
     pub local_path: PathBuf,
-    /// Sync mode: "read-write" or "read-only".
+    /// Sync mode: "full", "send-only", or "receive-only".
     #[serde(default = "default_mode")]
     pub mode: String,
 }
 
 fn default_mode() -> String {
-    "read-write".to_string()
+    "full".to_string()
 }
 
-/// Device identity and role.
+/// Device identity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceConfig {
     /// Human-readable device name.
     pub name: String,
-    /// Device role: "source", "backup", or "full".
-    pub role: String,
+    /// Legacy role field — ignored, kept for config-file backwards compat.
+    #[serde(default, skip_serializing)]
+    pub role: Option<String>,
 }
 
 /// Paths for persistent storage.
@@ -104,11 +105,11 @@ impl Config {
     }
 
     /// Create a config rooted at `base_dir`.
-    pub fn new(base_dir: &Path, name: &str, role: &str) -> Self {
+    pub fn new(base_dir: &Path, name: &str) -> Self {
         Self {
             device: DeviceConfig {
                 name: name.to_string(),
-                role: role.to_string(),
+                role: None,
             },
             storage: StorageConfig {
                 blob_dir: base_dir.join("blobs"),
@@ -150,18 +151,6 @@ impl Config {
     pub fn device_key_path(base_dir: &Path) -> PathBuf {
         base_dir.join("device.key")
     }
-
-    /// Parse the role string into a [`murmur_types::DeviceRole`].
-    pub fn parse_role(&self) -> anyhow::Result<murmur_types::DeviceRole> {
-        match self.device.role.as_str() {
-            "source" => Ok(murmur_types::DeviceRole::Source),
-            "backup" => Ok(murmur_types::DeviceRole::Backup),
-            "full" => Ok(murmur_types::DeviceRole::Full),
-            other => {
-                anyhow::bail!("unknown device role: {other:?} (expected source, backup, or full)")
-            }
-        }
-    }
 }
 
 /// Home directory helper (no external dep needed).
@@ -177,7 +166,7 @@ mod tests {
 
     #[test]
     fn test_config_roundtrip_toml() {
-        let config = Config::new(Path::new("/data/murmur"), "Home NAS", "backup");
+        let config = Config::new(Path::new("/data/murmur"), "Home NAS");
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(config, parsed);
@@ -185,39 +174,32 @@ mod tests {
 
     #[test]
     fn test_config_default_network() {
-        let config = Config::new(Path::new("/tmp/test"), "Test", "full");
+        let config = Config::new(Path::new("/tmp/test"), "Test");
         assert!(!config.network.auto_approve);
     }
 
     #[test]
-    fn test_config_parse_role() {
-        let config = Config::new(Path::new("/tmp"), "NAS", "backup");
-        assert_eq!(
-            config.parse_role().unwrap(),
-            murmur_types::DeviceRole::Backup
-        );
+    fn test_config_legacy_role_ignored() {
+        // Old config files with a role field should still parse without error.
+        let toml = r#"
+[device]
+name = "NAS"
+role = "backup"
 
-        let config = Config::new(Path::new("/tmp"), "Phone", "source");
-        assert_eq!(
-            config.parse_role().unwrap(),
-            murmur_types::DeviceRole::Source
-        );
-
-        let config = Config::new(Path::new("/tmp"), "All", "full");
-        assert_eq!(config.parse_role().unwrap(), murmur_types::DeviceRole::Full);
-    }
-
-    #[test]
-    fn test_config_parse_role_invalid() {
-        let config = Config::new(Path::new("/tmp"), "NAS", "invalid");
-        assert!(config.parse_role().is_err());
+[storage]
+blob_dir = "/tmp/blobs"
+data_dir = "/tmp/db"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.device.name, "NAS");
+        assert_eq!(config.device.role.as_deref(), Some("backup"));
     }
 
     #[test]
     fn test_config_save_load() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let config = Config::new(dir.path(), "NAS", "backup");
+        let config = Config::new(dir.path(), "NAS");
         config.save(&path).unwrap();
 
         let loaded = Config::load(&path).unwrap();
@@ -299,7 +281,7 @@ folder_id = "abc123"
 local_path = "/home/user/Sync/Photos"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.folders[0].mode, "read-write");
+        assert_eq!(config.folders[0].mode, "full");
         // name defaults to empty when omitted from TOML (backwards compat).
         assert_eq!(config.folders[0].name, "");
     }

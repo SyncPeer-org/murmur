@@ -53,7 +53,11 @@ pub fn handle_reverse_sync_event(
             path,
         } => {
             if let Some(folder) = folders.get(folder_id) {
-                reverse_sync_file(folder, path, *blob_hash, storage, echo_suppressor)?;
+                if folder.mode.can_receive() {
+                    reverse_sync_file(folder, path, *blob_hash, storage, echo_suppressor)?;
+                } else {
+                    debug!(path, "skipping reverse sync for send-only folder");
+                }
             }
             Ok(true)
         }
@@ -63,13 +67,21 @@ pub fn handle_reverse_sync_event(
             new_hash,
         } => {
             if let Some(folder) = folders.get(folder_id) {
-                reverse_sync_file(folder, path, *new_hash, storage, echo_suppressor)?;
+                if folder.mode.can_receive() {
+                    reverse_sync_file(folder, path, *new_hash, storage, echo_suppressor)?;
+                } else {
+                    debug!(path, "skipping reverse sync for send-only folder");
+                }
             }
             Ok(true)
         }
         EngineEvent::FileDeleted { folder_id, path } => {
             if let Some(folder) = folders.get(folder_id) {
-                delete_file_from_disk(folder, path, echo_suppressor)?;
+                if folder.mode.can_receive() {
+                    delete_file_from_disk(folder, path, echo_suppressor)?;
+                } else {
+                    debug!(path, "skipping reverse sync for send-only folder");
+                }
             }
             Ok(true)
         }
@@ -204,11 +216,11 @@ pub fn handle_forward_sync_event(
         }
     };
 
-    // Read-only folders don't forward local changes.
-    if folder.mode == SyncMode::ReadOnly {
+    // Only forward local changes if the mode allows writing.
+    if !folder.mode.can_write() {
         debug!(
             path = %event.relative_path,
-            "skipping forward sync for read-only folder"
+            "skipping forward sync for receive-only folder"
         );
         return Ok(());
     }
@@ -309,8 +321,8 @@ pub fn initial_scan(
     // Scan local directory.
     let local_files = scan_local_dir(&folder.local_path, &folder.local_path)?;
 
-    // Local files not in DAG → add them (only if read-write).
-    if folder.mode == SyncMode::ReadWrite {
+    // Local files not in DAG → add them (only if mode allows writing).
+    if folder.mode.can_write() {
         for (rel_path, full_path) in &local_files {
             // Apply ignore patterns — don't add OS cruft to DAG.
             if ignore_filter.is_ignored(Path::new(rel_path), false) {
@@ -501,7 +513,7 @@ mod tests {
         let folder = SyncedFolder {
             folder_id: FolderId::from_bytes([1u8; 32]),
             local_path: dir.path().to_path_buf(),
-            mode: SyncMode::ReadWrite,
+            mode: SyncMode::Full,
         };
 
         write_file_to_disk(&folder, "subdir/file.txt", b"content", &suppressor).unwrap();
@@ -521,7 +533,7 @@ mod tests {
         let folder = SyncedFolder {
             folder_id: FolderId::from_bytes([1u8; 32]),
             local_path: dir.path().to_path_buf(),
-            mode: SyncMode::ReadWrite,
+            mode: SyncMode::Full,
         };
 
         let subdir = dir.path().join("subdir");
@@ -542,7 +554,7 @@ mod tests {
         let folder = SyncedFolder {
             folder_id: FolderId::from_bytes([1u8; 32]),
             local_path: dir.path().to_path_buf(),
-            mode: SyncMode::ReadWrite,
+            mode: SyncMode::Full,
         };
 
         // Should not error.
@@ -555,7 +567,7 @@ mod tests {
         let _folder = SyncedFolder {
             folder_id: FolderId::from_bytes([1u8; 32]),
             local_path: dir.path().to_path_buf(),
-            mode: SyncMode::ReadWrite,
+            mode: SyncMode::Full,
         };
 
         // Write a file that already has the expected content.

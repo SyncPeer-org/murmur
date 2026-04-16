@@ -772,14 +772,13 @@ mod tests {
 
         dag.append(Action::DeviceApproved {
             device_id: new_id,
-            role: DeviceRole::Source,
+            role: DeviceRole::SendOnly,
         });
 
         let devices = &dag.state().devices;
         assert!(devices.contains_key(&new_id));
         let info = &devices[&new_id];
         assert!(info.approved);
-        assert_eq!(info.role, DeviceRole::Source);
     }
 
     #[test]
@@ -789,7 +788,7 @@ mod tests {
 
         dag.append(Action::DeviceApproved {
             device_id: new_id,
-            role: DeviceRole::Backup,
+            role: DeviceRole::ReceiveOnly,
         });
         dag.append(Action::DeviceRevoked { device_id: new_id });
 
@@ -930,7 +929,7 @@ mod tests {
             },
             Action::DeviceApproved {
                 device_id: other_id,
-                role: DeviceRole::Source,
+                role: DeviceRole::SendOnly,
             },
             Action::DeviceRevoked {
                 device_id: other_id,
@@ -984,7 +983,7 @@ mod tests {
             Action::FolderSubscribed {
                 folder_id: FolderId::from_bytes([0xbb; 32]),
                 device_id: dag.device_id(),
-                mode: SyncMode::ReadWrite,
+                mode: SyncMode::Full,
             },
             Action::FolderUnsubscribed {
                 folder_id: FolderId::from_bytes([0xbb; 32]),
@@ -1015,7 +1014,7 @@ mod tests {
         // Build some history.
         let e1 = dag.append(Action::DeviceApproved {
             device_id: new_id,
-            role: DeviceRole::Backup,
+            role: DeviceRole::ReceiveOnly,
         });
         let meta = sample_file_metadata(device_id);
         let e2 = dag.append(Action::FileAdded {
@@ -1051,7 +1050,7 @@ mod tests {
         });
         dag_a.append(Action::DeviceApproved {
             device_id: id_b,
-            role: DeviceRole::Source,
+            role: DeviceRole::SendOnly,
         });
 
         // Sync A's history to B so B is known and approved.
@@ -1374,7 +1373,7 @@ mod tests {
         });
         dag_a.append(Action::DeviceApproved {
             device_id: id_b,
-            role: DeviceRole::Source,
+            role: DeviceRole::SendOnly,
         });
 
         // Then revokes device B.
@@ -1440,7 +1439,7 @@ mod tests {
         });
         dag_a.append(Action::DeviceApproved {
             device_id: id_b,
-            role: DeviceRole::Source,
+            role: DeviceRole::SendOnly,
         });
 
         // Sync to viewer.
@@ -1505,7 +1504,7 @@ mod tests {
         });
         dag.append(Action::DeviceApproved {
             device_id: other_id,
-            role: DeviceRole::Source,
+            role: DeviceRole::SendOnly,
         });
         dag.append(Action::FileAdded {
             metadata: sample_file_metadata(device_id),

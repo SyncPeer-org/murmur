@@ -21,7 +21,7 @@ rm -rf /tmp/murmur-a /tmp/murmur-b
 **Terminal 1** — start the first daemon:
 
 ```bash
-cargo run --bin murmurd -- --data-dir /tmp/murmur-a --name "node-a" --role full --verbose
+cargo run --bin murmurd -- --data-dir /tmp/murmur-a --name "node-a" --verbose
 ```
 
 **Expected**:
@@ -58,8 +58,11 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a status
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a status --json
 ```
 
-**Expected**: valid JSON containing fields `device_id`, `device_name`, `network_id`,
-`peer_count`, `dag_entries`, `uptime_secs`. Pipe through `jq .` to validate.
+**Expected**: valid JSON in the form `{"Status": { ... }}` containing fields
+`device_id`, `device_name`, `network_id`, `peer_count`, `dag_entries`,
+`uptime_secs` under the `Status` key. All `CliResponse` payloads use the
+same externally-tagged enum format (e.g. `{"Devices": {...}}`,
+`{"Files": {...}}`, `{"Mnemonic": {...}}`). Pipe through `jq .` to validate.
 
 ---
 
@@ -69,14 +72,14 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a status --json
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a devices
 ```
 
-**Expected**: one device — "node-a" with role "full".
+**Expected**: one device — "node-a".
 
 ```bash
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a devices --json
 ```
 
-**Expected**: valid JSON with a `devices` array of length 1. Each entry has
-`device_id`, `name`, `role`, `approved` fields.
+**Expected**: valid JSON `{"Devices": {"devices": [ ... ]}}` with a `devices`
+array of length 1. Each entry has `device_id`, `name`, `approved` fields.
 
 ---
 
@@ -92,7 +95,7 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a pending
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a pending --json
 ```
 
-**Expected**: `{"devices": []}` (valid JSON, empty array).
+**Expected**: `{"Pending": {"devices": []}}` (valid JSON, empty array).
 
 ---
 
@@ -108,7 +111,7 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a files
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a files --json
 ```
 
-**Expected**: `{"files": []}` (valid JSON, empty array).
+**Expected**: `{"Files": {"files": []}}` (valid JSON, empty array).
 
 ---
 
@@ -124,7 +127,8 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a mnemonic
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a mnemonic --json
 ```
 
-**Expected**: valid JSON with `mnemonic` field matching the mnemonic from B1.
+**Expected**: valid JSON `{"Mnemonic": {"mnemonic": "..."}}` — the `mnemonic`
+field matches the mnemonic from B1.
 
 ---
 
@@ -133,7 +137,7 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a mnemonic --json
 **Terminal 4** — join Node B (no daemon needed for this step):
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b join "<PASTE 24 WORDS HERE>" --name "node-b" --role backup
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b join "<PASTE 24 WORDS HERE>" --name "node-b"
 ```
 
 **Expected**:
@@ -150,36 +154,40 @@ ls -la /tmp/murmur-b/device.key
 ```
 
 **Expected**:
-- `config.toml` contains `name = "node-b"` and `role = "backup"`
+- `config.toml` contains `name = "node-b"`
 - `mnemonic` file contains the 24 words
 - `device.key` exists (32 bytes)
+
+(Roles are a legacy concept — they no longer live in config.toml or the CLI;
+per-folder `SyncMode` replaces them.)
 
 ---
 
 ## B9 — Join Rejects Invalid Mnemonic
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-bad join "not a valid mnemonic at all" --name "bad" --role backup
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-bad join "not a valid mnemonic at all" --name "bad"
 ```
 
 **Expected**: error message containing "invalid mnemonic". Exit code non-zero.
 
 ---
 
-## B10 — Join Rejects Invalid Role
+## B10 — Join Rejects Unknown Flags
 
 ```bash
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-bad join "<PASTE 24 WORDS HERE>" --name "bad" --role superadmin
 ```
 
-**Expected**: error message about unknown role. Exit code non-zero.
+**Expected**: clap error — "unexpected argument '--role'". Exit code non-zero.
+(There is no `--role` flag; roles are a legacy concept.)
 
 ---
 
 ## B11 — Join Prevents Double-Init
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b join "<PASTE 24 WORDS HERE>" --name "node-b2" --role backup
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b join "<PASTE 24 WORDS HERE>" --name "node-b2"
 ```
 
 **Expected**: error — "already initialized". The existing config is not overwritten.
@@ -227,7 +235,7 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a pending --json
 **Terminal 3** — approve node-b:
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a approve <NODE_B_DEVICE_ID> --role backup
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a approve <NODE_B_DEVICE_ID>
 ```
 
 **Expected**: "Device approved" confirmation.
@@ -244,7 +252,7 @@ Wait 5-10 seconds for gossip propagation.
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a devices
 ```
 
-**Expected**: two devices — "node-a" (full) and "node-b" (backup).
+**Expected**: two devices — "node-a" and "node-b", both approved.
 
 **Terminal 4**:
 
@@ -354,16 +362,18 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b files
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a files --json
 ```
 
-**Expected**: valid JSON with `files` array. Each entry has: `blob_hash` (64 hex chars),
-`folder_id` (64 hex chars), `path`, `size` (positive integer), `mime_type`, `device_origin`.
+**Expected**: valid JSON `{"Files": {"files": [ ... ]}}`. Each entry has:
+`blob_hash` (64 hex chars), `folder_id` (64 hex chars), `path`,
+`size` (positive integer), `mime_type` (string — `application/octet-stream`
+for unknown types, never `null`), `device_origin`.
 
 ---
 
 ## B21 — DAG Entry Counts Match
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a status --json | jq .dag_entries
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b status --json | jq .dag_entries
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a status --json | jq .Status.dag_entries
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b status --json | jq .Status.dag_entries
 ```
 
 **Expected**: both return the same number.
@@ -402,13 +412,13 @@ rm -rf /tmp/murmur-a /tmp/murmur-b /tmp/murmur-bad /tmp/test-file-a.txt /tmp/tes
 | B1 | Network creation | Daemon running, mnemonic printed, socket listening |
 | B2 | Status (plain) | All fields present, correct DAG entries |
 | B3 | Status (JSON) | Valid JSON, all fields present |
-| B4 | Devices | One device "node-a" (full) |
+| B4 | Devices | One approved device "node-a" |
 | B5 | Pending (empty) | "No pending requests." |
 | B6 | Files (empty) | "No synced files." |
 | B7 | Mnemonic | Matches original, works in plain + JSON |
 | B8 | Join (offline) | Config/mnemonic/key files created |
 | B9 | Bad mnemonic | Error, non-zero exit |
-| B10 | Bad role | Error, non-zero exit |
+| B10 | Unknown flag | Clap rejects `--role`, non-zero exit |
 | B11 | Double init | Error, no overwrite |
 | B12 | Start Node B | Daemon starts, join request broadcast |
 | B13 | Pending (populated) | Node B visible as pending |

@@ -5,7 +5,6 @@ mod helpers;
 
 use helpers::*;
 use murmur_engine::EngineEvent;
-use murmur_types::DeviceRole;
 
 // =========================================================================
 // File modification
@@ -14,7 +13,7 @@ use murmur_types::DeviceRole;
 /// Modify a file and verify version history grows.
 #[test]
 fn test_file_modification_creates_version() {
-    let (mut engine, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine, _) = create_engine("NAS");
     let id = engine.device_id();
     let folder_id = create_test_folder(&mut engine);
 
@@ -46,7 +45,7 @@ fn test_file_modification_creates_version() {
 /// Multiple modifications build a full version chain.
 #[test]
 fn test_multiple_modifications_version_chain() {
-    let (mut engine, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine, _) = create_engine("NAS");
     let id = engine.device_id();
     let folder_id = create_test_folder(&mut engine);
 
@@ -68,7 +67,7 @@ fn test_multiple_modifications_version_chain() {
 /// Modification of a nonexistent file fails.
 #[test]
 fn test_modify_nonexistent_file_fails() {
-    let (mut engine, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine, _) = create_engine("NAS");
     let id = engine.device_id();
     let folder_id = create_test_folder(&mut engine);
 
@@ -80,7 +79,7 @@ fn test_modify_nonexistent_file_fails() {
 /// Modification emits FileModified event.
 #[test]
 fn test_modification_emits_event() {
-    let (mut engine, cb) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine, cb) = create_engine("NAS");
     let id = engine.device_id();
     let folder_id = create_test_folder(&mut engine);
 
@@ -104,10 +103,10 @@ fn test_modification_emits_event() {
 /// File modification syncs to remote device.
 #[test]
 fn test_file_modification_syncs() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
     let nas_id = nas.device_id();
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Full);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     let folder_id = create_test_folder(&mut nas);
     sync_engines(&nas, &mut phone);
@@ -144,7 +143,7 @@ fn test_file_modification_syncs() {
 /// Delete a file removes it from the files map.
 #[test]
 fn test_delete_file() {
-    let (mut engine, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine, _) = create_engine("NAS");
     let id = engine.device_id();
     let folder_id = create_test_folder(&mut engine);
 
@@ -159,7 +158,7 @@ fn test_delete_file() {
 /// Deleting a nonexistent file fails.
 #[test]
 fn test_delete_nonexistent_file_fails() {
-    let (mut engine, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine, _) = create_engine("NAS");
     let folder_id = create_test_folder(&mut engine);
 
     let result = engine.delete_file(folder_id, "nonexistent.txt");
@@ -169,10 +168,10 @@ fn test_delete_nonexistent_file_fails() {
 /// File deletion syncs to remote device.
 #[test]
 fn test_delete_file_syncs() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
     let nas_id = nas.device_id();
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Full);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     let folder_id = create_test_folder(&mut nas);
     sync_engines(&nas, &mut phone);
@@ -193,17 +192,17 @@ fn test_delete_file_syncs() {
 /// Cannot delete from a read-only folder.
 #[test]
 fn test_delete_from_readonly_fails() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
     let nas_id = nas.device_id();
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     let folder_id = create_test_folder(&mut nas);
     sync_engines(&nas, &mut phone);
 
     // Phone subscribes as read-only.
     phone
-        .subscribe_folder(folder_id, murmur_types::SyncMode::ReadOnly)
+        .subscribe_folder(folder_id, murmur_types::SyncMode::ReceiveOnly)
         .unwrap();
 
     // NAS adds a file and syncs.
@@ -223,7 +222,7 @@ fn test_delete_from_readonly_fails() {
 /// File history is empty for nonexistent file.
 #[test]
 fn test_file_history_empty() {
-    let (mut engine, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine, _) = create_engine("NAS");
     let folder_id = create_test_folder(&mut engine);
 
     let history = engine.file_history(folder_id, "nonexistent.txt");
@@ -233,7 +232,7 @@ fn test_file_history_empty() {
 /// File history tracks blob hashes correctly.
 #[test]
 fn test_file_history_blob_hashes() {
-    let (mut engine, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine, _) = create_engine("NAS");
     let id = engine.device_id();
     let folder_id = create_test_folder(&mut engine);
 
@@ -258,10 +257,10 @@ fn test_file_history_blob_hashes() {
 /// File history is preserved across sync.
 #[test]
 fn test_file_history_syncs() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
     let nas_id = nas.device_id();
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Full);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     let folder_id = create_test_folder(&mut nas);
     sync_engines(&nas, &mut phone);

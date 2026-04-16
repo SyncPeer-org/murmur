@@ -187,7 +187,7 @@ When fixing a reported bug:
 Murmur is a Syncthing-style folder sync app. Milestones 13–17 (folder model, conflicts, streaming blobs, filesystem watching, IPC & CLI expansion) are complete. Key design decisions:
 
 - **Shared folders** map to real directories on each device. murmurd watches them with `notify`.
-- **Per-device subscribe model**: each device chooses which folders to sync and whether read-write or read-only.
+- **Per-folder sync mode**: each device chooses which folders to sync and with what mode (full sync, send-only, or receive-only).
 - **File versioning**: `FileModified` action in DAG tracks explicit version chains per `(folder, path)`.
 - **Conflict resolution**: fork-based — concurrent edits produce conflict files on disk, user resolves.
 - **Three frontends**: Desktop app (iced), Web UI (htmx/axum), CLI — all thin clients to murmurd via IPC.

@@ -5,13 +5,12 @@ mod helpers;
 
 use helpers::*;
 use murmur_engine::EngineEvent;
-use murmur_types::DeviceRole;
 
 /// Device A creates network, device B joins, A approves, both sync files.
 #[test]
 fn test_two_device_full_sync() {
     // Device A creates the network.
-    let (mut engine_a, _) = create_engine("NAS", DeviceRole::Backup);
+    let (mut engine_a, _) = create_engine("NAS");
     let device_a_id = engine_a.device_id();
 
     // Device B joins.
@@ -26,9 +25,7 @@ fn test_two_device_full_sync() {
     assert_eq!(pending[0].device_id, device_b_id);
 
     // A approves B.
-    engine_a
-        .approve_device(device_b_id, DeviceRole::Source)
-        .unwrap();
+    engine_a.approve_device(device_b_id).unwrap();
 
     // A creates a shared folder.
     let folder_id = create_test_folder(&mut engine_a);
@@ -42,7 +39,6 @@ fn test_two_device_full_sync() {
     // B should see itself as approved.
     let b_info = engine_b.state().devices.get(&device_b_id).unwrap();
     assert!(b_info.approved);
-    assert_eq!(b_info.role, DeviceRole::Source);
 
     // Both should see both devices.
     assert_eq!(engine_a.list_devices().len(), 2);
@@ -111,12 +107,12 @@ fn test_two_device_full_sync() {
 /// Two devices add files simultaneously, DAGs merge correctly.
 #[test]
 fn test_two_device_concurrent_files() {
-    let (mut engine_a, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine_a, _) = create_engine("NAS");
     let (mut engine_b, _, id_b) = join_engine("Phone");
     let id_a = engine_a.device_id();
 
     // A approves B and they sync.
-    join_approve_sync(&mut engine_a, &mut engine_b, id_b, DeviceRole::Full);
+    join_approve_sync(&mut engine_a, &mut engine_b, id_b);
 
     // A creates a folder, sync to B, B subscribes.
     let folder_id = create_test_folder(&mut engine_a);
@@ -171,12 +167,12 @@ fn test_two_device_concurrent_files() {
 /// File deduplication: same content added on two devices.
 #[test]
 fn test_two_device_deduplication() {
-    let (mut engine_a, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine_a, _) = create_engine("NAS");
     let (mut engine_b, _, id_b) = join_engine("Phone");
     let id_a = engine_a.device_id();
 
     // A approves B and they sync.
-    join_approve_sync(&mut engine_a, &mut engine_b, id_b, DeviceRole::Full);
+    join_approve_sync(&mut engine_a, &mut engine_b, id_b);
 
     // A creates a folder, sync to B, B subscribes.
     let folder_id = create_test_folder(&mut engine_a);
@@ -204,12 +200,12 @@ fn test_two_device_deduplication() {
 /// Sync delta computation: only missing entries are sent.
 #[test]
 fn test_two_device_delta_sync() {
-    let (mut engine_a, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine_a, _) = create_engine("NAS");
     let (mut engine_b, _, id_b) = join_engine("Phone");
     let id_a = engine_a.device_id();
 
     // A approves B and they sync.
-    join_approve_sync(&mut engine_a, &mut engine_b, id_b, DeviceRole::Full);
+    join_approve_sync(&mut engine_a, &mut engine_b, id_b);
 
     // A creates a folder and syncs to B.
     let folder_id = create_test_folder(&mut engine_a);

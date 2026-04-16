@@ -35,9 +35,7 @@ impl App {
             let mnemonic_card = container(
                 column![
                     text("Network Mnemonic").size(16).color(TEXT_SECONDARY),
-                    text(&self.cfg_mnemonic)
-                        .size(13)
-                        .color(Color::WHITE),
+                    text(&self.cfg_mnemonic).size(13).color(Color::WHITE),
                     button(text("Copy to Clipboard").size(13))
                         .on_press(Message::CopyMnemonic)
                         .style(secondary_btn)

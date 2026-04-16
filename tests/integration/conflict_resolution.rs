@@ -5,7 +5,6 @@ mod helpers;
 
 use helpers::*;
 use murmur_engine::EngineEvent;
-use murmur_types::DeviceRole;
 
 // =========================================================================
 // Conflict detection
@@ -14,10 +13,10 @@ use murmur_types::DeviceRole;
 /// Concurrent modifications to the same file produce a conflict.
 #[test]
 fn test_concurrent_modification_creates_conflict() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
     let nas_id = nas.device_id();
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Full);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     let folder_id = create_test_folder(&mut nas);
     sync_engines(&nas, &mut phone);
@@ -62,10 +61,10 @@ fn test_concurrent_modification_creates_conflict() {
 /// Conflict detection emits ConflictDetected event.
 #[test]
 fn test_conflict_emits_event() {
-    let (mut nas, cb_nas) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, cb_nas) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
     let nas_id = nas.device_id();
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Full);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     let folder_id = create_test_folder(&mut nas);
     sync_engines(&nas, &mut phone);
@@ -104,10 +103,10 @@ fn test_conflict_emits_event() {
 /// Resolving a conflict removes it from the active list.
 #[test]
 fn test_resolve_conflict_removes_from_list() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
     let nas_id = nas.device_id();
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Full);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     let folder_id = create_test_folder(&mut nas);
     sync_engines(&nas, &mut phone);
@@ -148,7 +147,7 @@ fn test_resolve_conflict_removes_from_list() {
 /// Resolving a nonexistent conflict fails.
 #[test]
 fn test_resolve_nonexistent_conflict_fails() {
-    let (mut engine, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine, _) = create_engine("NAS");
     let folder_id = create_test_folder(&mut engine);
 
     let fake_hash = murmur_types::BlobHash::from_data(b"fake");
@@ -163,10 +162,10 @@ fn test_resolve_nonexistent_conflict_fails() {
 /// List conflicts in a specific folder filters correctly.
 #[test]
 fn test_list_conflicts_in_folder_filters() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
     let nas_id = nas.device_id();
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Full);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     let folder1 = create_test_folder(&mut nas);
     let (f2, _) = nas.create_folder("other").unwrap();
@@ -174,7 +173,7 @@ fn test_list_conflicts_in_folder_filters() {
     sync_engines(&nas, &mut phone);
     subscribe_test_folder(&mut phone, folder1);
     phone
-        .subscribe_folder(folder2, murmur_types::SyncMode::ReadWrite)
+        .subscribe_folder(folder2, murmur_types::SyncMode::Full)
         .unwrap();
 
     // Add files in both folders, sync.

@@ -4,21 +4,21 @@
 mod helpers;
 
 use helpers::*;
-use murmur_types::{AccessScope, DeviceRole};
+use murmur_types::AccessScope;
 
 /// Phone (source) → NAS (backup), Tablet requests access from Phone.
 #[test]
 fn test_three_device_source_backup_tablet() {
     // NAS creates the network.
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Backup);
+    let (mut nas, _) = create_engine("NAS");
 
     // Phone joins and is approved.
     let (mut phone, _, phone_id) = join_engine("Phone");
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     // Tablet joins and is approved.
     let (mut tablet, _, tablet_id) = join_engine("Tablet");
-    join_approve_sync(&mut nas, &mut tablet, tablet_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut tablet, tablet_id);
 
     // Sync tablet approval to phone.
     bidirectional_sync(&mut nas, &mut phone);
@@ -60,14 +60,14 @@ fn test_three_device_source_backup_tablet() {
 /// Three devices, star topology: NAS is hub, Phone and Tablet are spokes.
 #[test]
 fn test_three_device_star_sync() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let nas_id = nas.device_id();
 
     let (mut phone, _, phone_id) = join_engine("Phone");
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     let (mut tablet, _, tablet_id) = join_engine("Tablet");
-    join_approve_sync(&mut nas, &mut tablet, tablet_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut tablet, tablet_id);
 
     // NAS creates a folder, sync to all, everyone subscribes.
     let folder_id = create_test_folder(&mut nas);
@@ -133,13 +133,13 @@ fn test_three_device_star_sync() {
 /// Access grant flow in three-device topology.
 #[test]
 fn test_three_device_access_grant() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Backup);
+    let (mut nas, _) = create_engine("NAS");
 
     let (mut phone, _, phone_id) = join_engine("Phone");
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     let (mut tablet, _, tablet_id) = join_engine("Tablet");
-    join_approve_sync(&mut nas, &mut tablet, tablet_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut tablet, tablet_id);
     // Also sync tablet approval to phone.
     bidirectional_sync(&mut nas, &mut phone);
 

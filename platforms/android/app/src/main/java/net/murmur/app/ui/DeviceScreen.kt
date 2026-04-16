@@ -58,11 +58,8 @@ fun DeviceScreen(viewModel: DeviceViewModel, myDeviceIdHex: String) {
                 items(pendingRequests) { device ->
                     PendingDeviceCard(
                         device = device,
-                        onApprove = { role ->
-                            viewModel.approveDevice(
-                                hex(device.deviceId),
-                                role
-                            )
+                        onApprove = {
+                            viewModel.approveDevice(hex(device.deviceId))
                         }
                     )
                 }
@@ -107,7 +104,7 @@ fun DeviceScreen(viewModel: DeviceViewModel, myDeviceIdHex: String) {
 @Composable
 private fun PendingDeviceCard(
     device: DeviceInfoFfi,
-    onApprove: (role: String) -> Unit
+    onApprove: () -> Unit
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(12.dp)) {
@@ -118,13 +115,8 @@ private fun PendingDeviceCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { onApprove("full") }, modifier = Modifier.weight(1f)) {
-                    Text("Approve (Full)")
-                }
-                OutlinedButton(onClick = { onApprove("source") }, modifier = Modifier.weight(1f)) {
-                    Text("Source only")
-                }
+            Button(onClick = { onApprove() }) {
+                Text("Approve")
             }
         }
     }
@@ -142,11 +134,6 @@ private fun ApprovedDeviceCard(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(device.name, style = MaterialTheme.typography.bodyLarge)
-                Text(
-                    "Role: ${device.role}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
             }
             OutlinedButton(onClick = onRevoke) { Text("Revoke") }
         }

@@ -13,7 +13,6 @@ use futures_lite::StreamExt;
 use murmur_dag::DagEntry;
 use murmur_net::{CHUNK_SIZE, CHUNK_THRESHOLD, ChunkBuffer, compress_wire, decompress_wire};
 use murmur_types::{Action, BlobHash, DeviceId, GossipMessage, GossipPayload};
-use rand::TryRng;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -74,6 +73,7 @@ pub async fn start_networking(
     storage: Arc<Storage>,
     device_id: DeviceId,
     creator_iroh_key_bytes: [u8; 32],
+    my_iroh_key_bytes: [u8; 32],
     is_creator: bool,
     topic: iroh_gossip::TopicId,
     throttle: ThrottleConfig,
@@ -83,17 +83,13 @@ pub async fn start_networking(
     let creator_secret = iroh::SecretKey::from_bytes(&creator_iroh_key_bytes);
     let creator_endpoint_id = creator_secret.public();
 
-    // This device's iroh secret key: creator uses the deterministic key,
-    // other devices generate a random key from 32 random bytes.
-    let my_secret = if is_creator {
-        creator_secret
-    } else {
-        let mut bytes = [0u8; 32];
-        rand::rngs::SysRng
-            .try_fill_bytes(&mut bytes)
-            .expect("OS RNG should not fail");
-        iroh::SecretKey::from_bytes(&bytes)
-    };
+    // This device's iroh secret key. Always derived deterministically from
+    // a persistent key (HKDF from mnemonic for the creator, HKDF from the
+    // device's ed25519 signing key for joiners) so the iroh endpoint ID
+    // stays stable across daemon restarts. A stable endpoint ID is what
+    // lets peers reconnect after one side restarts — a fresh random key
+    // breaks iroh's address caching and relay discovery.
+    let my_secret = iroh::SecretKey::from_bytes(&my_iroh_key_bytes);
 
     // Create iroh endpoint with relay enabled (for NAT traversal).
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
@@ -139,7 +135,7 @@ pub async fn start_networking(
     };
 
     let topic_handle = gossip
-        .subscribe(topic, bootstrap)
+        .subscribe(topic, bootstrap.clone())
         .await
         .context("subscribe to gossip topic")?;
     let (sender, mut receiver) = topic_handle.split();
@@ -385,13 +381,58 @@ pub async fn start_networking(
         );
     }
 
-    Ok((NetworkHandle {
-        broadcast_tx,
-        connected_peers,
-        upload_throttle,
-        endpoint,
-        background_tasks: vec![accept_task, broadcast_task, recv_task, push_queue_task],
-    }, blob_arrived_rx))
+    // Periodic re-bootstrap task. iroh-gossip does not retry dialing when
+    // its active view goes empty (all neighbors gone). If we still have a
+    // static bootstrap peer — for joiners, that's the creator whose iroh
+    // endpoint ID is derived from the mnemonic — we re-inject it so the
+    // mesh can re-form after a one-sided restart.
+    //
+    // The creator itself has no static bootstrap to fall back on, so it
+    // relies on joiners to dial it back. Because the creator's endpoint
+    // ID is stable across restarts, joiners' re-bootstrap attempts will
+    // always target the right node.
+    let reconnect_task = if !bootstrap.is_empty() {
+        let sender_for_reconnect = sender.clone();
+        let peers_for_reconnect = connected_peers.clone();
+        let reconnect_bootstrap = bootstrap.clone();
+        Some(tokio::spawn(async move {
+            const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+            loop {
+                tokio::time::sleep(CHECK_INTERVAL).await;
+                if peers_for_reconnect.load(Ordering::Relaxed) > 0 {
+                    continue;
+                }
+                match sender_for_reconnect
+                    .join_peers(reconnect_bootstrap.clone())
+                    .await
+                {
+                    Ok(()) => debug!(
+                        peers = reconnect_bootstrap.len(),
+                        "re-bootstrapped gossip topic"
+                    ),
+                    Err(e) => warn!(error = %e, "gossip re-bootstrap failed"),
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    let mut background_tasks = vec![accept_task, broadcast_task, recv_task, push_queue_task];
+    if let Some(t) = reconnect_task {
+        background_tasks.push(t);
+    }
+
+    Ok((
+        NetworkHandle {
+            broadcast_tx,
+            connected_peers,
+            upload_throttle,
+            endpoint,
+            background_tasks,
+        },
+        blob_arrived_rx,
+    ))
 }
 
 /// Simple token-bucket rate limiter.

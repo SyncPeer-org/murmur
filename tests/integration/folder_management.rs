@@ -5,7 +5,7 @@ mod helpers;
 
 use helpers::*;
 use murmur_engine::EngineEvent;
-use murmur_types::{DeviceRole, SyncMode};
+use murmur_types::SyncMode;
 
 // =========================================================================
 // Folder creation and listing
@@ -14,7 +14,7 @@ use murmur_types::{DeviceRole, SyncMode};
 /// Creating a folder auto-subscribes the creator.
 #[test]
 fn test_create_folder_auto_subscribes_creator() {
-    let (mut engine, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine, _) = create_engine("NAS");
 
     let (folder, entries) = engine.create_folder("Photos").unwrap();
     assert_eq!(folder.name, "Photos");
@@ -27,13 +27,13 @@ fn test_create_folder_auto_subscribes_creator() {
     let subs = engine.folder_subscriptions(folder.folder_id);
     assert_eq!(subs.len(), 1);
     assert_eq!(subs[0].device_id, engine.device_id());
-    assert_eq!(subs[0].mode, SyncMode::ReadWrite);
+    assert_eq!(subs[0].mode, SyncMode::Full);
 }
 
 /// Multiple folders can be created.
 #[test]
 fn test_create_multiple_folders() {
-    let (mut engine, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine, _) = create_engine("NAS");
 
     engine.create_folder("Photos").unwrap();
     engine.create_folder("Documents").unwrap();
@@ -51,7 +51,7 @@ fn test_create_multiple_folders() {
 /// Folder creation emits FolderCreated event.
 #[test]
 fn test_create_folder_emits_event() {
-    let (mut engine, cb) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine, cb) = create_engine("NAS");
 
     let (folder, _) = engine.create_folder("Backups").unwrap();
 
@@ -70,9 +70,9 @@ fn test_create_folder_emits_event() {
 /// Remote device subscribes to a folder after sync.
 #[test]
 fn test_remote_device_subscribes_to_folder() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     let folder_id = create_test_folder(&mut nas);
     sync_engines(&nas, &mut phone);
@@ -91,16 +91,16 @@ fn test_remote_device_subscribes_to_folder() {
 /// Subscribe to a nonexistent folder fails.
 #[test]
 fn test_subscribe_nonexistent_folder_fails() {
-    let (mut engine, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine, _) = create_engine("NAS");
     let fake_folder = murmur_types::FolderId::from_data(b"nonexistent");
-    let result = engine.subscribe_folder(fake_folder, SyncMode::ReadWrite);
+    let result = engine.subscribe_folder(fake_folder, SyncMode::Full);
     assert!(result.is_err());
 }
 
 /// Unsubscribe from a folder.
 #[test]
 fn test_unsubscribe_folder() {
-    let (mut engine, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine, _) = create_engine("NAS");
     let folder_id = create_test_folder(&mut engine);
 
     // Auto-subscribed after creation.
@@ -113,19 +113,19 @@ fn test_unsubscribe_folder() {
     assert_eq!(engine.folder_subscriptions(folder_id).len(), 0);
 }
 
-/// ReadOnly subscription prevents file addition.
+/// ReceiveOnly subscription prevents file addition.
 #[test]
 fn test_read_only_subscription_prevents_writes() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     let folder_id = create_test_folder(&mut nas);
     sync_engines(&nas, &mut phone);
 
     // Subscribe as read-only.
     phone
-        .subscribe_folder(folder_id, SyncMode::ReadOnly)
+        .subscribe_folder(folder_id, SyncMode::ReceiveOnly)
         .unwrap();
 
     // Try to add a file — should fail.
@@ -141,7 +141,7 @@ fn test_read_only_subscription_prevents_writes() {
 /// Remove a folder from the network.
 #[test]
 fn test_remove_folder() {
-    let (mut engine, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine, _) = create_engine("NAS");
 
     let folder_id = create_test_folder(&mut engine);
     assert_eq!(engine.list_folders().len(), 1);
@@ -153,7 +153,7 @@ fn test_remove_folder() {
 /// Remove a nonexistent folder fails.
 #[test]
 fn test_remove_nonexistent_folder_fails() {
-    let (mut engine, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine, _) = create_engine("NAS");
     let fake_folder = murmur_types::FolderId::from_data(b"nonexistent");
     let result = engine.remove_folder(fake_folder);
     assert!(result.is_err());
@@ -162,9 +162,9 @@ fn test_remove_nonexistent_folder_fails() {
 /// Folder removal syncs to remote devices.
 #[test]
 fn test_folder_removal_syncs() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     let folder_id = create_test_folder(&mut nas);
     sync_engines(&nas, &mut phone);
@@ -182,7 +182,7 @@ fn test_folder_removal_syncs() {
 /// Folder files returns only files in that folder.
 #[test]
 fn test_folder_files_isolation() {
-    let (mut engine, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut engine, _) = create_engine("NAS");
     let id = engine.device_id();
 
     let folder1 = create_test_folder(&mut engine);

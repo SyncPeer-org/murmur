@@ -4,7 +4,7 @@
 mod helpers;
 
 use helpers::*;
-use murmur_types::{AccessScope, DeviceRole};
+use murmur_types::AccessScope;
 
 // =========================================================================
 // Offline reconnect
@@ -13,9 +13,9 @@ use murmur_types::{AccessScope, DeviceRole};
 /// Device goes offline, adds files, reconnects, syncs.
 #[test]
 fn test_offline_reconnect() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     // NAS creates a folder, sync to phone, phone subscribes.
     let folder_id = create_test_folder(&mut nas);
@@ -64,9 +64,9 @@ fn test_offline_reconnect() {
 /// Multiple offline/reconnect cycles.
 #[test]
 fn test_multiple_offline_cycles() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     let nas_id = nas.device_id();
 
@@ -105,9 +105,9 @@ fn test_multiple_offline_cycles() {
 /// Revoked device's files remain, but device is marked revoked.
 #[test]
 fn test_device_revocation() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     // NAS creates a folder, sync to phone, phone subscribes.
     let folder_id = create_test_folder(&mut nas);
@@ -140,9 +140,9 @@ fn test_device_revocation() {
 /// Revoked device's access grants are separate from device revocation.
 #[test]
 fn test_revoke_device_with_grants() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     // NAS grants phone access.
     let grant = make_grant(phone_id, nas.device_id(), AccessScope::AllFiles, u64::MAX);
@@ -167,9 +167,9 @@ fn test_revoke_device_with_grants() {
 /// Request → grant → use → expiry.
 #[test]
 fn test_access_grant_lifecycle() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Backup);
+    let (mut nas, _) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     // Grant with expiration at timestamp 1000.
     let grant = make_grant(
@@ -194,9 +194,9 @@ fn test_access_grant_lifecycle() {
 /// Access grant with AllFiles scope.
 #[test]
 fn test_access_grant_all_files() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let (mut tablet, _, tablet_id) = join_engine("Tablet");
-    join_approve_sync(&mut nas, &mut tablet, tablet_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut tablet, tablet_id);
 
     let grant = make_grant(tablet_id, nas.device_id(), AccessScope::AllFiles, u64::MAX);
     nas.grant_access(grant).unwrap();
@@ -209,9 +209,9 @@ fn test_access_grant_all_files() {
 /// Revoke access explicitly.
 #[test]
 fn test_access_revoke_explicit() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     let grant = make_grant(phone_id, nas.device_id(), AccessScope::AllFiles, u64::MAX);
     nas.grant_access(grant).unwrap();
@@ -231,7 +231,7 @@ fn test_access_revoke_explicit() {
 /// Multi-MB file with blake3 integrity verification.
 #[test]
 fn test_large_file_integrity() {
-    let (mut nas, cb_nas) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, cb_nas) = create_engine("NAS");
     let nas_id = nas.device_id();
 
     // NAS creates a folder.
@@ -258,7 +258,7 @@ fn test_large_file_integrity() {
 /// Bad hash detection.
 #[test]
 fn test_large_file_bad_hash_rejected() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let nas_id = nas.device_id();
 
     // NAS creates a folder.
@@ -288,13 +288,13 @@ fn test_large_file_bad_hash_rejected() {
 /// After network partition heals, all devices reach same state.
 #[test]
 fn test_dag_convergence_after_partition() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
     let (mut tablet, _, tablet_id) = join_engine("Tablet");
 
     // Setup: approve both devices via NAS.
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
-    join_approve_sync(&mut nas, &mut tablet, tablet_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
+    join_approve_sync(&mut nas, &mut tablet, tablet_id);
     // Ensure phone sees tablet and vice versa.
     bidirectional_sync(&mut nas, &mut phone);
 
@@ -359,12 +359,12 @@ fn test_dag_convergence_after_partition() {
 /// DAG convergence with many entries from different devices.
 #[test]
 fn test_dag_convergence_many_entries() {
-    let (mut a, _) = create_engine("A", DeviceRole::Full);
+    let (mut a, _) = create_engine("A");
     let (mut b, _, id_b) = join_engine("B");
     let id_a = a.device_id();
 
     // A approves B and they sync.
-    join_approve_sync(&mut a, &mut b, id_b, DeviceRole::Full);
+    join_approve_sync(&mut a, &mut b, id_b);
 
     // A creates a folder, sync to B, B subscribes.
     let folder_id = create_test_folder(&mut a);
@@ -409,9 +409,9 @@ fn test_dag_convergence_many_entries() {
 /// File added on one device, synced, verified on the other.
 #[test]
 fn test_file_add_and_sync() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     // NAS creates a folder, sync to phone, phone subscribes.
     let folder_id = create_test_folder(&mut nas);
@@ -440,7 +440,7 @@ fn test_file_add_and_sync() {
 /// A new device joining late gets the complete history.
 #[test]
 fn test_new_device_gets_full_history() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
     let nas_id = nas.device_id();
 
     // NAS creates a folder.
@@ -460,7 +460,7 @@ fn test_new_device_gets_full_history() {
     // New phone joins late.
     let (mut phone, _, phone_id) = join_engine("Phone");
     sync_engines(&phone, &mut nas);
-    nas.approve_device(phone_id, DeviceRole::Source).unwrap();
+    nas.approve_device(phone_id).unwrap();
 
     // Full sync: NAS → Phone.
     sync_engines(&nas, &mut phone);
@@ -475,12 +475,12 @@ fn test_new_device_gets_full_history() {
 /// Multiple new devices join sequentially.
 #[test]
 fn test_sequential_device_joins() {
-    let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, _) = create_engine("NAS");
 
     let mut devices = vec![];
     for i in 0..4 {
         let (mut dev, _, dev_id) = join_engine(&format!("Device{i}"));
-        join_approve_sync(&mut nas, &mut dev, dev_id, DeviceRole::Source);
+        join_approve_sync(&mut nas, &mut dev, dev_id);
         devices.push((dev, dev_id));
     }
 
@@ -503,9 +503,9 @@ fn test_sequential_device_joins() {
 /// Verify all platform callbacks are triggered correctly.
 #[test]
 fn test_callbacks_triggered_on_sync() {
-    let (mut nas, cb_nas) = create_engine("NAS", DeviceRole::Full);
+    let (mut nas, cb_nas) = create_engine("NAS");
     let (mut phone, _, phone_id) = join_engine("Phone");
-    join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
+    join_approve_sync(&mut nas, &mut phone, phone_id);
 
     // NAS creates a folder, sync to phone, phone subscribes.
     let folder_id = create_test_folder(&mut nas);

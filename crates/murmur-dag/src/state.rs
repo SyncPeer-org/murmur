@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use murmur_types::{
-    AccessGrant, Action, BlobHash, ConflictInfo, DeviceId, DeviceInfo, DeviceRole, FileMetadata,
-    FolderId, FolderSubscription, SharedFolder,
+    AccessGrant, Action, BlobHash, ConflictInfo, DeviceId, DeviceInfo, FileMetadata, FolderId,
+    FolderSubscription, SharedFolder,
 };
 use serde::{Deserialize, Serialize};
 
@@ -70,26 +70,23 @@ impl MaterializedState {
                     .or_insert_with(|| DeviceInfo {
                         device_id: *device_id,
                         name: name.clone(),
-                        role: DeviceRole::Source,
                         approved: false,
                         approved_by: None,
                         joined_at: entry.hlc,
                     });
             }
-            Action::DeviceApproved { device_id, role } => {
+            Action::DeviceApproved { device_id, .. } => {
                 let info = self
                     .devices
                     .entry(*device_id)
                     .or_insert_with(|| DeviceInfo {
                         device_id: *device_id,
                         name: String::new(),
-                        role: *role,
                         approved: false,
                         approved_by: None,
                         joined_at: entry.hlc,
                     });
                 info.approved = true;
-                info.role = *role;
                 info.approved_by = Some(entry.device_id);
             }
             Action::DeviceRevoked { device_id } => {

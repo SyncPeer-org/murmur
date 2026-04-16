@@ -24,13 +24,11 @@ pub struct Config {
     pub network: NetworkConfig,
 }
 
-/// Device identity and role.
+/// Device identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceConfig {
     /// Human-readable device name.
     pub name: String,
-    /// Device role: "source", "backup", or "full".
-    pub role: String,
 }
 
 /// Paths for persistent storage.
@@ -67,24 +65,12 @@ fn device_key_path(base_dir: &Path) -> std::path::PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Validate role
-// ---------------------------------------------------------------------------
-
-fn validate_role(role: &str) -> Result<()> {
-    match role {
-        "source" | "backup" | "full" => Ok(()),
-        other => anyhow::bail!("unknown device role: {other:?} (expected source, backup, or full)"),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
 /// Join an existing Murmur network.
-pub fn cmd_join(base_dir: &Path, mnemonic_str: &str, name: &str, role: &str) -> Result<()> {
-    validate_role(role)?;
-
+pub fn cmd_join(base_dir: &Path, mnemonic_str: &str, name: &str) -> Result<()> {
     let cfg_path = config_path(base_dir);
     if cfg_path.exists() {
         anyhow::bail!(
@@ -111,7 +97,6 @@ pub fn cmd_join(base_dir: &Path, mnemonic_str: &str, name: &str, role: &str) -> 
     let config = Config {
         device: DeviceConfig {
             name: name.to_string(),
-            role: role.to_string(),
         },
         storage: StorageConfig {
             blob_dir: base_dir.join("blobs"),
@@ -142,7 +127,7 @@ mod tests {
     fn test_join_valid_mnemonic() {
         let mnemonic = murmur_seed::generate_mnemonic(murmur_seed::WordCount::Twelve);
         let dir = tempfile::tempdir().unwrap();
-        cmd_join(dir.path(), &mnemonic.to_string(), "Phone", "source").unwrap();
+        cmd_join(dir.path(), &mnemonic.to_string(), "Phone").unwrap();
 
         assert!(config_path(dir.path()).exists());
         assert!(mnemonic_path(dir.path()).exists());
@@ -153,15 +138,7 @@ mod tests {
     #[test]
     fn test_join_invalid_mnemonic() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_join(dir.path(), "not a valid mnemonic", "Phone", "source");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_join_invalid_role() {
-        let mnemonic = murmur_seed::generate_mnemonic(murmur_seed::WordCount::Twelve);
-        let dir = tempfile::tempdir().unwrap();
-        let result = cmd_join(dir.path(), &mnemonic.to_string(), "Phone", "bogus");
+        let result = cmd_join(dir.path(), "not a valid mnemonic", "Phone");
         assert!(result.is_err());
     }
 }

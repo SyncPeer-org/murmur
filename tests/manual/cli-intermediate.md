@@ -46,9 +46,9 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder list
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a folder list --json
 ```
 
-**Expected**: valid JSON with `folders` array. Each entry has: `folder_id` (64 hex),
-`name`, `created_by` (64 hex), `file_count`, `subscribed` (bool), `mode` (string or null),
-`local_path` (string or null).
+**Expected**: valid JSON `{"Folders": {"folders": [ ... ]}}`. Each entry has:
+`folder_id` (64 hex), `name`, `created_by` (64 hex), `file_count`,
+`subscribed` (bool), `mode` (string or null), `local_path` (string or null).
 
 **Save the default folder ID** from this output.
 
@@ -115,7 +115,8 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a folder status <DEFAULT_FO
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a folder status <DEFAULT_FOLDER_ID> --json
 ```
 
-**Expected**: valid JSON with `folder_id`, `name`, `file_count`, `conflict_count`, `sync_status`.
+**Expected**: valid JSON `{"FolderStatus": { ... }}` with `folder_id`, `name`,
+`file_count`, `conflict_count`, `sync_status` under the `FolderStatus` key.
 
 ---
 
@@ -157,16 +158,17 @@ Verify:
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder list --json
 ```
 
-**Expected**: "photos" folder shows `subscribed: true`, `mode: "read-write"`.
+**Expected**: "photos" folder shows `subscribed: true`, `mode: "full"`
+(the default — accepts the legacy alias `read-write` too).
 
 ---
 
-## I10 — Subscribe Read-Only
+## I10 — Subscribe Receive-Only
 
-Subscribe Node B to "documents" in read-only mode:
+Subscribe Node B to "documents" in receive-only mode:
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder subscribe <DOCUMENTS_FOLDER_ID> /tmp/murmur-b-docs --name "documents" --read-only
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder subscribe <DOCUMENTS_FOLDER_ID> /tmp/murmur-b-docs --name "documents" --mode receive-only
 ```
 
 **Expected**: confirmation including folder name.
@@ -175,7 +177,9 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder subscribe <DOCUMEN
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder list --json
 ```
 
-**Expected**: "documents" folder shows `subscribed: true`, `mode: "read-only"`.
+**Expected**: "documents" folder shows `subscribed: true`, `mode: "receive-only"`.
+(`read-only` is accepted as a legacy alias on the `mode` subcommand but the
+canonical value shown in output is `receive-only`.)
 
 ---
 
@@ -191,13 +195,14 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder subscribe aaaaaaaa
 
 ## I12 — Change Folder Sync Mode
 
-Change the "photos" subscription from read-write to read-only:
+Change the "photos" subscription from full to receive-only:
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder mode <PHOTOS_FOLDER_ID> read-only
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder mode <PHOTOS_FOLDER_ID> receive-only
 ```
 
-**Expected**: confirmation (e.g., "Mode changed").
+**Expected**: confirmation (e.g., "Mode changed"). `read-only` is accepted as
+a legacy alias for `receive-only`.
 
 Verify:
 
@@ -205,15 +210,16 @@ Verify:
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder list --json
 ```
 
-**Expected**: "photos" folder now shows `mode: "read-only"`.
+**Expected**: "photos" folder now shows `mode: "receive-only"`.
 
 Change it back:
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder mode <PHOTOS_FOLDER_ID> read-write
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder mode <PHOTOS_FOLDER_ID> full
 ```
 
-**Expected**: confirmation. Mode reverts to "read-write".
+**Expected**: confirmation. Mode reverts to "full" (the legacy alias
+`read-write` is also accepted).
 
 ---
 
@@ -251,7 +257,7 @@ folders are not shown.
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a folder files <DEFAULT_FOLDER_ID> --json
 ```
 
-**Expected**: valid JSON with `files` array.
+**Expected**: valid JSON `{"Files": {"files": [ ... ]}}`.
 
 ---
 
@@ -265,9 +271,11 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a folder files <PHOTOS_FOLD
 
 ---
 
-## I15 — Add File and Verify in Folder
+## I15 — Add File Lands in "default" Folder
 
-Add a file:
+Add a file. With `photos` and `documents` already created, verify `add`
+still targets the folder named "default" (not the first folder in BTreeMap
+order):
 
 ```bash
 echo "Hello from Node A — $(date)" > /tmp/test-file-a.txt
@@ -278,9 +286,11 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a add /tmp/test-file-a.txt
 
 ```bash
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a folder files <DEFAULT_FOLDER_ID>
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a folder files <PHOTOS_FOLDER_ID>
 ```
 
-**Expected**: `test-file-a.txt` in the default folder file list.
+**Expected**: `test-file-a.txt` appears in the `default` folder, and the
+`photos` folder still returns "No synced files.".
 
 ---
 
@@ -298,11 +308,13 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a add /tmp/test.bin
 ```
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a files
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a files --json
 ```
 
-**Expected**: MIME types reflect file content — e.g., `application/json`, `text/html`,
-`application/octet-stream` (or similar). Verify these are plausible types.
+**Expected**: MIME types reflect the extension — `application/json` for
+`.json`, `text/html` for `.html`, `application/octet-stream` for `.bin`
+(the fallback for unknown/extension-less files). No entry should show
+`mime_type: null`.
 
 ---
 
@@ -347,8 +359,8 @@ and percentage, or "No active transfers." if already complete.
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a transfers --json
 ```
 
-**Expected**: valid JSON with `transfers` array. Each entry has `blob_hash`,
-`bytes_transferred`, `total_bytes`.
+**Expected**: valid JSON `{"TransferStatus": {"transfers": [ ... ]}}`. Each
+entry has `blob_hash`, `bytes_transferred`, `total_bytes`.
 
 ---
 
@@ -366,7 +378,7 @@ Verify integrity:
 
 ```bash
 b3sum /tmp/test-large.bin
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b files --json | jq '.files[] | select(.path | contains("test-large.bin")) | .blob_hash'
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b files --json | jq '.Files.files[] | select(.path | contains("test-large.bin")) | .blob_hash'
 ```
 
 **Expected**: hashes match.
@@ -445,7 +457,7 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a conflicts
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a conflicts --json
 ```
 
-**Expected**: valid JSON with `conflicts` array (empty).
+**Expected**: valid JSON `{"Conflicts": {"conflicts": []}}`.
 
 ---
 
@@ -499,8 +511,8 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a history <DEFAULT_FOLDER_I
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a history <DEFAULT_FOLDER_ID> test-file-a.txt --json
 ```
 
-**Expected**: valid JSON with `versions` array. Each entry has `blob_hash`, `device_id`,
-`device_name`, `modified_at`, `size`.
+**Expected**: valid JSON `{"FileVersions": {"versions": [ ... ]}}`. Each entry
+has `blob_hash`, `device_id`, `device_name`, `modified_at`, `size`.
 
 ---
 
@@ -583,7 +595,7 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b folder list
 Stop Node A (Ctrl+C). Restart it:
 
 ```bash
-cargo run --bin murmurd -- --data-dir /tmp/murmur-a --name node-a --role full
+cargo run --bin murmurd -- --data-dir /tmp/murmur-a --name node-a
 ```
 
 ```bash
@@ -607,8 +619,8 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a folder list --json
 ## I34 — DAG Consistency After All Operations
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a status --json | jq .dag_entries
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b status --json | jq .dag_entries
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a status --json | jq .Status.dag_entries
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b status --json | jq .Status.dag_entries
 ```
 
 **Expected**: both nodes report the same DAG entry count.
@@ -636,13 +648,13 @@ rm -f /tmp/test-large.bin /tmp/test-offline.txt /tmp/test-off1.txt /tmp/test-off
 | I7 | Status non-existent folder | Error response |
 | I8 | Status invalid hex | Error about invalid folder ID |
 | I9 | Subscribe | Node B subscribed to "photos" |
-| I10 | Subscribe read-only | "documents" subscribed in read-only mode |
+| I10 | Subscribe receive-only | "documents" subscribed in receive-only mode |
 | I11 | Subscribe non-existent | Error response |
-| I12 | Change mode | Mode switches between read-write and read-only |
+| I12 | Change mode | Mode switches between full and receive-only |
 | I13 | Folder files | Lists only files in specified folder |
 | I14 | Folder files (empty) | Empty result for folder with no files |
-| I15 | Add file to folder | File appears in folder-specific listing |
-| I16 | MIME detection | Different file types get appropriate MIME types |
+| I15 | Add lands in "default" | File appears under the folder named "default" |
+| I16 | MIME detection | Known extensions map correctly; unknown/no extension → `application/octet-stream`, never `null` |
 | I17 | Dedup | Same file content produces same blob hash |
 | I18 | Large file add | 5 MB file added successfully |
 | I19 | Transfer status | Shows active/completed transfers, valid JSON |

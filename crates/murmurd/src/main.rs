@@ -56,10 +56,6 @@ struct Cli {
     #[arg(long, default_value = "murmurd")]
     name: String,
 
-    /// Device role: source, backup, or full (only used on first run).
-    #[arg(long, default_value = "backup")]
-    role: String,
-
     /// Increase log verbosity (debug level).
     #[arg(long, short)]
     verbose: bool,
@@ -84,7 +80,7 @@ fn main() -> Result<()> {
         )
         .init();
 
-    run_daemon(&cli.data_dir, &cli.name, &cli.role, cli.http_port)
+    run_daemon(&cli.data_dir, &cli.name, cli.http_port)
 }
 
 // ---------------------------------------------------------------------------
@@ -95,12 +91,7 @@ fn main() -> Result<()> {
 ///
 /// On first run (no config.toml), automatically creates a new network,
 /// generates a mnemonic, writes config, and prints the mnemonic.
-fn run_daemon(
-    base_dir: &Path,
-    default_name: &str,
-    default_role: &str,
-    http_port: Option<u16>,
-) -> Result<()> {
+fn run_daemon(base_dir: &Path, default_name: &str, http_port: Option<u16>) -> Result<()> {
     // Check for a LeaveNetwork marker from a previous run.
     // If present, wipe the entire data directory and start fresh.
     // Preserve any mnemonic the desktop app pre-wrote for a Join flow.
@@ -126,7 +117,7 @@ fn run_daemon(
     // Auto-initialize on first run (or after a wipe).
     let first_run = !config_path.exists();
     if first_run {
-        auto_init(base_dir, default_name, default_role)?;
+        auto_init(base_dir, default_name)?;
     }
 
     let config = Config::load(&config_path).context("load config")?;
@@ -140,19 +131,29 @@ fn run_daemon(
 
     // Determine device key. Zeroize raw key bytes after use.
     let device_key_path = Config::device_key_path(base_dir);
-    let (device_id, signing_key) = if device_key_path.exists() {
+    let (device_id, signing_key, my_iroh_key) = if device_key_path.exists() {
         let mut raw_bytes = std::fs::read(&device_key_path).context("read device key")?;
         let bytes: [u8; 32] = raw_bytes
             .clone()
             .try_into()
             .map_err(|_| anyhow::anyhow!("device key file must be 32 bytes"))?;
         raw_bytes.zeroize();
+        // Derive a stable iroh secret from the signing key bytes so the iroh
+        // endpoint ID is identical across restarts. Without this, joiners
+        // generate a fresh random iroh key each startup, which breaks peer
+        // reconnection whenever one side of the network restarts.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"murmur/device-iroh-key-v1");
+        hasher.update(&bytes);
+        let iroh_key = *hasher.finalize().as_bytes();
         let kp = murmur_seed::DeviceKeyPair::from_bytes(bytes);
-        (kp.device_id(), kp.signing_key().clone())
+        (kp.device_id(), kp.signing_key().clone(), iroh_key)
     } else {
+        // Creator: mnemonic-derived iroh key, computed below next to network_id.
         (
             identity.first_device_id(),
             identity.first_device_signing_key().clone(),
+            identity.creator_iroh_key_bytes(),
         )
     };
 
@@ -186,9 +187,6 @@ fn run_daemon(
     // 1. Restart (has persisted DAG entries) → load from storage, no new entries.
     // 2. First run as creator (no device.key) → create_network (auto-approves).
     // 3. First run as joiner (has device.key) → join_network (sends join request).
-    let device_role = config
-        .parse_role()
-        .unwrap_or(murmur_types::DeviceRole::Backup);
     let persisted_entries = storage.load_all_dag_entries()?;
     let is_joiner = device_key_path.exists();
 
@@ -223,7 +221,6 @@ fn run_daemon(
             device_id,
             signing_key,
             config.device.name.clone(),
-            device_role,
             platform,
         )
     };
@@ -280,6 +277,7 @@ fn run_daemon(
             storage.clone(),
             device_id,
             creator_iroh_key,
+            my_iroh_key,
             is_creator,
             topic,
             config.network.throttle.clone(),
@@ -350,10 +348,7 @@ fn run_daemon(
                 }
             };
             let folder_id = FolderId::from_bytes(folder_id_bytes);
-            let mode = match fc.mode.as_str() {
-                "read-only" => SyncMode::ReadOnly,
-                _ => SyncMode::ReadWrite,
-            };
+            let mode = SyncMode::from_str_loose(&fc.mode).unwrap_or(SyncMode::Full);
 
             // Create local directory if it doesn't exist.
             if let Err(e) = std::fs::create_dir_all(&fc.local_path) {
@@ -491,6 +486,13 @@ fn run_daemon(
 
                 for (folder_id, path) in pending {
                     if let Some(folder) = folders_for_blob.get(&folder_id) {
+                        if !folder.mode.can_receive() {
+                            debug!(
+                                path = %path,
+                                "blob_arrived: skipping reverse sync for send-only folder"
+                            );
+                            continue;
+                        }
                         if let Err(e) = sync::reverse_sync_file(
                             folder,
                             &path,
@@ -748,10 +750,7 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                 .collect();
             CliResponse::Pending { devices }
         }
-        CliRequest::ApproveDevice {
-            device_id_hex,
-            role,
-        } => {
+        CliRequest::ApproveDevice { device_id_hex } => {
             let device_id = match parse_device_id(&device_id_hex) {
                 Ok(id) => id,
                 Err(e) => {
@@ -760,25 +759,15 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                     };
                 }
             };
-            let device_role = match role.as_str() {
-                "source" => murmur_types::DeviceRole::Source,
-                "backup" => murmur_types::DeviceRole::Backup,
-                "full" => murmur_types::DeviceRole::Full,
-                other => {
-                    return CliResponse::Error {
-                        message: format!("unknown role: {other:?}"),
-                    };
-                }
-            };
             let mut eng = ctx.engine.lock().unwrap();
-            match eng.approve_device(device_id, device_role) {
+            match eng.approve_device(device_id) {
                 Ok(entry) => {
                     let _ = ctx.broadcast_tx.send(entry.to_bytes());
                     if let Err(e) = ctx.storage.flush() {
                         error!(error = %e, "flush after approve");
                     }
                     CliResponse::Ok {
-                        message: format!("Device {device_id} approved with role {role}."),
+                        message: format!("Device {device_id} approved."),
                     }
                 }
                 Err(e) => CliResponse::Error {
@@ -878,7 +867,7 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                                 folder_id: folder.folder_id.to_string(),
                                 name: folder.name.clone(),
                                 local_path: local.clone(),
-                                mode: "read-write".to_string(),
+                                mode: SyncMode::Full.as_str().to_string(),
                             });
                             persist_config(ctx, &cfg);
                         }
@@ -1017,7 +1006,7 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                         created_by: f.created_by.to_string(),
                         file_count,
                         subscribed: sub.is_some(),
-                        mode: sub.map(|s| s.mode.to_string()),
+                        mode: sub.map(|s| s.mode.as_str().to_string()),
                         local_path,
                         sync_status,
                     }
@@ -1035,10 +1024,7 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                 Ok(id) => id,
                 Err(e) => return CliResponse::Error { message: e },
             };
-            let sync_mode = match mode.as_str() {
-                "read-only" => SyncMode::ReadOnly,
-                _ => SyncMode::ReadWrite,
-            };
+            let sync_mode = SyncMode::from_str_loose(&mode).unwrap_or(SyncMode::Full);
             let mut eng = ctx.engine.lock().unwrap();
             // Resolve the display name: explicit name > folder's original name > folder_id.
             let folder_name = name
@@ -1250,12 +1236,13 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                 Ok(id) => id,
                 Err(e) => return CliResponse::Error { message: e },
             };
-            let sync_mode = match mode.as_str() {
-                "read-only" => SyncMode::ReadOnly,
-                "read-write" => SyncMode::ReadWrite,
-                other => {
+            let sync_mode = match SyncMode::from_str_loose(&mode) {
+                Some(m) => m,
+                None => {
                     return CliResponse::Error {
-                        message: format!("unknown mode: {other:?} (use read-write or read-only)"),
+                        message: format!(
+                            "unknown mode: {mode:?} (use full, send-only, or receive-only)"
+                        ),
                     };
                 }
             };
@@ -1383,7 +1370,6 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                 .collect();
             CliResponse::Config {
                 device_name: cfg.device.name.clone(),
-                device_role: cfg.device.role.clone(),
                 network_id: ctx.network_id_hex.clone(),
                 folders,
                 auto_approve: cfg.network.auto_approve,
@@ -1465,7 +1451,7 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                         file_count,
                         subscriber_count,
                         subscribed: my_sub.is_some(),
-                        mode: my_sub.map(|s| s.mode.to_string()),
+                        mode: my_sub.map(|s| s.mode.as_str().to_string()),
                     })
                 })
                 .collect();
@@ -1490,7 +1476,7 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                     FolderSubscriberIpc {
                         device_id: sub.device_id.to_string(),
                         device_name,
-                        mode: sub.mode.to_string(),
+                        mode: sub.mode.as_str().to_string(),
                     }
                 })
                 .collect();
@@ -1590,12 +1576,10 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                 .into_iter()
                 .filter(|d| d.approved)
                 .map(|d| {
-                    let (_, last_seen) =
-                        presence.get(&d.device_id).copied().unwrap_or((false, 0));
+                    let (_, last_seen) = presence.get(&d.device_id).copied().unwrap_or((false, 0));
                     let is_local = d.device_id == eng.device_id();
                     let online = is_local
-                        || (last_seen > 0
-                            && now.saturating_sub(last_seen) < ONLINE_THRESHOLD_SECS);
+                        || (last_seen > 0 && now.saturating_sub(last_seen) < ONLINE_THRESHOLD_SECS);
                     DevicePresenceIpc {
                         device_id: d.device_id.to_string(),
                         device_name: d.name,
@@ -1856,10 +1840,9 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                 .into_iter()
                 .filter(|d| d.approved && d.device_id != device_id)
                 .map(|d| {
-                    let (_, last_seen) =
-                        presence.get(&d.device_id).copied().unwrap_or((false, 0));
-                    let online = last_seen > 0
-                        && now.saturating_sub(last_seen) < ONLINE_THRESHOLD_SECS;
+                    let (_, last_seen) = presence.get(&d.device_id).copied().unwrap_or((false, 0));
+                    let online =
+                        last_seen > 0 && now.saturating_sub(last_seen) < ONLINE_THRESHOLD_SECS;
                     let conn_type = if online { "direct" } else { "relay" };
                     PeerInfoIpc {
                         device_id: d.device_id.to_string(),
@@ -1962,10 +1945,9 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                 .into_iter()
                 .filter(|d| d.approved && d.device_id != device_id)
                 .map(|d| {
-                    let (_, last_seen) =
-                        presence.get(&d.device_id).copied().unwrap_or((false, 0));
-                    let online = last_seen > 0
-                        && now.saturating_sub(last_seen) < ONLINE_THRESHOLD_SECS;
+                    let (_, last_seen) = presence.get(&d.device_id).copied().unwrap_or((false, 0));
+                    let online =
+                        last_seen > 0 && now.saturating_sub(last_seen) < ONLINE_THRESHOLD_SECS;
                     serde_json::json!({
                         "device_id": d.device_id.to_string(),
                         "name": d.name,
@@ -2039,12 +2021,15 @@ fn process_add_file(path: String, ctx: &DaemonCtx) -> CliResponse {
 
     let mut eng = ctx.engine.lock().unwrap();
 
-    // Get or create a default folder for the file.
+    // Get or create the "default" folder for the file. Prefer a folder
+    // literally named "default"; if none exists, create one. Fall back to
+    // the first folder only as a legacy safety net for networks whose
+    // default folder was renamed.
     let folder_id = {
         let folders = eng.list_folders();
-        if let Some(f) = folders.first() {
+        if let Some(f) = folders.iter().find(|f| f.name == "default") {
             f.folder_id
-        } else {
+        } else if folders.is_empty() {
             match eng.create_folder("default") {
                 Ok((folder, entries)) => {
                     for entry in &entries {
@@ -2058,6 +2043,8 @@ fn process_add_file(path: String, ctx: &DaemonCtx) -> CliResponse {
                     };
                 }
             }
+        } else {
+            folders[0].folder_id
         }
     };
 
@@ -2068,7 +2055,7 @@ fn process_add_file(path: String, ctx: &DaemonCtx) -> CliResponse {
         .iter()
         .any(|s| s.device_id == device_id);
     if !already_subscribed {
-        match eng.subscribe_folder(folder_id, murmur_types::SyncMode::ReadWrite) {
+        match eng.subscribe_folder(folder_id, murmur_types::SyncMode::Full) {
             Ok(entry) => {
                 let _ = ctx.broadcast_tx.send(entry.to_bytes());
             }
@@ -2118,7 +2105,7 @@ fn process_add_file(path: String, ctx: &DaemonCtx) -> CliResponse {
 // ---------------------------------------------------------------------------
 
 /// Initialize a new network on first run.
-fn auto_init(base_dir: &Path, name: &str, role: &str) -> Result<()> {
+fn auto_init(base_dir: &Path, name: &str) -> Result<()> {
     std::fs::create_dir_all(base_dir).context("create base directory")?;
 
     // Use existing mnemonic (written by desktop join flow) or generate a new one.
@@ -2150,7 +2137,7 @@ fn auto_init(base_dir: &Path, name: &str, role: &str) -> Result<()> {
     };
 
     // Write config.
-    let config = Config::new(base_dir, name, role);
+    let config = Config::new(base_dir, name);
     let toml_str = toml::to_string_pretty(&config).context("serialize config")?;
     std::fs::write(Config::config_path(base_dir), toml_str).context("write config")?;
 
@@ -2187,7 +2174,6 @@ fn device_to_ipc(dev: murmur_types::DeviceInfo) -> DeviceInfoIpc {
     DeviceInfoIpc {
         device_id: dev.device_id.to_string(),
         name: dev.name,
-        role: format!("{:?}", dev.role).to_lowercase(),
         approved: dev.approved,
     }
 }
@@ -2210,20 +2196,57 @@ fn parse_device_id(hex_str: &str) -> Result<DeviceId> {
 }
 
 /// Simple MIME type guess from file extension.
+///
+/// Returns `application/octet-stream` when the extension is unknown or the
+/// filename has no extension, so callers always get a non-null MIME.
 fn guess_mime(filename: &str) -> Option<String> {
-    let ext = filename.rsplit('.').next()?.to_lowercase();
-    let mime = match ext.as_str() {
+    let lower = filename.to_lowercase();
+    let ext = match lower.rsplit_once('.') {
+        Some((_, e)) => e,
+        None => return Some("application/octet-stream".to_string()),
+    };
+    let mime = match ext {
         "jpg" | "jpeg" => "image/jpeg",
         "png" => "image/png",
         "gif" => "image/gif",
         "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
         "mp4" => "video/mp4",
         "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "ogg" => "audio/ogg",
         "pdf" => "application/pdf",
-        "txt" => "text/plain",
+        "txt" | "log" => "text/plain",
+        "md" | "markdown" => "text/markdown",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" | "mjs" => "text/javascript",
+        "xml" => "application/xml",
+        "csv" => "text/csv",
+        "tsv" => "text/tab-separated-values",
         "json" => "application/json",
+        "yaml" | "yml" => "application/yaml",
+        "toml" => "application/toml",
         "zip" => "application/zip",
-        _ => return None,
+        "tar" => "application/x-tar",
+        "gz" | "tgz" => "application/gzip",
+        "bz2" => "application/x-bzip2",
+        "xz" => "application/x-xz",
+        "7z" => "application/x-7z-compressed",
+        "rar" => "application/vnd.rar",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        _ => "application/octet-stream",
     };
     Some(mime.to_string())
 }
@@ -2391,9 +2414,9 @@ fn engine_event_to_ipc(event: &murmur_engine::EngineEvent, _ctx: &DaemonCtx) -> 
                 escape_json(name)
             ),
         },
-        EngineEvent::DeviceApproved { device_id, role } => EngineEventIpc {
+        EngineEvent::DeviceApproved { device_id } => EngineEventIpc {
             event_type: "device_approved".to_string(),
-            data: format!("{{\"device_id\":\"{device_id}\",\"role\":\"{role:?}\"}}"),
+            data: format!("{{\"device_id\":\"{device_id}\"}}"),
         },
         EngineEvent::DeviceRevoked { device_id } => EngineEventIpc {
             event_type: "device_revoked".to_string(),
@@ -2558,7 +2581,6 @@ mod tests {
             device_id,
             signing_key,
             "TestDaemon".to_string(),
-            murmur_types::DeviceRole::Backup,
             platform,
         );
 
@@ -2566,7 +2588,7 @@ mod tests {
         let (event_broadcast, _) =
             tokio::sync::broadcast::channel::<murmur_engine::EngineEvent>(16);
 
-        let config = Config::new(dir, "TestDaemon", "backup");
+        let config = Config::new(dir, "TestDaemon");
         DaemonCtx {
             engine: Arc::new(Mutex::new(engine)),
             storage,
@@ -2678,7 +2700,6 @@ mod tests {
         let resp = process_request(
             CliRequest::ApproveDevice {
                 device_id_hex: "not-valid-hex".to_string(),
-                role: "backup".to_string(),
             },
             &ctx,
         );
@@ -2686,27 +2707,6 @@ mod tests {
         match resp {
             CliResponse::Error { message } => {
                 assert!(!message.is_empty());
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_process_request_approve_invalid_role() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(dir.path());
-
-        let resp = process_request(
-            CliRequest::ApproveDevice {
-                device_id_hex: "ff".repeat(32),
-                role: "bogus".to_string(),
-            },
-            &ctx,
-        );
-
-        match resp {
-            CliResponse::Error { message } => {
-                assert!(message.contains("unknown role"), "got: {message}");
             }
             other => panic!("expected Error, got {other:?}"),
         }
@@ -2876,7 +2876,7 @@ mod tests {
     #[test]
     fn test_auto_init_creates_config_and_mnemonic() {
         let dir = tempfile::tempdir().unwrap();
-        auto_init(dir.path(), "TestNAS", "backup").unwrap();
+        auto_init(dir.path(), "TestNAS").unwrap();
 
         assert!(Config::config_path(dir.path()).exists());
         assert!(Config::mnemonic_path(dir.path()).exists());
@@ -2886,7 +2886,6 @@ mod tests {
         // Config should be loadable and have correct values.
         let config = Config::load(&Config::config_path(dir.path())).unwrap();
         assert_eq!(config.device.name, "TestNAS");
-        assert_eq!(config.device.role, "backup");
 
         // Mnemonic should be valid.
         let mnemonic_str = std::fs::read_to_string(Config::mnemonic_path(dir.path())).unwrap();
@@ -2928,7 +2927,7 @@ mod tests {
         }
 
         // 2. auto_init (first_run because config.toml is gone after wipe).
-        auto_init(base, "JoinDevice", "backup").unwrap();
+        auto_init(base, "JoinDevice").unwrap();
 
         // The mnemonic on disk must be the one the user entered, not a random one.
         let on_disk = std::fs::read_to_string(Config::mnemonic_path(base)).unwrap();
@@ -2960,7 +2959,7 @@ mod tests {
         let user_mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         std::fs::write(Config::mnemonic_path(base), user_mnemonic).unwrap();
 
-        auto_init(base, "JoiningDevice", "full").unwrap();
+        auto_init(base, "JoiningDevice").unwrap();
 
         // device.key must exist so is_joiner = true.
         assert!(
@@ -2978,7 +2977,7 @@ mod tests {
     #[test]
     fn test_auto_init_skipped_when_config_exists() {
         let dir = tempfile::tempdir().unwrap();
-        auto_init(dir.path(), "First", "backup").unwrap();
+        auto_init(dir.path(), "First").unwrap();
 
         // Config exists, so run_daemon would skip auto_init.
         assert!(Config::config_path(dir.path()).exists());
@@ -3005,7 +3004,23 @@ mod tests {
         assert_eq!(guess_mime("photo.jpg"), Some("image/jpeg".to_string()));
         assert_eq!(guess_mime("doc.pdf"), Some("application/pdf".to_string()));
         assert_eq!(guess_mime("video.mp4"), Some("video/mp4".to_string()));
-        assert_eq!(guess_mime("unknown.xyz"), None);
+        assert_eq!(guess_mime("index.html"), Some("text/html".to_string()));
+        assert_eq!(guess_mime("notes.md"), Some("text/markdown".to_string()));
+        assert_eq!(guess_mime("style.css"), Some("text/css".to_string()));
+        assert_eq!(guess_mime("script.js"), Some("text/javascript".to_string()));
+        // Unknown extensions and extension-less files fall back to octet-stream.
+        assert_eq!(
+            guess_mime("unknown.xyz"),
+            Some("application/octet-stream".to_string())
+        );
+        assert_eq!(
+            guess_mime("README"),
+            Some("application/octet-stream".to_string())
+        );
+        assert_eq!(
+            guess_mime("random.bin"),
+            Some("application/octet-stream".to_string())
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3089,7 +3104,7 @@ mod tests {
             CliResponse::Folders { folders } => {
                 let f = folders.iter().find(|f| f.name == "Docs").unwrap();
                 assert!(f.subscribed, "creator should be auto-subscribed");
-                assert_eq!(f.mode.as_deref(), Some("read-write"));
+                assert_eq!(f.mode.as_deref(), Some("full"));
             }
             other => panic!("expected Folders, got {other:?}"),
         }
@@ -3125,7 +3140,7 @@ mod tests {
             CliResponse::Folders { folders } => {
                 let f = folders.iter().find(|f| f.name == "Docs").unwrap();
                 assert!(f.subscribed);
-                assert_eq!(f.mode.as_deref(), Some("read-only"));
+                assert_eq!(f.mode.as_deref(), Some("receive-only"));
             }
             other => panic!("expected Folders, got {other:?}"),
         }
@@ -3281,7 +3296,7 @@ mod tests {
         );
         match resp2 {
             CliResponse::Ok { message } => {
-                assert!(message.contains("read-only"), "got: {message}");
+                assert!(message.contains("Receive only"), "got: {message}");
             }
             other => panic!("expected Ok, got {other:?}"),
         }
@@ -3291,7 +3306,7 @@ mod tests {
         match resp3 {
             CliResponse::Folders { folders } => {
                 let f = folders.iter().find(|f| f.name == "Setmode").unwrap();
-                assert_eq!(f.mode.as_deref(), Some("read-only"));
+                assert_eq!(f.mode.as_deref(), Some("receive-only"));
             }
             other => panic!("expected Folders, got {other:?}"),
         }
@@ -3679,7 +3694,6 @@ mod tests {
                 device_id,
                 signing_key.clone(),
                 "TestDaemon".to_string(),
-                murmur_types::DeviceRole::Backup,
                 platform,
             );
 
@@ -3687,7 +3701,7 @@ mod tests {
             let (event_broadcast, _) =
                 tokio::sync::broadcast::channel::<murmur_engine::EngineEvent>(16);
 
-            let config = Config::new(dir.path(), "TestDaemon", "backup");
+            let config = Config::new(dir.path(), "TestDaemon");
             let ctx = DaemonCtx {
                 engine: Arc::new(Mutex::new(engine)),
                 storage: storage.clone(),
@@ -3704,6 +3718,7 @@ mod tests {
                 sync_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 paused_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 device_presence: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                endpoint: None,
             };
 
             // Create a folder with a local path.
@@ -3787,6 +3802,7 @@ mod tests {
                 sync_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 paused_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 device_presence: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                endpoint: None,
             };
 
             // Verify folder survives restart.

@@ -45,8 +45,6 @@ pub enum CliRequest {
     ApproveDevice {
         /// Device ID as 64-character hex string.
         device_id_hex: String,
-        /// Role: "source", "backup", or "full".
-        role: String,
     },
     /// Revoke an approved device.
     RevokeDevice {
@@ -90,7 +88,7 @@ pub enum CliRequest {
         name: Option<String>,
         /// Local directory path for the folder's files.
         local_path: String,
-        /// Sync mode: "read-write" or "read-only".
+        /// Sync mode: "full", "send-only", or "receive-only".
         mode: String,
     },
     /// Unsubscribe this device from a folder.
@@ -135,7 +133,7 @@ pub enum CliRequest {
     SetFolderMode {
         /// Folder ID as 64-character hex string.
         folder_id_hex: String,
-        /// New sync mode: "read-write" or "read-only".
+        /// New sync mode: "full", "send-only", or "receive-only".
         mode: String,
     },
 
@@ -403,8 +401,6 @@ pub enum CliResponse {
     Config {
         /// Device name.
         device_name: String,
-        /// Device role.
-        device_role: String,
         /// Network ID (hex).
         network_id: String,
         /// Folder configurations.
@@ -497,8 +493,6 @@ pub struct DeviceInfoIpc {
     pub device_id: String,
     /// Human-readable name.
     pub name: String,
-    /// Role: "source", "backup", or "full".
-    pub role: String,
     /// Whether the device is approved.
     pub approved: bool,
 }
@@ -612,7 +606,7 @@ pub struct FolderConfigIpc {
     pub name: String,
     /// Local path on disk.
     pub local_path: String,
-    /// Sync mode: "read-write" or "read-only".
+    /// Sync mode: "full", "send-only", or "receive-only".
     pub mode: String,
     /// Auto-resolve strategy: "none", "newest", or "mine".
     pub auto_resolve: String,
@@ -755,7 +749,6 @@ mod tests {
     fn test_request_roundtrip_approve() {
         let req = CliRequest::ApproveDevice {
             device_id_hex: "ab".repeat(32),
-            role: "backup".to_string(),
         };
         let bytes = postcard::to_allocvec(&req).unwrap();
         let decoded: CliRequest = postcard::from_bytes(&bytes).unwrap();
@@ -790,7 +783,6 @@ mod tests {
             CliRequest::ListPending,
             CliRequest::ApproveDevice {
                 device_id_hex: "aa".repeat(32),
-                role: "full".to_string(),
             },
             CliRequest::RevokeDevice {
                 device_id_hex: "bb".repeat(32),
@@ -953,7 +945,6 @@ mod tests {
             devices: vec![DeviceInfoIpc {
                 device_id: "ab".repeat(32),
                 name: "Phone".to_string(),
-                role: "source".to_string(),
                 approved: true,
             }],
         };
@@ -1113,7 +1104,6 @@ mod tests {
             // M19a
             CliResponse::Config {
                 device_name: "NAS".to_string(),
-                device_role: "backup".to_string(),
                 network_id: "aa".repeat(32),
                 folders: vec![FolderConfigIpc {
                     folder_id: "bb".repeat(32),
@@ -1430,13 +1420,11 @@ mod tests {
                 DeviceInfoIpc {
                     device_id: "aa".repeat(32),
                     name: "Phone".to_string(),
-                    role: "source".to_string(),
                     approved: true,
                 },
                 DeviceInfoIpc {
                     device_id: "bb".repeat(32),
                     name: "NAS".to_string(),
-                    role: "backup".to_string(),
                     approved: true,
                 },
             ],

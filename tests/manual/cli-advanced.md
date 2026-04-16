@@ -42,7 +42,7 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a devices
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a devices --json
 ```
 
-**Expected**: JSON `devices` array with one entry.
+**Expected**: JSON `{"Devices": {"devices": [ ... ]}}` with one entry.
 
 ---
 
@@ -80,20 +80,22 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a revoke aaaaaaaaaaaaaaaaaa
 ## A5 — Approve Invalid Device ID Format
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a approve "not-hex" --role backup
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a approve "not-hex"
 ```
 
 **Expected**: error about invalid device ID. Non-zero exit code.
 
 ---
 
-## A6 — Approve with Invalid Role
+## A6 — Approve Rejects Unknown Flags
 
 ```bash
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a approve aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --role superadmin
 ```
 
-**Expected**: error about invalid role. Non-zero exit code.
+**Expected**: clap error — "unexpected argument '--role'". Non-zero exit code.
+(There is no `--role` flag on `approve`; the approve action doesn't carry a
+role.)
 
 ---
 
@@ -105,7 +107,7 @@ Stop Node B (Ctrl+C in Terminal 2).
 
 ```bash
 rm -rf /tmp/murmur-b
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b join "<MNEMONIC>" --name "node-b-v2" --role full
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b join "<MNEMONIC>" --name "node-b-v2"
 ```
 
 Restart Node B:
@@ -121,12 +123,14 @@ Wait for the join request to appear:
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a pending
 ```
 
-**Expected**: "node-b-v2" appears as pending.
+**Expected**: exactly one entry — "node-b-v2" (the newly joined device).
+The previously revoked node-b MUST NOT appear. If both show, that's a
+regression of the "revoked-device-in-pending" bug fix.
 
 Approve:
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a approve <NEW_NODE_B_DEVICE_ID> --role full
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a approve <NEW_NODE_B_DEVICE_ID>
 ```
 
 **Expected**: "Device approved". Both nodes see both devices after a few seconds.
@@ -212,22 +216,37 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a mnemonic
 ## A14 — Restart Persistence: Status DAG Count
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a status --json | jq .dag_entries
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a status --json | jq .Status.dag_entries
 ```
 
 **Expected**: DAG entry count matches the pre-restart count.
 
 ---
 
-## A15 — Restart Persistence: Reconnection
+## A15 — Restart Persistence: Reconnection (Single-Node Restart)
 
-Wait 5-10 seconds after both daemons are running:
+This exercises the asymmetric-restart scenario: stop only one daemon and
+confirm the mesh re-forms after it comes back. Both sides must use a
+stable (deterministic) iroh endpoint ID, and the side that still has
+bootstrap peers re-dials every few seconds.
+
+With both daemons up and `Peers: 1`, stop only Node A (Ctrl+C), then
+restart it:
+
+```bash
+cargo run --bin murmurd -- --data-dir /tmp/murmur-a --name node-a --verbose
+```
+
+Poll both nodes for ~30 seconds:
 
 ```bash
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a status
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b status
 ```
 
-**Expected**: `Peers: 1` — both nodes reconnected after restart.
+**Expected**: both report `Peers: 1` within ~30 seconds (usually within a
+few). If `peer_count` stays at 0 for more than 30 seconds that's a
+regression of the peer-reconnect fix.
 
 ---
 
@@ -239,8 +258,10 @@ Verify the on-disk state of Node A:
 cat /tmp/murmur-a/config.toml
 ```
 
-**Expected**: `name = "node-a"`, `role = "full"`, blob_dir and data_dir paths set.
-Each `[[folders]]` section should include a `name` field with the folder's display name.
+**Expected**: `name = "node-a"`, with `data_dir`/`blob_dir` paths and the
+`[network]`/`[throttle]` sections. `config.toml` does NOT contain a `role`
+field or `[[folders]]` sections — roles are a legacy concept and folder
+metadata lives in the DAG / Fjall store, not in `config.toml`.
 
 ```bash
 cat /tmp/murmur-a/mnemonic
@@ -252,19 +273,27 @@ cat /tmp/murmur-a/mnemonic
 ls /tmp/murmur-a/device.key 2>/dev/null || echo "no device.key (expected for creator)"
 ```
 
-**Expected**: creator may not have a separate device.key (uses HKDF-derived key).
+**Expected**: creator does NOT have a separate `device.key` (creator uses
+the HKDF-derived first-device key from the mnemonic).
 
 ```bash
 ls /tmp/murmur-a/db/
 ```
 
-**Expected**: Fjall database files/directories present.
+**Expected**: Fjall database files/directories present (the push queue).
 
 ```bash
 ls /tmp/murmur-a/blobs/
 ```
 
 **Expected**: content-addressed blob directory structure.
+
+```bash
+ls /tmp/murmur-a/dag.bin
+```
+
+**Expected**: a `dag.bin` file — the flat append-only log of signed DAG
+entries.
 
 ---
 
@@ -276,13 +305,13 @@ Verify Node B's on-disk state:
 cat /tmp/murmur-b/config.toml
 ```
 
-**Expected**: `name = "node-b-v2"`, `role = "full"`.
+**Expected**: `name = "node-b-v2"`. No `role` field (legacy concept removed).
 
 ```bash
 ls -la /tmp/murmur-b/device.key
 ```
 
-**Expected**: 32-byte file (joining device generates a random key).
+**Expected**: 32-byte file (joining device generates a random signing key).
 
 ---
 
@@ -292,7 +321,7 @@ Create a completely separate network to verify no crosstalk:
 
 ```bash
 rm -rf /tmp/murmur-c
-cargo run --bin murmurd -- --data-dir /tmp/murmur-c --name "node-c" --role full --verbose &
+cargo run --bin murmurd -- --data-dir /tmp/murmur-c --name "node-c" --verbose &
 DAEMON_C_PID=$!
 sleep 5
 ```
@@ -337,14 +366,14 @@ done
 Wait 15-20 seconds for all entries to propagate.
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b files --json | jq '.files | length'
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b files --json | jq '.Files.files | length'
 ```
 
 **Expected**: file count includes all 20 batch files (plus any previously synced files).
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a status --json | jq .dag_entries
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b status --json | jq .dag_entries
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a status --json | jq .Status.dag_entries
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b status --json | jq .Status.dag_entries
 ```
 
 **Expected**: same DAG entry count on both nodes.
@@ -361,7 +390,7 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a add /tmp/test-empty.txt
 **Expected**: "File added" (or dedup if empty blob exists). Size should be 0.
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a files --json | jq '.files[] | select(.path | contains("test-empty")) | .size'
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a files --json | jq '.Files.files[] | select(.path | contains("test-empty")) | .size'
 ```
 
 **Expected**: `0`.
@@ -393,7 +422,7 @@ Validate each field:
 - `uptime_secs`: non-negative integer
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a status --json | jq '{
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a status --json | jq '.Status | {
   id_len: (.device_id | length),
   nid_len: (.network_id | length),
   name_present: (.device_name | length > 0),
@@ -412,7 +441,7 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a status --json | jq '{
 After syncing files from both nodes:
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a files --json | jq '.files[] | {path, device_origin}'
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a files --json | jq '.Files.files[] | {path, device_origin}'
 ```
 
 **Expected**: files added by Node A show Node A's device ID as `device_origin`.
@@ -452,8 +481,8 @@ If not, restart daemon first, then stop and add):
 Restart both daemons. Wait for sync.
 
 ```bash
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a status --json | jq .dag_entries
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b status --json | jq .dag_entries
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a status --json | jq .Status.dag_entries
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b status --json | jq .Status.dag_entries
 ```
 
 **Expected**: DAG entry counts match after bidirectional delta sync.
@@ -485,16 +514,18 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a history <DEFAULT_FOLDER_I
 
 ---
 
-## A28 — Approve With Different Roles
+## A28 — Device JSON Shape
 
-Set up a scenario to test all three roles:
+Roles are a legacy concept and do not appear in the devices JSON output.
+Verify the actual fields:
 
 ```bash
-# Assuming node-b-v2 is already approved as "full"
-cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a devices --json | jq '.devices[] | {name, role}'
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a devices --json | jq '.Devices.devices[] | {name, approved}'
 ```
 
-**Expected**: "node-a" is "full", "node-b-v2" is "full" (or whatever was set in A7).
+**Expected**: every approved device reports `approved: true`. There is no
+`role` field on `DeviceInfoIpc` (use per-folder `SyncMode` for sync direction
+instead).
 
 ---
 
@@ -571,7 +602,7 @@ rm -f /tmp/test-batch-*.txt
 | A3 | Revoked can't sync | Revoked node's entries rejected by Node A |
 | A4 | Revoke invalid ID | Error response |
 | A5 | Approve bad hex | Error about invalid ID |
-| A6 | Approve bad role | Error about invalid role |
+| A6 | Approve unknown flag | Clap rejects `--role`, non-zero exit |
 | A7 | Re-join after revoke | New device joins and is approved |
 | A8 | Shutdown socket cleanup | Socket file removed |
 | A9 | Stale socket | Daemon removes stale socket, starts normally |
@@ -580,9 +611,9 @@ rm -f /tmp/test-batch-*.txt
 | A12 | Persist: folders | Folders survive restart |
 | A13 | Persist: mnemonic | Mnemonic survives restart |
 | A14 | Persist: DAG count | Entry count matches pre-restart |
-| A15 | Persist: reconnection | Peers reconnect after restart |
-| A16 | Filesystem: Node A | config.toml, mnemonic, db/, blobs/ correct |
-| A17 | Filesystem: Node B | config.toml, device.key correct |
+| A15 | Single-node restart reconnect | Peers re-form within ~30s after asymmetric restart |
+| A16 | Filesystem: Node A | config.toml (no `role`, no `[[folders]]`), mnemonic, dag.bin, db/, blobs/ correct |
+| A17 | Filesystem: Node B | config.toml (no `role`), 32-byte device.key correct |
 | A18 | Network isolation | Separate network has 0 peers, no crosstalk |
 | A19 | Batch file sync | 20 files sync, DAG consistent |
 | A20 | Empty file | 0-byte file added successfully |
@@ -593,7 +624,7 @@ rm -f /tmp/test-batch-*.txt
 | A25 | Bidirectional delta | Both sides sync offline entries |
 | A26 | Folders after restart | Folder create works on persisted state |
 | A27 | History after restart | Version history survives restart |
-| A28 | Role assignment | Different roles visible in device list |
+| A28 | Device JSON fields | `devices[]` has `name`/`approved`; no `role` field |
 | A29 | Mixed subscriptions | Subscribed/unsubscribed states per folder |
 | A30 | Final DAG consistency | Same entry count, same network ID |
 | A31 | Clean shutdown | No panics, sockets cleaned |

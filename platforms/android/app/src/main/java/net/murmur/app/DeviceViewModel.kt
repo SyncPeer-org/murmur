@@ -33,10 +33,10 @@ class DeviceViewModel(private val engine: MurmurEngine) : ViewModel() {
     }
 
     /** Approve a pending device. */
-    fun approveDevice(deviceIdHex: String, role: String = "full") {
+    fun approveDevice(deviceIdHex: String) {
         viewModelScope.launch {
             try {
-                engine.approveDevice(deviceIdHex, role)
+                engine.approveDevice(deviceIdHex)
                 refresh()
             } catch (e: Exception) {
                 _error.value = "Failed to approve device: ${e.message}"

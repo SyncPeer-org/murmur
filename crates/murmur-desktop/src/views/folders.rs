@@ -214,19 +214,49 @@ impl App {
         .spacing(8)
         .align_y(iced::Alignment::Center);
 
-        // Info card
+        // Info card — sync mode buttons
+        let current_mode = folder.mode.as_deref().unwrap_or("full");
+        let fid = &folder.folder_id;
+        let mode_buttons: Vec<(&str, &str)> = vec![
+            ("Full sync", "full"),
+            ("Send only", "send-only"),
+            ("Receive only", "receive-only"),
+        ];
+        let mut mode_row = row![text("Sync mode:").size(12).color(TEXT_MUTED),]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+        for (label, value) in mode_buttons {
+            let is_active = current_mode == value;
+            let style_fn = if is_active {
+                primary_btn
+            } else {
+                secondary_btn
+            };
+            mode_row = mode_row.push(
+                button(text(label).size(12))
+                    .on_press(Message::SetFolderMode(fid.clone(), value.to_string()))
+                    .style(style_fn)
+                    .padding(iced::Padding {
+                        top: 3.0,
+                        right: 10.0,
+                        bottom: 3.0,
+                        left: 10.0,
+                    }),
+            );
+        }
+
         let mut info_items = column![
             text(format!(
-                "ID: {}  |  {} files  |  Mode: {}  |  {}",
+                "ID: {}  |  {} files  |  {}",
                 &folder.folder_id[..16],
                 folder.file_count,
-                folder.mode.as_deref().unwrap_or("--"),
                 folder.local_path.as_deref().unwrap_or("(no local path)")
             ))
             .size(12)
-            .color(TEXT_MUTED)
+            .color(TEXT_MUTED),
+            mode_row,
         ]
-        .spacing(4);
+        .spacing(6);
         if !self.folder_subscribers.is_empty() {
             let sub_text = self
                 .folder_subscribers

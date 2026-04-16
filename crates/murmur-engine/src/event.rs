@@ -1,6 +1,6 @@
 //! Engine events emitted to the platform.
 
-use murmur_types::{BlobHash, ConflictVersion, DeviceId, DeviceRole, FolderId, SyncMode};
+use murmur_types::{BlobHash, ConflictVersion, DeviceId, FolderId, SyncMode};
 
 /// Events emitted by the engine to notify the platform of state changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,8 +16,6 @@ pub enum EngineEvent {
     DeviceApproved {
         /// The approved device's ID.
         device_id: DeviceId,
-        /// The approved device's role.
-        role: DeviceRole,
     },
     /// A device was revoked.
     DeviceRevoked {

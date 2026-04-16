@@ -81,6 +81,8 @@ pub enum Message {
     ApproveDevice(String),
     ToggleGlobalSync,
     ToggleFolderSync(String),
+    /// Change sync mode for a folder (folder_id, new mode string).
+    SetFolderMode(String, String),
     // Settings
     ToggleAutoApprove,
     ToggleMdns,

@@ -31,19 +31,19 @@ impl MurmurEngine {
     // -----------------------------------------------------------------
 
     /// Create a new engine for the **first device** in a network.
-    ///
-    /// The device is auto-approved with the given role.
     pub fn create_network(
         device_id: DeviceId,
         signing_key: SigningKey,
         device_name: String,
-        role: DeviceRole,
         callbacks: Arc<dyn PlatformCallbacks>,
     ) -> Self {
         let mut dag = Dag::new(device_id, signing_key);
 
         // Auto-approve the first device.
-        let entry = dag.append(Action::DeviceApproved { device_id, role });
+        let entry = dag.append(Action::DeviceApproved {
+            device_id,
+            role: DeviceRole::Full,
+        });
         callbacks.on_dag_entry(entry.to_bytes());
 
         // Set the device name.
@@ -217,17 +217,16 @@ impl MurmurEngine {
     // -----------------------------------------------------------------
 
     /// Approve a pending device.
-    pub fn approve_device(
-        &mut self,
-        device_id: DeviceId,
-        role: DeviceRole,
-    ) -> Result<DagEntry, EngineError> {
-        let entry = self.dag.append(Action::DeviceApproved { device_id, role });
+    pub fn approve_device(&mut self, device_id: DeviceId) -> Result<DagEntry, EngineError> {
+        let entry = self.dag.append(Action::DeviceApproved {
+            device_id,
+            role: DeviceRole::Full,
+        });
         self.callbacks.on_dag_entry(entry.to_bytes());
 
-        info!(%device_id, ?role, "engine: device approved");
+        info!(%device_id, "engine: device approved");
         self.callbacks
-            .on_event(EngineEvent::DeviceApproved { device_id, role });
+            .on_event(EngineEvent::DeviceApproved { device_id });
 
         Ok(entry)
     }
@@ -259,13 +258,17 @@ impl MurmurEngine {
         self.dag.state().devices.values().cloned().collect()
     }
 
-    /// List pending (unapproved) devices.
+    /// List pending (never-approved) devices.
+    ///
+    /// Revoked devices also have `approved == false`, so they're distinguished
+    /// by `approved_by`: a revoked device was approved at some point, a truly
+    /// pending one never was.
     pub fn pending_requests(&self) -> Vec<DeviceInfo> {
         self.dag
             .state()
             .devices
             .values()
-            .filter(|d| !d.approved)
+            .filter(|d| !d.approved && d.approved_by.is_none())
             .cloned()
             .collect()
     }
@@ -276,7 +279,7 @@ impl MurmurEngine {
 
     /// Create a new shared folder.
     ///
-    /// The creator is automatically subscribed as ReadWrite.
+    /// The creator is automatically subscribed as Full.
     pub fn create_folder(
         &mut self,
         name: &str,
@@ -303,11 +306,11 @@ impl MurmurEngine {
         });
         self.callbacks.on_dag_entry(entry.to_bytes());
 
-        // Auto-subscribe the creator as ReadWrite.
+        // Auto-subscribe the creator as Full.
         let sub_entry = self.dag.append(Action::FolderSubscribed {
             folder_id,
             device_id,
-            mode: SyncMode::ReadWrite,
+            mode: SyncMode::Full,
         });
         self.callbacks.on_dag_entry(sub_entry.to_bytes());
 
@@ -724,7 +727,7 @@ impl MurmurEngine {
     /// Add a file to a folder.
     ///
     /// Creates a `FileAdded` DAG entry. Verifies the device is subscribed as
-    /// ReadWrite. Returns `Err` if the file already exists at the same path.
+    /// Full. Returns `Err` if the file already exists at the same path.
     pub fn add_file(
         &mut self,
         metadata: FileMetadata,
@@ -1002,7 +1005,7 @@ impl MurmurEngine {
     fn check_write_permission(&self, folder_id: FolderId) -> Result<(), EngineError> {
         let device_id = self.dag.device_id();
         match self.dag.state().subscriptions.get(&(folder_id, device_id)) {
-            Some(sub) if sub.mode == SyncMode::ReadOnly => {
+            Some(sub) if !sub.mode.can_write() => {
                 Err(EngineError::ReadOnlyFolder(folder_id.to_string()))
             }
             Some(_) => Ok(()),
@@ -1158,10 +1161,9 @@ impl MurmurEngine {
                     name: name.clone(),
                 });
             }
-            Action::DeviceApproved { device_id, role } => {
+            Action::DeviceApproved { device_id, .. } => {
                 self.callbacks.on_event(EngineEvent::DeviceApproved {
                     device_id: *device_id,
-                    role: *role,
                 });
             }
             Action::DeviceRevoked { device_id } => {
@@ -1228,7 +1230,7 @@ impl MurmurEngine {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use murmur_types::{AccessScope, DeviceRole};
+    use murmur_types::AccessScope;
     use std::sync::Mutex;
 
     // --- Test callback implementation ---
@@ -1318,8 +1320,7 @@ mod tests {
     fn make_engine(name: &str) -> (MurmurEngine, Arc<TestCallbacks>) {
         let (id, sk) = make_keypair();
         let cb = Arc::new(TestCallbacks::default());
-        let engine =
-            MurmurEngine::create_network(id, sk, name.to_string(), DeviceRole::Full, cb.clone());
+        let engine = MurmurEngine::create_network(id, sk, name.to_string(), cb.clone());
         (engine, cb)
     }
 
@@ -1409,13 +1410,12 @@ mod tests {
         let (mut engine, cb) = make_engine("NAS");
         let (new_id, _) = make_keypair();
 
-        engine.approve_device(new_id, DeviceRole::Source).unwrap();
+        engine.approve_device(new_id).unwrap();
 
         let devices = engine.list_devices();
         assert_eq!(devices.len(), 2);
         let new_dev = devices.iter().find(|d| d.device_id == new_id).unwrap();
         assert!(new_dev.approved);
-        assert_eq!(new_dev.role, DeviceRole::Source);
 
         let events = cb.events.lock().unwrap();
         assert!(events.iter().any(
@@ -1436,7 +1436,7 @@ mod tests {
         engine2.receive_sync_entries(pre_delta).unwrap();
 
         // Engine1 approves new device.
-        let approval = engine1.approve_device(new_id, DeviceRole::Source).unwrap();
+        let approval = engine1.approve_device(new_id).unwrap();
 
         // Engine2 receives the approval entry.
         engine2.receive_entry(approval).unwrap();
@@ -1457,7 +1457,7 @@ mod tests {
         let (mut engine, _cb) = make_engine("NAS");
         let (new_id, _) = make_keypair();
 
-        engine.approve_device(new_id, DeviceRole::Backup).unwrap();
+        engine.approve_device(new_id).unwrap();
         engine.revoke_device(new_id).unwrap();
 
         let dev = engine.state().devices.get(&new_id).unwrap();
@@ -1486,6 +1486,35 @@ mod tests {
         assert_eq!(pending.len(), 2);
     }
 
+    #[test]
+    fn test_pending_excludes_revoked_devices() {
+        let (mut engine, _cb) = make_engine("NAS");
+        let (id_a, _) = make_keypair();
+        let (id_b, _) = make_keypair();
+
+        engine.dag.append(Action::DeviceJoinRequest {
+            device_id: id_a,
+            name: "Phone A".to_string(),
+        });
+        engine.dag.append(Action::DeviceJoinRequest {
+            device_id: id_b,
+            name: "Phone B".to_string(),
+        });
+
+        // Approve both, then revoke A.
+        engine.approve_device(id_a).unwrap();
+        engine.approve_device(id_b).unwrap();
+        engine.revoke_device(id_a).unwrap();
+
+        // A is revoked — it must not appear as pending.
+        // B is still approved — it must not appear as pending either.
+        let pending = engine.pending_requests();
+        assert!(
+            pending.is_empty(),
+            "revoked/approved devices should not be listed as pending: {pending:?}"
+        );
+    }
+
     // --- Folder management ---
 
     #[test]
@@ -1507,7 +1536,7 @@ mod tests {
         let subs = engine.folder_subscriptions(folder.folder_id);
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].device_id, engine.device_id());
-        assert_eq!(subs[0].mode, SyncMode::ReadWrite);
+        assert_eq!(subs[0].mode, SyncMode::Full);
     }
 
     #[test]
@@ -1533,12 +1562,12 @@ mod tests {
 
         // Creator is already subscribed; subscribe another device
         let (new_id, _) = make_keypair();
-        engine.approve_device(new_id, DeviceRole::Full).unwrap();
+        engine.approve_device(new_id).unwrap();
 
         // The subscription is for THIS device, so we test the mode is recorded
         let subs = engine.folder_subscriptions(folder.folder_id);
         assert_eq!(subs.len(), 1);
-        assert_eq!(subs[0].mode, SyncMode::ReadWrite);
+        assert_eq!(subs[0].mode, SyncMode::Full);
     }
 
     #[test]
@@ -1546,15 +1575,15 @@ mod tests {
         let (mut engine, _cb) = make_engine("NAS");
         let (folder, _) = engine.create_folder("Photos").unwrap();
 
-        // Unsubscribe and re-subscribe as ReadOnly
+        // Unsubscribe and re-subscribe as ReceiveOnly
         engine.unsubscribe_folder(folder.folder_id).unwrap();
         engine
-            .subscribe_folder(folder.folder_id, SyncMode::ReadOnly)
+            .subscribe_folder(folder.folder_id, SyncMode::ReceiveOnly)
             .unwrap();
 
         let subs = engine.folder_subscriptions(folder.folder_id);
         assert_eq!(subs.len(), 1);
-        assert_eq!(subs[0].mode, SyncMode::ReadOnly);
+        assert_eq!(subs[0].mode, SyncMode::ReceiveOnly);
     }
 
     #[test]
@@ -1570,7 +1599,7 @@ mod tests {
     #[test]
     fn test_subscribe_nonexistent_folder() {
         let (mut engine, _cb) = make_engine("NAS");
-        let result = engine.subscribe_folder(FolderId::from_data(b"nope"), SyncMode::ReadWrite);
+        let result = engine.subscribe_folder(FolderId::from_data(b"nope"), SyncMode::Full);
         assert!(matches!(result, Err(EngineError::FolderNotFound(_))));
     }
 
@@ -1654,7 +1683,7 @@ mod tests {
         let (folder, _) = engine.create_folder("Photos").unwrap();
         engine.unsubscribe_folder(folder.folder_id).unwrap();
         engine
-            .subscribe_folder(folder.folder_id, SyncMode::ReadOnly)
+            .subscribe_folder(folder.folder_id, SyncMode::ReceiveOnly)
             .unwrap();
 
         let (meta, data) = make_file_data(b"content", folder.folder_id);
@@ -1867,7 +1896,7 @@ mod tests {
         let cb2 = Arc::new(TestCallbacks::default());
 
         // Engine1 approves device2.
-        engine1.approve_device(id2, DeviceRole::Source).unwrap();
+        engine1.approve_device(id2).unwrap();
 
         // Engine2 joins as a fresh DAG and syncs engine1's entries.
         let mut engine2 = MurmurEngine::from_dag(Dag::new(id2, sk2), cb2.clone());
@@ -1916,14 +1945,12 @@ mod tests {
         let cb2 = Arc::new(TestCallbacks::default());
 
         // Engine1 approves device2.
-        engine1.approve_device(id2, DeviceRole::Source).unwrap();
+        engine1.approve_device(id2).unwrap();
 
         // Engine2 joins and syncs engine1's entries.
         let mut engine2 = MurmurEngine::from_dag(Dag::new(id2, sk2), cb2);
         engine2.receive_sync_entries(engine1.all_entries()).unwrap();
-        engine2
-            .subscribe_folder(folder_id, SyncMode::ReadWrite)
-            .unwrap();
+        engine2.subscribe_folder(folder_id, SyncMode::Full).unwrap();
 
         let data1 = b"file from NAS".to_vec();
         let meta1 = FileMetadata {
@@ -1976,7 +2003,7 @@ mod tests {
         let (meta, data) = make_file_data(b"important", folder_id);
         engine1.add_file(meta.clone(), data).unwrap();
         let (peer_id, _) = make_keypair();
-        engine1.approve_device(peer_id, DeviceRole::Backup).unwrap();
+        engine1.approve_device(peer_id).unwrap();
 
         // New device joins with empty DAG and syncs.
         let (id2, sk2) = make_keypair();
@@ -2001,14 +2028,12 @@ mod tests {
         let cb2 = Arc::new(TestCallbacks::default());
 
         // Engine1 approves device2.
-        engine1.approve_device(id2, DeviceRole::Source).unwrap();
+        engine1.approve_device(id2).unwrap();
 
         // Engine2 joins and syncs.
         let mut engine2 = MurmurEngine::from_dag(Dag::new(id2, sk2), cb2);
         engine2.receive_sync_entries(engine1.all_entries()).unwrap();
-        engine2
-            .subscribe_folder(folder_id, SyncMode::ReadWrite)
-            .unwrap();
+        engine2.subscribe_folder(folder_id, SyncMode::Full).unwrap();
 
         let data_a = b"a".to_vec();
         let meta_a = FileMetadata {
@@ -2089,7 +2114,7 @@ mod tests {
     fn test_device_id() {
         let (id, sk) = make_keypair();
         let cb = Arc::new(TestCallbacks::default());
-        let engine = MurmurEngine::create_network(id, sk, "NAS".to_string(), DeviceRole::Full, cb);
+        let engine = MurmurEngine::create_network(id, sk, "NAS".to_string(), cb);
         assert_eq!(engine.device_id(), id);
     }
 
@@ -2107,13 +2132,11 @@ mod tests {
         let (id2, sk2) = make_keypair();
         let cb2 = Arc::new(TestCallbacks::default());
 
-        engine1.approve_device(id2, DeviceRole::Source).unwrap();
+        engine1.approve_device(id2).unwrap();
 
         let mut engine2 = MurmurEngine::from_dag(Dag::new(id2, sk2), cb2.clone());
         engine2.receive_sync_entries(engine1.all_entries()).unwrap();
-        engine2
-            .subscribe_folder(folder_id, SyncMode::ReadWrite)
-            .unwrap();
+        engine2.subscribe_folder(folder_id, SyncMode::Full).unwrap();
 
         (engine1, cb1, engine2, cb2, folder_id)
     }
@@ -2383,20 +2406,16 @@ mod tests {
         let cb2 = Arc::new(TestCallbacks::default());
         let cb3 = Arc::new(TestCallbacks::default());
 
-        engine1.approve_device(id2, DeviceRole::Source).unwrap();
-        engine1.approve_device(id3, DeviceRole::Source).unwrap();
+        engine1.approve_device(id2).unwrap();
+        engine1.approve_device(id3).unwrap();
 
         let mut engine2 = MurmurEngine::from_dag(Dag::new(id2, sk2), cb2);
         engine2.receive_sync_entries(engine1.all_entries()).unwrap();
-        engine2
-            .subscribe_folder(folder_id, SyncMode::ReadWrite)
-            .unwrap();
+        engine2.subscribe_folder(folder_id, SyncMode::Full).unwrap();
 
         let mut engine3 = MurmurEngine::from_dag(Dag::new(id3, sk3), cb3);
         engine3.receive_sync_entries(engine1.all_entries()).unwrap();
-        engine3
-            .subscribe_folder(folder_id, SyncMode::ReadWrite)
-            .unwrap();
+        engine3.subscribe_folder(folder_id, SyncMode::Full).unwrap();
 
         // All three add the same file path concurrently.
         let (m1, d1) = make_file_data_path(b"v1", folder_id, "doc.txt", engine1.device_id());
@@ -2527,7 +2546,7 @@ mod tests {
         let delta = engine1.compute_delta(engine2.tips());
         engine2.receive_sync_entries(delta).unwrap();
         engine2
-            .subscribe_folder(folder2_id, SyncMode::ReadWrite)
+            .subscribe_folder(folder2_id, SyncMode::Full)
             .unwrap();
 
         // Create a conflict in folder1.
@@ -2572,7 +2591,7 @@ mod tests {
         let delta = engine1.compute_delta(engine2.tips());
         engine2.receive_sync_entries(delta).unwrap();
         engine2
-            .subscribe_folder(folder2_id, SyncMode::ReadWrite)
+            .subscribe_folder(folder2_id, SyncMode::Full)
             .unwrap();
 
         // Engine1 adds doc.txt in folder1, engine2 adds doc.txt in folder2.
@@ -2862,10 +2881,10 @@ mod tests {
     fn test_add_file_streaming_rejects_read_only() {
         let (mut engine, _cb, folder_id) = make_engine_with_folder("NAS");
 
-        // Unsubscribe and resubscribe as ReadOnly.
+        // Unsubscribe and resubscribe as ReceiveOnly.
         engine.unsubscribe_folder(folder_id).unwrap();
         engine
-            .subscribe_folder(folder_id, SyncMode::ReadOnly)
+            .subscribe_folder(folder_id, SyncMode::ReceiveOnly)
             .unwrap();
 
         let dir = tempfile::tempdir().unwrap();

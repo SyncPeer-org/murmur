@@ -122,14 +122,20 @@ define_id!(
 // Device types
 // ---------------------------------------------------------------------------
 
-/// Role of a device in the Murmur network.
+/// Legacy device role — kept only for DAG wire compatibility.
+///
+/// Sync direction is now per-folder via [`SyncMode`], not per-device.
+/// New `DeviceApproved` entries always use `Full`; the field is ignored
+/// when rebuilding state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DeviceRole {
-    /// Produces files (phone, tablet).
-    Source,
-    /// Stores files (NAS, server).
-    Backup,
-    /// Both source and backup.
+    /// Legacy "Source".
+    #[serde(alias = "Source")]
+    SendOnly,
+    /// Legacy "Backup".
+    #[serde(alias = "Backup")]
+    ReceiveOnly,
+    /// Default (no-op).
     Full,
 }
 
@@ -140,8 +146,6 @@ pub struct DeviceInfo {
     pub device_id: DeviceId,
     /// Human-readable name (e.g. "Max's iPhone").
     pub name: String,
-    /// The device's role.
-    pub role: DeviceRole,
     /// Whether the device has been approved.
     pub approved: bool,
     /// Which device approved this one.
@@ -168,20 +172,81 @@ pub struct SharedFolder {
 }
 
 /// How a device participates in a folder.
+///
+/// Determines the sync direction for this device in a given folder:
+/// - **Full** (default) — sends and receives file changes.
+/// - **ReceiveOnly** — only pulls changes from other devices.
+/// - **SendOnly** — only pushes local changes to other devices.
+///
+/// Variant order is wire-stable (postcard encodes by index):
+/// `Full=0` (was `ReadWrite`), `ReceiveOnly=1` (was `ReadOnly`), `SendOnly=2`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SyncMode {
-    /// Device can read and write files.
-    ReadWrite,
-    /// Device can only read files.
-    ReadOnly,
+    /// Sends and receives file changes (default).
+    #[serde(alias = "ReadWrite")]
+    Full,
+    /// Only receives file changes from other devices.
+    #[serde(alias = "ReadOnly")]
+    ReceiveOnly,
+    /// Only sends local file changes to other devices.
+    SendOnly,
+}
+
+impl SyncMode {
+    /// Human-readable label for UI display.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Full => "Full sync",
+            Self::SendOnly => "Send only",
+            Self::ReceiveOnly => "Receive only",
+        }
+    }
+
+    /// Short description for tooltips and help text.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Full => "Sends and receives files",
+            Self::SendOnly => "Only sends files to other devices",
+            Self::ReceiveOnly => "Only receives files from other devices",
+        }
+    }
+
+    /// Parse from a user-facing string (config files, CLI flags).
+    ///
+    /// Accepts both the new names (`full`, `send-only`, `receive-only`) and
+    /// the legacy names (`read-write`, `read-only`) for backwards compatibility.
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "full" | "read-write" | "readwrite" => Some(Self::Full),
+            "receive-only" | "receiveonly" | "read-only" | "readonly" => Some(Self::ReceiveOnly),
+            "send-only" | "sendonly" => Some(Self::SendOnly),
+            _ => None,
+        }
+    }
+
+    /// Canonical CLI/config string representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::SendOnly => "send-only",
+            Self::ReceiveOnly => "receive-only",
+        }
+    }
+
+    /// Whether this mode allows writing local changes to the DAG.
+    pub fn can_write(self) -> bool {
+        matches!(self, Self::Full | Self::SendOnly)
+    }
+
+    /// Whether this mode allows receiving remote changes to the local filesystem.
+    pub fn can_receive(self) -> bool {
+        matches!(self, Self::Full | Self::ReceiveOnly)
+    }
 }
 
 impl fmt::Display for SyncMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SyncMode::ReadWrite => write!(f, "read-write"),
-            SyncMode::ReadOnly => write!(f, "read-only"),
-        }
+        f.write_str(self.display_name())
     }
 }
 
@@ -192,7 +257,7 @@ pub struct FolderSubscription {
     pub folder_id: FolderId,
     /// Which device.
     pub device_id: DeviceId,
-    /// Read-write or read-only.
+    /// Sync direction for this device in this folder.
     pub mode: SyncMode,
 }
 
@@ -698,12 +763,71 @@ mod tests {
     }
 
     #[test]
-    fn test_device_role_roundtrip_postcard() {
-        for role in [DeviceRole::Source, DeviceRole::Backup, DeviceRole::Full] {
-            let encoded = postcard::to_allocvec(&role).unwrap();
-            let decoded: DeviceRole = postcard::from_bytes(&encoded).unwrap();
-            assert_eq!(role, decoded);
-        }
+    fn test_device_role_postcard_wire_compat() {
+        // Legacy DeviceRole variant indices: SendOnly=0, ReceiveOnly=1, Full=2.
+        // Must stay stable for existing DAGs.
+        assert_eq!(postcard::to_allocvec(&DeviceRole::SendOnly).unwrap(), [0]);
+        assert_eq!(
+            postcard::to_allocvec(&DeviceRole::ReceiveOnly).unwrap(),
+            [1]
+        );
+        assert_eq!(postcard::to_allocvec(&DeviceRole::Full).unwrap(), [2]);
+    }
+
+    #[test]
+    fn test_sync_mode_postcard_wire_compat() {
+        // Full=0 (was ReadWrite), ReceiveOnly=1 (was ReadOnly), SendOnly=2 (new).
+        assert_eq!(postcard::to_allocvec(&SyncMode::Full).unwrap(), [0]);
+        assert_eq!(postcard::to_allocvec(&SyncMode::ReceiveOnly).unwrap(), [1]);
+        assert_eq!(postcard::to_allocvec(&SyncMode::SendOnly).unwrap(), [2]);
+    }
+
+    #[test]
+    fn test_sync_mode_from_str_loose() {
+        // New canonical names.
+        assert_eq!(SyncMode::from_str_loose("full"), Some(SyncMode::Full));
+        assert_eq!(
+            SyncMode::from_str_loose("send-only"),
+            Some(SyncMode::SendOnly)
+        );
+        assert_eq!(
+            SyncMode::from_str_loose("receive-only"),
+            Some(SyncMode::ReceiveOnly)
+        );
+        // Legacy names still work.
+        assert_eq!(SyncMode::from_str_loose("read-write"), Some(SyncMode::Full));
+        assert_eq!(
+            SyncMode::from_str_loose("read-only"),
+            Some(SyncMode::ReceiveOnly)
+        );
+        // Case-insensitive.
+        assert_eq!(SyncMode::from_str_loose("FULL"), Some(SyncMode::Full));
+        // Unknown.
+        assert_eq!(SyncMode::from_str_loose("unknown"), None);
+    }
+
+    #[test]
+    fn test_sync_mode_display_and_as_str() {
+        assert_eq!(SyncMode::Full.display_name(), "Full sync");
+        assert_eq!(SyncMode::SendOnly.display_name(), "Send only");
+        assert_eq!(SyncMode::ReceiveOnly.display_name(), "Receive only");
+        assert_eq!(SyncMode::Full.as_str(), "full");
+        assert_eq!(SyncMode::SendOnly.as_str(), "send-only");
+        assert_eq!(SyncMode::ReceiveOnly.as_str(), "receive-only");
+    }
+
+    #[test]
+    fn test_sync_mode_can_write() {
+        assert!(SyncMode::Full.can_write());
+        assert!(SyncMode::SendOnly.can_write());
+        assert!(!SyncMode::ReceiveOnly.can_write());
+    }
+
+    #[test]
+    fn test_sync_mode_can_receive() {
+        assert!(SyncMode::Full.can_receive());
+        assert!(!SyncMode::SendOnly.can_receive());
+        assert!(SyncMode::ReceiveOnly.can_receive());
     }
 
     #[test]
@@ -711,7 +835,6 @@ mod tests {
         let info = DeviceInfo {
             device_id: DeviceId::from_data(b"dev1"),
             name: "Test Device".to_string(),
-            role: DeviceRole::Full,
             approved: true,
             approved_by: Some(DeviceId::from_data(b"admin")),
             joined_at: 1234567890,
@@ -788,7 +911,7 @@ mod tests {
             },
             Action::DeviceApproved {
                 device_id: DeviceId::from_data(b"d1"),
-                role: DeviceRole::Source,
+                role: DeviceRole::SendOnly,
             },
             Action::DeviceRevoked {
                 device_id: DeviceId::from_data(b"d1"),
@@ -809,7 +932,7 @@ mod tests {
             Action::FolderSubscribed {
                 folder_id,
                 device_id: DeviceId::from_data(b"d1"),
-                mode: SyncMode::ReadWrite,
+                mode: SyncMode::Full,
             },
             Action::FolderUnsubscribed {
                 folder_id,

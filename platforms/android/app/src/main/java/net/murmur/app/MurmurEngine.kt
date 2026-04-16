@@ -70,11 +70,10 @@ class MurmurEngine private constructor(
     /**
      * Approve a pending device.
      * @param deviceIdHex 64-char lowercase hex device ID
-     * @param role "source", "backup", or "full"
      */
-    suspend fun approveDevice(deviceIdHex: String, role: String) =
+    suspend fun approveDevice(deviceIdHex: String) =
         kotlinx.coroutines.withContext(Dispatchers.IO) {
-            handle.approveDevice(deviceIdHex, role)
+            handle.approveDevice(deviceIdHex)
         }
 
     /** Revoke a device. */

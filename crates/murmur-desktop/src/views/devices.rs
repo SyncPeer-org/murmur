@@ -27,7 +27,6 @@ impl App {
                             .size(15)
                             .color(Color::WHITE)
                             .width(Length::Fill),
-                        text(&local.role).size(12).color(TEXT_MUTED),
                         text("Online").size(12).color(ACCENT),
                     ]
                     .spacing(8)
@@ -100,7 +99,6 @@ impl App {
                             .size(14)
                             .color(Color::WHITE)
                             .width(Length::Fill),
-                        text(&d.role).size(12).color(TEXT_MUTED),
                         text(status).size(12).color(color),
                     ]
                     .spacing(8)
