@@ -101,6 +101,17 @@ pub enum Message {
     // Diagnostics
     RunConnectivityCheck,
     ExportDiagnostics,
+    // Onboarding
+    /// User clicked "Invite device" — daemon should mint a PairingInvite.
+    IssuePairingInvite,
+    /// Response from `IssuePairingInvite`.
+    GotPairingInvite(Result<CliResponse, String>),
+    /// User dismissed the pairing invite card.
+    ClearPairingInvite,
+    /// Copy the current pairing invite URL to the clipboard.
+    CopyPairingInviteUrl,
+    /// User picked a folder-template slug — fill the ignore-patterns input.
+    ApplyFolderTemplate(String),
     DaemonEvent(CliResponse),
     Tick,
 }

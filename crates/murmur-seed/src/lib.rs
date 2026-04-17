@@ -22,6 +22,9 @@ use rand::TryRng;
 use sha2::Sha256;
 use zeroize::Zeroize;
 
+pub mod pairing;
+pub use pairing::{PairingError, PairingToken};
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------

@@ -240,6 +240,7 @@ impl App {
                         CliRequest::CreateFolder {
                             name,
                             local_path: Some(local_path),
+                            ignore_patterns: None,
                         },
                     ),
                     Message::GotGeneric,
@@ -614,6 +615,53 @@ impl App {
                     ),
                     Message::GotGeneric,
                 );
+            }
+            // Onboarding: pairing invites + folder templates.
+            Message::IssuePairingInvite => {
+                let s = self.socket_path.clone();
+                return Task::perform(
+                    ipc::send(s, CliRequest::IssuePairingInvite),
+                    Message::GotPairingInvite,
+                );
+            }
+            Message::GotPairingInvite(Ok(CliResponse::PairingInvite {
+                url,
+                expires_at_unix,
+            })) => {
+                self.pairing_invite = Some(crate::app::PairingInviteCache {
+                    url,
+                    expires_at_unix,
+                });
+            }
+            Message::GotPairingInvite(Ok(CliResponse::Error { message })) => {
+                tracing::warn!(%message, "issue pairing invite error");
+                self.daemon_error = Some(message);
+            }
+            Message::GotPairingInvite(Ok(_other)) => {
+                tracing::warn!("unexpected response for IssuePairingInvite");
+            }
+            Message::GotPairingInvite(Err(e)) => {
+                tracing::warn!(error = %e, "pairing invite RPC failed");
+                if self.daemon_running == Some(true) {
+                    self.daemon_error = Some(e);
+                }
+            }
+            Message::ClearPairingInvite => {
+                self.pairing_invite = None;
+            }
+            Message::CopyPairingInviteUrl => {
+                if let Some(cache) = &self.pairing_invite {
+                    // iced provides clipboard ops via Task::future; fall back
+                    // to logging if we can't copy (e.g., headless test).
+                    return iced::clipboard::write(cache.url.clone());
+                }
+            }
+            Message::ApplyFolderTemplate(slug) => {
+                if let Some(patterns) = murmur_ipc::templates::template_patterns(&slug) {
+                    self.folder_ignore_patterns = patterns;
+                } else {
+                    tracing::warn!(%slug, "unknown folder template");
+                }
             }
             // Events
             Message::DaemonEvent(CliResponse::Event { event }) => {

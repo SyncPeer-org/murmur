@@ -2,6 +2,9 @@
 //!
 //! `join` sets up configuration files for joining an existing network.
 //! Network creation is handled automatically by `murmurd` on first run.
+//!
+//! Also hosts the built-in folder-template map used by `folder create
+//! --template <name>`.
 
 use std::path::Path;
 
@@ -119,6 +122,16 @@ pub fn cmd_join(base_dir: &Path, mnemonic_str: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Folder templates
+// ---------------------------------------------------------------------------
+//
+// Thin re-export of `murmur_ipc::templates` so both the CLI and the desktop
+// app ship identical patterns. Kept here as `pub` so the existing CLI
+// call-sites (`offline::template_patterns`, `offline::TEMPLATES`) keep
+// working without a larger refactor.
+pub use murmur_ipc::templates::{TEMPLATES, template_patterns};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +153,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = cmd_join(dir.path(), "not a valid mnemonic", "Phone");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cli_reexports_templates() {
+        // Sanity check: the CLI re-export surfaces the same map as murmur-ipc.
+        assert_eq!(TEMPLATES, murmur_ipc::templates::TEMPLATES);
+        assert_eq!(
+            template_patterns("rust"),
+            murmur_ipc::templates::template_patterns("rust")
+        );
     }
 }

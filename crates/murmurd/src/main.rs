@@ -190,6 +190,10 @@ fn run_daemon(base_dir: &Path, default_name: &str, http_port: Option<u16>) -> Re
     let persisted_entries = storage.load_all_dag_entries()?;
     let is_joiner = device_key_path.exists();
 
+    // Keep a copy of the signing key alive for the DaemonCtx — the engine
+    // variants below consume the original by value.
+    let ctx_signing_key = signing_key.clone();
+
     let engine = if !persisted_entries.is_empty() {
         // Restart: recreate engine from persisted state.
         let dag = murmur_dag::Dag::new(device_id, signing_key);
@@ -536,6 +540,9 @@ fn run_daemon(base_dir: &Path, default_name: &str, http_port: Option<u16>) -> Re
             sync_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             paused_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
             device_presence: device_presence.clone(),
+            used_invite_nonces: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            signing_key: Arc::new(ctx_signing_key.clone()),
+            device_id,
         });
 
         let accept_handle = tokio::task::spawn_blocking(move || {
@@ -667,6 +674,15 @@ struct DaemonCtx {
     device_presence: Arc<Mutex<std::collections::HashMap<DeviceId, (bool, u64)>>>,
     /// Iroh endpoint for connectivity checks (None only in tests).
     endpoint: Option<iroh::Endpoint>,
+    /// Pairing-invite nonces that have already been redeemed on this daemon.
+    /// Guards against local replay of the same URL; cross-daemon replay
+    /// cannot be detected offline by design — the invite URL is
+    /// self-contained.
+    used_invite_nonces: Arc<Mutex<std::collections::HashSet<[u8; 32]>>>,
+    /// This daemon's signing key — signs pairing invites.
+    signing_key: Arc<ed25519_dalek::SigningKey>,
+    /// This daemon's device ID — identifies the invite issuer.
+    device_id: DeviceId,
 }
 
 /// Handle a single CLI connection.
@@ -848,7 +864,11 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
         CliRequest::AddFile { path } => process_add_file(path, ctx),
 
         // -- Folder management (M17) --
-        CliRequest::CreateFolder { name, local_path } => {
+        CliRequest::CreateFolder {
+            name,
+            local_path,
+            ignore_patterns,
+        } => {
             let mut eng = ctx.engine.lock().unwrap();
             match eng.create_folder(&name) {
                 Ok((folder, entries)) => {
@@ -870,6 +890,24 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                                 mode: SyncMode::Full.as_str().to_string(),
                             });
                             persist_config(ctx, &cfg);
+                        }
+                        // Write folder-template ignore patterns if provided.
+                        if let Some(ref patterns) = ignore_patterns {
+                            if let Err(e) = std::fs::create_dir_all(&local) {
+                                warn!(
+                                    path = %local.display(),
+                                    error = %e,
+                                    "failed to create folder dir for .murmurignore"
+                                );
+                            } else if let Err(e) =
+                                std::fs::write(local.join(".murmurignore"), patterns)
+                            {
+                                warn!(
+                                    path = %local.display(),
+                                    error = %e,
+                                    "failed to write .murmurignore from template"
+                                );
+                            }
                         }
                         // Scan existing files on disk.
                         if local.is_dir() {
@@ -1930,6 +1968,63 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                 }
             }
         }
+        // -- Onboarding: pairing invites --
+        CliRequest::IssuePairingInvite => {
+            let token = murmur_seed::PairingToken::issue_default(
+                &ctx.mnemonic,
+                ctx.device_id,
+                &ctx.signing_key,
+            );
+            let url = token.to_url();
+            let expires_at_unix = token.expires_at_unix;
+            info!(
+                issuer = %ctx.device_id,
+                expires_at_unix,
+                "issued pairing invite"
+            );
+            CliResponse::PairingInvite {
+                url,
+                expires_at_unix,
+            }
+        }
+        CliRequest::RedeemPairingInvite { url } => {
+            let token = match murmur_seed::PairingToken::from_url(&url) {
+                Ok(t) => t,
+                Err(e) => {
+                    return CliResponse::Error {
+                        message: format!("invalid invite URL: {e}"),
+                    };
+                }
+            };
+            // Enforce single-use on this daemon (cross-daemon replay cannot
+            // be detected offline — documented trade-off in docs/plan.md).
+            {
+                let mut used = ctx.used_invite_nonces.lock().unwrap();
+                if !used.insert(token.nonce) {
+                    return CliResponse::Error {
+                        message: "invite already redeemed on this daemon".to_string(),
+                    };
+                }
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default();
+            match token.redeem(now) {
+                Ok(mnemonic) => CliResponse::RedeemedMnemonic {
+                    mnemonic,
+                    issued_by: token.issued_by.to_string(),
+                },
+                Err(e) => {
+                    // Release the nonce so a corrupt URL doesn't lock out a
+                    // later correct one (edge case, but cheap to handle).
+                    ctx.used_invite_nonces.lock().unwrap().remove(&token.nonce);
+                    CliResponse::Error {
+                        message: format!("redeem failed: {e}"),
+                    }
+                }
+            }
+        }
         CliRequest::ExportDiagnostics { output_path } => {
             const ONLINE_THRESHOLD_SECS: u64 = 60;
             let now = std::time::SystemTime::now()
@@ -2577,6 +2672,7 @@ mod tests {
         let storage = Arc::new(Storage::open(&dir.join("db"), &dir.join("blobs")).unwrap());
         let platform = Arc::new(FjallPlatform::new(storage.clone()));
 
+        let ctx_signing_key = signing_key.clone();
         let engine = murmur_engine::MurmurEngine::create_network(
             device_id,
             signing_key,
@@ -2606,6 +2702,9 @@ mod tests {
             paused_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
             device_presence: Arc::new(Mutex::new(std::collections::HashMap::new())),
             endpoint: None,
+            used_invite_nonces: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            signing_key: Arc::new(ctx_signing_key),
+            device_id,
         }
     }
 
@@ -3036,6 +3135,7 @@ mod tests {
             CliRequest::CreateFolder {
                 name: "Photos".to_string(),
                 local_path: None,
+                ignore_patterns: None,
             },
             &ctx,
         );
@@ -3085,6 +3185,7 @@ mod tests {
             CliRequest::CreateFolder {
                 name: "Docs".to_string(),
                 local_path: None,
+                ignore_patterns: None,
             },
             &ctx,
         );
@@ -3156,6 +3257,7 @@ mod tests {
             CliRequest::CreateFolder {
                 name: "Music".to_string(),
                 local_path: None,
+                ignore_patterns: None,
             },
             &ctx,
         );
@@ -3274,6 +3376,7 @@ mod tests {
             CliRequest::CreateFolder {
                 name: "Setmode".to_string(),
                 local_path: None,
+                ignore_patterns: None,
             },
             &ctx,
         );
@@ -3342,6 +3445,7 @@ mod tests {
             CliRequest::CreateFolder {
                 name: "TestFiles".to_string(),
                 local_path: None,
+                ignore_patterns: None,
             },
             &ctx,
         );
@@ -3541,6 +3645,7 @@ mod tests {
             CliRequest::CreateFolder {
                 name: "A".to_string(),
                 local_path: None,
+                ignore_patterns: None,
             },
             &ctx,
         );
@@ -3587,6 +3692,7 @@ mod tests {
             CliRequest::CreateFolder {
                 name: "Original".to_string(),
                 local_path: Some(local.to_string_lossy().to_string()),
+                ignore_patterns: None,
             },
             &ctx,
         );
@@ -3640,6 +3746,7 @@ mod tests {
             CliRequest::CreateFolder {
                 name: "Photos".to_string(),
                 local_path: Some(local.to_string_lossy().to_string()),
+                ignore_patterns: None,
             },
             &ctx,
         );
@@ -3719,6 +3826,9 @@ mod tests {
                 paused_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 device_presence: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 endpoint: None,
+                used_invite_nonces: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                signing_key: Arc::new(signing_key.clone()),
+                device_id,
             };
 
             // Create a folder with a local path.
@@ -3726,6 +3836,7 @@ mod tests {
                 CliRequest::CreateFolder {
                     name: "Photos".to_string(),
                     local_path: Some(local.to_string_lossy().to_string()),
+                    ignore_patterns: None,
                 },
                 &ctx,
             );
@@ -3774,7 +3885,7 @@ mod tests {
                 "should have persisted DAG entries"
             );
 
-            let dag = murmur_dag::Dag::new(device_id, signing_key);
+            let dag = murmur_dag::Dag::new(device_id, signing_key.clone());
             let mut engine = murmur_engine::MurmurEngine::from_dag(dag, platform);
             for entry_bytes in &persisted_entries {
                 engine.load_entry_bytes(entry_bytes).unwrap();
@@ -3803,6 +3914,9 @@ mod tests {
                 paused_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 device_presence: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 endpoint: None,
+                used_invite_nonces: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                signing_key: Arc::new(signing_key),
+                device_id,
             };
 
             // Verify folder survives restart.
@@ -3828,5 +3942,145 @@ mod tests {
                 other => panic!("expected Folders, got {other:?}"),
             }
         }
+    }
+
+    // -- Onboarding: pairing invites --
+
+    #[test]
+    fn test_issue_pairing_invite_returns_valid_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        let resp = process_request(CliRequest::IssuePairingInvite, &ctx);
+        match resp {
+            CliResponse::PairingInvite {
+                url,
+                expires_at_unix,
+            } => {
+                assert!(url.starts_with("murmur://join?token="));
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                assert!(expires_at_unix > now);
+                assert!(expires_at_unix <= now + 301); // default 5 min + slack
+                // URL should parse back into a valid token.
+                let t = murmur_seed::PairingToken::from_url(&url).expect("parse");
+                assert_eq!(t.expires_at_unix, expires_at_unix);
+            }
+            other => panic!("expected PairingInvite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_issued_invite_redeems_to_same_mnemonic() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let expected_mnemonic = ctx.mnemonic.clone();
+
+        let url = match process_request(CliRequest::IssuePairingInvite, &ctx) {
+            CliResponse::PairingInvite { url, .. } => url,
+            other => panic!("expected PairingInvite, got {other:?}"),
+        };
+
+        let resp = process_request(CliRequest::RedeemPairingInvite { url }, &ctx);
+        match resp {
+            CliResponse::RedeemedMnemonic {
+                mnemonic,
+                issued_by,
+            } => {
+                assert_eq!(mnemonic, expected_mnemonic);
+                assert_eq!(issued_by, ctx.device_id.to_string());
+            }
+            other => panic!("expected RedeemedMnemonic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_redeem_rejects_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        let url = match process_request(CliRequest::IssuePairingInvite, &ctx) {
+            CliResponse::PairingInvite { url, .. } => url,
+            other => panic!("got {other:?}"),
+        };
+
+        // First redeem succeeds.
+        let first = process_request(CliRequest::RedeemPairingInvite { url: url.clone() }, &ctx);
+        assert!(matches!(first, CliResponse::RedeemedMnemonic { .. }));
+
+        // Second redeem of the same URL is rejected.
+        let second = process_request(CliRequest::RedeemPairingInvite { url }, &ctx);
+        match second {
+            CliResponse::Error { message } => {
+                assert!(
+                    message.contains("already redeemed"),
+                    "unexpected error text: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_redeem_rejects_bad_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        let resp = process_request(
+            CliRequest::RedeemPairingInvite {
+                url: "not-a-valid-url".to_string(),
+            },
+            &ctx,
+        );
+        match resp {
+            CliResponse::Error { message } => {
+                assert!(message.contains("invalid invite URL"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_create_folder_writes_template_ignore_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("proj");
+        std::fs::create_dir_all(&local).unwrap();
+        let ctx = test_ctx(dir.path());
+
+        let patterns = "target/\nCargo.lock\n".to_string();
+        let resp = process_request(
+            CliRequest::CreateFolder {
+                name: "Proj".to_string(),
+                local_path: Some(local.to_string_lossy().to_string()),
+                ignore_patterns: Some(patterns.clone()),
+            },
+            &ctx,
+        );
+        assert!(matches!(resp, CliResponse::Ok { .. }));
+
+        let written = std::fs::read_to_string(local.join(".murmurignore")).unwrap();
+        assert_eq!(written, patterns);
+    }
+
+    #[test]
+    fn test_create_folder_without_template_writes_no_ignore_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("bare");
+        std::fs::create_dir_all(&local).unwrap();
+        let ctx = test_ctx(dir.path());
+
+        let resp = process_request(
+            CliRequest::CreateFolder {
+                name: "Bare".to_string(),
+                local_path: Some(local.to_string_lossy().to_string()),
+                ignore_patterns: None,
+            },
+            &ctx,
+        );
+        assert!(matches!(resp, CliResponse::Ok { .. }));
+
+        assert!(!local.join(".murmurignore").exists());
     }
 }

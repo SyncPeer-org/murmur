@@ -8,7 +8,7 @@ For each milestone: implement, test, `cargo clippy -- -D warnings`, `cargo fmt`,
 For architecture and design details, see [architecture.md](architecture.md).
 For a feature overview, see [features.md](features.md).
 
-## Current Status (as of 2026-04-16)
+## Current Status (as of 2026-04-17)
 
 | Milestone                                                        | Status     |
 | ---------------------------------------------------------------- | ---------- |
@@ -24,7 +24,7 @@ For a feature overview, see [features.md](features.md).
 | 26 — Settings & Configuration UI                                 | ✅ Done    |
 | 27 — Diagnostics & Network Health                                | ✅ Done    |
 | 29 — Conflict Resolution Improvements                            | 🔲 Planned |
-| 30 — Onboarding                                                  | 🔲 Planned |
+| 30 — Onboarding                                                  | ✅ Done    |
 | 31 — Sync Progress & Desktop UX Polish                           | 🔲 Planned |
 | 32 — Miscellaneous Quality-of-Life                               | 🔲 Planned |
 | 33 — Cross-Platform Desktop Builds & Distribution                | 🔲 Planned |
@@ -62,39 +62,80 @@ work consistently across CLI and desktop — conflicts are mostly resolved in th
 
 ---
 
-## Milestone 30 — Onboarding
+## Milestone 30 — Onboarding ✅ Done
 
-Streamline the device pairing and folder setup experience. Reduce reliance on typing
-12 words; reduce risk of mnemonic leakage; add the standard "verify backup" gate.
+Streamline device pairing and folder setup. Reduce reliance on typing 12 words and
+template the common `.murmurignore` cases. The mnemonic-verification step from the
+original plan was dropped at the user's request — see "Scope changes" below.
 
-### Features
+### Features (shipped)
 
-- **QR pairing token (preferred)** — short-lived pairing token (mnemonic-derived nonce + expiry, ed25519-signed by an existing device) rendered as a `murmur://join?token=…` URL inside a QR code. Joiner scans, authenticates, exchanges to receive the actual mnemonic over a one-shot encrypted channel. Token expires in 5 minutes, single-use. Available in both CLI (`murmur-cli pair invite`) and the desktop UI (modal with QR image).
-- **Raw mnemonic QR (fallback)** — `murmur-cli mnemonic qr` for headless / no-second-device scenarios; explicit `--i-understand-this-is-secret` flag.
-- **Mnemonic verification step** — after first-device setup, the user is prompted to re-enter (or pick) words from their freshly generated mnemonic before the daemon considers onboarding "complete". Standard wallet pattern; prevents data loss from users who skip writing it down.
-- **Invite-link URL scheme** — `murmur://join?token=…` deep links on Android (intent filter) and desktop (xdg-mime / Launch Services / Windows registry). Clicking an invite in chat or email opens Murmur in join mode.
-- **Folder templates** — preset `.murmurignore` rule sets per language/use case: `rust` (excludes `target/`, `**/*.rs.bk`), `node` (excludes `node_modules/`, `dist/`, `.next/`), `python` (excludes `.venv/`, `__pycache__/`, `*.pyc`), `photos` (includes only image/video extensions), `documents`, `office` (includes office formats). The generic `code` superset is dropped — language-specific templates produce more useful defaults.
+- **QR pairing token (preferred)** — short-lived [`PairingToken`](../crates/murmur-seed/src/pairing.rs)
+  (32-byte random nonce + 5-minute expiry + issuer `DeviceId` + ed25519 signature +
+  AES-256-GCM-encrypted mnemonic). Encoded as `murmur://join?token=<base64url>`. Mint via
+  `murmur-cli pair invite` (renders an ASCII QR) or the desktop **Devices → Invite device**
+  button. Joiners redeem offline with `murmur-cli pair redeem <url>` — no running daemon
+  needed, since the URL is self-contained.
+- **Raw mnemonic QR (fallback)** — `murmur-cli mnemonic-cmd qr --i-understand-this-is-secret`.
+  Gated behind an explicit consent flag; prints a stderr warning before the QR.
+- **Invite-link URL scheme** — `murmur://join?token=…` deep links. Android registered via
+  `AndroidManifest.xml` intent-filter (`scheme="murmur"`, `host="join"`). Linux registered
+  via `crates/murmur-desktop/packaging/linux/murmur-desktop.desktop` (`MimeType=x-scheme-handler/murmur`).
+  macOS/Windows registration deferred to M33 (signed installers).
+- **Folder templates** — `murmur_ipc::templates::{TEMPLATES, template_patterns}` — stable
+  slugs `rust`, `node`, `python`, `photos`, `documents`, `office`. Exposed via
+  `murmur-cli folder create <name> --local-path <path> --template rust` and as a
+  click-to-prefill button row in the desktop folder-detail "Ignore Patterns" card.
+
+### Scope changes from the original plan
+
+- **Mnemonic verification step was dropped.** Not implemented at user request.
+- **One-shot Noise handshake over iroh was simplified** to a self-contained URL: the
+  mnemonic is encrypted with AES-256-GCM under a key derived (HKDF-SHA256) from the URL's
+  random nonce. Security properties:
+  - Signed origin (joiner verifies the invite came from a real network device).
+  - 5-minute expiry; single-use enforced per-daemon on the issuer side.
+  - **No forward secrecy against URL capture** — same threat model as reading a paper
+    mnemonic. Acceptable because the QR is a brief visual handshake; we don't claim
+    stronger. Documented in `crates/murmur-seed/src/pairing.rs`.
 
 ### Implementation
 
-1. Add `qrcodegen` crate (CLI + desktop). Add `image` (PNG render) for the desktop modal.
-2. Define `PairingToken { nonce: [u8; 32], expires_at_unix: u64, issued_by: DeviceId, signature: [u8; 64] }`. Add `IssuePairingInvite` and `RedeemPairingInvite` IPC requests. Token redemption performs a one-shot Noise-style handshake over iroh that delivers the mnemonic encrypted to a key the joiner derived from the token.
-3. Implement `murmur-cli pair invite` — calls `IssuePairingInvite`, prints the `murmur://` URL plus a terminal QR rendering. Implement `murmur-cli pair redeem <url>` for headless joiners.
-4. Implement `murmur-cli mnemonic qr` (raw fallback) — gated behind explicit flag, prints a warning.
-5. Add a "Verify your mnemonic" step to first-run onboarding (CLI prompt + desktop modal). Persist a `mnemonic_verified_at: Option<u64>` field in config; surface a banner in the desktop UI if unverified.
-6. Add `MURMUR_URL_SCHEME=murmur` registration: desktop installer / `.desktop` file (Linux), `Info.plist` (macOS, M33), Android intent filter (already partially in place — verify).
-7. Define built-in template map in `murmur-cli`: `rust`, `node`, `python`, `photos`, `documents`, `office`. Add `--template <name>` flag to `murmur-cli folder create`; write patterns via `SetIgnorePatterns` IPC.
-8. Expose templates in the desktop app's create-folder flow as a dropdown with previews.
+1. `qrcodegen` added to `murmur-cli` and `murmur-desktop` workspace deps. `image` and
+   `data-encoding` added to the workspace; `data-encoding` + `aes-gcm` + `postcard`
+   promoted to hard deps of `murmur-seed` for the pairing module.
+2. `murmur-seed::pairing` module hosts `PairingToken`, `PairingError`,
+   `MURMUR_URL_SCHEME`, `JOIN_URL_HOST`, `DEFAULT_EXPIRY_SECS`, plus
+   `issue` / `issue_default` / `redeem` / `to_url` / `from_url`.
+3. `murmur-ipc` gained `CliRequest::{IssuePairingInvite, RedeemPairingInvite}` and
+   `CliResponse::{PairingInvite, RedeemedMnemonic}`. `CliRequest::CreateFolder` gained
+   an optional `ignore_patterns` field written to `.murmurignore` after folder creation.
+4. Daemon signs invites with its device key; tracks redeemed nonces in-process to reject
+   same-daemon replays.
+5. `murmur-cli pair invite` renders a terminal QR (half-block ASCII). `pair redeem`
+   works fully offline — no daemon needed on the joining side.
+6. `murmur-ipc::templates` is the single source of truth for template slugs, descriptions,
+   and patterns. Both the CLI (`--template`) and the desktop template-row buttons consume
+   it directly.
+7. Linux URL-scheme registration shipped as a `.desktop` file in
+   `crates/murmur-desktop/packaging/linux/`. Android manifest updated. macOS/Windows
+   packaging intentionally deferred to M33.
 
 ### Tests
 
-- Unit test: pairing token signature verifies; expired token rejected; replayed token rejected (single-use enforcement)
-- Integration test: device A issues invite → device B redeems → mnemonic delivered → device B can join the network
-- Unit test: QR encoding roundtrip for both pairing token and raw mnemonic
-- Unit test: each template produces valid, non-empty ignore patterns
-- Unit test: mnemonic verification accepts correct words, rejects wrong ones, tolerates whitespace
-- CLI test: `folder create --template rust` creates folder with correct `.murmurignore`
-- Integration test: clicking a `murmur://join?token=…` URL launches the app in join mode (manual verification on Linux)
+- `murmur-seed::pairing`: 9 unit tests covering sign/verify, URL roundtrip, expiry,
+  wrong-issuer rejection, tampered-ciphertext rejection, trailing-fragment tolerance,
+  nonce uniqueness, default expiry window.
+- `murmur-ipc::templates`: every slug has patterns + description; non-empty; unknown
+  slug returns `None`; key templates exclude/include expected paths.
+- `murmurd` bin tests: `IssuePairingInvite` returns a parseable URL, the same daemon's
+  `RedeemPairingInvite` recovers the network mnemonic, replays are rejected, invalid
+  URLs are rejected, `CreateFolder { ignore_patterns: Some(...) }` writes `.murmurignore`,
+  and `None` does not.
+- `murmur-cli::offline`: re-export parity with `murmur-ipc::templates`.
+- Integration (`tests/integration/pairing.rs`): end-to-end invite → redeem → identical
+  `NetworkIdentity`; cross-signed invites rejected; expired invites rejected; every
+  template slug exposes non-empty multi-line patterns.
 
 ---
 

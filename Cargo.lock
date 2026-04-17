@@ -3763,6 +3763,7 @@ dependencies = [
  "clap",
  "murmur-ipc",
  "murmur-seed",
+ "qrcodegen",
  "serde",
  "serde_json",
  "tempfile",
@@ -3846,6 +3847,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "murmur-dag",
  "murmur-engine",
+ "murmur-ipc",
  "murmur-seed",
  "murmur-types",
  "rand 0.10.0",
@@ -3883,8 +3885,10 @@ dependencies = [
 name = "murmur-seed"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "bip39",
  "blake3",
+ "data-encoding",
  "ed25519-dalek 2.2.0",
  "hkdf",
  "murmur-types",
@@ -5170,6 +5174,12 @@ checksum = "3e36c2f31e0a47f9280fb347ef5e461ffcd2c52dd520d8e216b52f93b0b0d7d6"
 dependencies = [
  "thiserror 1.0.69",
 ]
+
+[[package]]
+name = "qrcodegen"
+version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4339fc7a1021c9c1621d87f5e3505f2805c8c105420ba2f2a4df86814590c142"
 
 [[package]]
 name = "quick-xml"

@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub mod templates;
+
 /// Error type for IPC operations.
 #[derive(Debug, thiserror::Error)]
 pub enum IpcError {
@@ -71,6 +73,9 @@ pub enum CliRequest {
         /// Local directory path to sync. If provided, murmurd registers it in
         /// config and starts watching for files.
         local_path: Option<String>,
+        /// Optional initial `.murmurignore` content (folder templates).
+        /// Only written to disk when a `local_path` is also provided.
+        ignore_patterns: Option<String>,
     },
     /// Remove a shared folder.
     RemoveFolder {
@@ -300,6 +305,18 @@ pub enum CliRequest {
         /// Output file path.
         output_path: String,
     },
+
+    // -- Onboarding: pairing invites --
+    /// Issue a short-lived pairing invite (signed token carrying the encrypted
+    /// mnemonic). Used by `murmur-cli pair invite` and the desktop pairing
+    /// modal.
+    IssuePairingInvite,
+    /// Redeem a pairing invite URL offline — validates signature and expiry,
+    /// returns the decrypted mnemonic. Used by `murmur-cli pair redeem <url>`.
+    RedeemPairingInvite {
+        /// A `murmur://join?token=…` URL.
+        url: String,
+    },
 }
 
 /// A response sent from `murmurd` to `murmur-cli`.
@@ -479,6 +496,23 @@ pub enum CliResponse {
         relay_reachable: bool,
         /// Round-trip latency in milliseconds (if reachable).
         latency_ms: Option<u64>,
+    },
+
+    // -- Onboarding: pairing invites --
+    /// A freshly issued pairing invite URL (response to `IssuePairingInvite`).
+    PairingInvite {
+        /// Full `murmur://join?token=…` URL. Clients render this as a QR code.
+        url: String,
+        /// UNIX timestamp (seconds) at which the invite stops being valid.
+        expires_at_unix: u64,
+    },
+    /// Mnemonic extracted from a redeemed pairing invite (response to
+    /// `RedeemPairingInvite`).
+    RedeemedMnemonic {
+        /// The BIP39 mnemonic phrase.
+        mnemonic: String,
+        /// Device ID of the issuer, as 64-character hex.
+        issued_by: String,
     },
 }
 
@@ -796,6 +830,16 @@ mod tests {
             CliRequest::CreateFolder {
                 name: "Photos".to_string(),
                 local_path: Some("/home/user/Photos".to_string()),
+                ignore_patterns: None,
+            },
+            CliRequest::CreateFolder {
+                name: "Rust Project".to_string(),
+                local_path: Some("/home/user/code/proj".to_string()),
+                ignore_patterns: Some("target/\n**/*.rs.bk\n".to_string()),
+            },
+            CliRequest::IssuePairingInvite,
+            CliRequest::RedeemPairingInvite {
+                url: "murmur://join?token=abc".to_string(),
             },
             CliRequest::RemoveFolder {
                 folder_id_hex: "cc".repeat(32),
@@ -1180,6 +1224,15 @@ mod tests {
                 relay_reachable: true,
                 latency_ms: Some(42),
             },
+            // Onboarding: pairing invites
+            CliResponse::PairingInvite {
+                url: "murmur://join?token=abc".to_string(),
+                expires_at_unix: 1_700_000_000,
+            },
+            CliResponse::RedeemedMnemonic {
+                mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),
+                issued_by: "aa".repeat(32),
+            },
         ];
         for resp in variants {
             let bytes = postcard::to_allocvec(&resp).unwrap();
@@ -1322,31 +1375,31 @@ mod tests {
         // If someone adds or removes a CliResponse variant, this test
         // forces them to also update the golden-byte tests above.
         //
-        // Serialize the LAST variant (ConnectivityResult) — if a new variant
-        // is appended, its discriminant will differ from what we expect here.
-        let last = CliResponse::ConnectivityResult {
-            relay_reachable: true,
-            latency_ms: None,
+        // Last variant is now RedeemedMnemonic. Variant index 24 (0x18),
+        // then strings "m" and "i" (each len 1 + byte).
+        let last = CliResponse::RedeemedMnemonic {
+            mnemonic: "m".to_string(),
+            issued_by: "i".to_string(),
         };
         let bytes = postcard::to_allocvec(&last).unwrap();
-        // Variant index 22 = 0x16, then bool true = 0x01, Option None = 0x00
         assert_eq!(
             hex(&bytes),
-            "160100",
+            "18016d0169",
             "CliResponse variant count changed — update golden-byte tests for new variants"
         );
     }
 
     #[test]
     fn test_request_variant_count_guard() {
-        let last = CliRequest::ExportDiagnostics {
-            output_path: "x".to_string(),
+        // Last variant is now RedeemPairingInvite. Variant index 51 (0x33),
+        // then string payload ("x" = len 1 + byte).
+        let last = CliRequest::RedeemPairingInvite {
+            url: "x".to_string(),
         };
         let bytes = postcard::to_allocvec(&last).unwrap();
-        // Variant index 49 = 0x31, then string "x" (len 1 + byte)
         assert_eq!(
             hex(&bytes),
-            "310178",
+            "330178",
             "CliRequest variant count changed — update golden-byte tests for new variants"
         );
     }

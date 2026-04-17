@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Murmur
+GenericName=Private Device Sync
+Comment=Syncthing-style private peer-to-peer folder sync
+Exec=murmur-desktop %u
+Icon=murmur
+Terminal=false
+Categories=Network;FileTransfer;
+# handle murmur://join?token=… pairing URLs.
+MimeType=x-scheme-handler/murmur;
+StartupWMClass=murmur-desktop
+Keywords=sync;p2p;backup;files;

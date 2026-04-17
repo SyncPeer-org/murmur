@@ -273,8 +273,27 @@ impl App {
 
         // Ignore patterns
         let fid = folder.folder_id.clone();
+        // Template selector — click a slug to prefill the patterns input,
+        // then Save to write `.murmurignore`.
+        let mut template_row = row![text("Template:").size(12).color(TEXT_MUTED),]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+        for slug in murmur_ipc::templates::TEMPLATES {
+            template_row = template_row.push(
+                button(text(*slug).size(12))
+                    .on_press(Message::ApplyFolderTemplate((*slug).to_string()))
+                    .style(secondary_btn)
+                    .padding(iced::Padding {
+                        top: 3.0,
+                        right: 10.0,
+                        bottom: 3.0,
+                        left: 10.0,
+                    }),
+            );
+        }
         let ignore_section = column![
             text("Ignore Patterns").size(14).color(TEXT_SECONDARY),
+            template_row,
             row![
                 text_input(".murmurignore patterns", &self.folder_ignore_patterns)
                     .on_input(Message::FolderIgnorePatternsChanged)

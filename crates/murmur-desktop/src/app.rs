@@ -105,6 +105,15 @@ pub struct App {
     pub(crate) peers: Vec<PeerInfoIpc>,
     pub(crate) storage_stats: Option<StorageStatsCache>,
     pub(crate) connectivity_result: Option<(bool, Option<u64>)>,
+    /// Current pairing invite (URL + expiry) shown in the Devices view.
+    pub(crate) pairing_invite: Option<PairingInviteCache>,
+}
+
+/// Cached pairing-invite state for display.
+#[derive(Debug, Clone)]
+pub struct PairingInviteCache {
+    pub url: String,
+    pub expires_at_unix: u64,
 }
 
 /// Cached storage stats for display.
@@ -172,6 +181,7 @@ impl App {
             peers: Vec::new(),
             storage_stats: None,
             connectivity_result: None,
+            pairing_invite: None,
         };
         let path = app.socket_path.clone();
         (

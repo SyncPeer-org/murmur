@@ -10,7 +10,56 @@ use crate::style::*;
 
 impl App {
     pub(crate) fn view_devices(&self) -> Element<'_, Message> {
-        let mut col = column![text("Devices").size(24).color(Color::WHITE),].spacing(16);
+        let mut col = column![
+            row![
+                text("Devices")
+                    .size(24)
+                    .color(Color::WHITE)
+                    .width(Length::Fill),
+                button(text("Invite device").size(13))
+                    .on_press(Message::IssuePairingInvite)
+                    .style(primary_btn)
+                    .padding(iced::Padding {
+                        top: 6.0,
+                        right: 16.0,
+                        bottom: 6.0,
+                        left: 16.0,
+                    }),
+            ]
+            .align_y(iced::Alignment::Center),
+        ]
+        .spacing(16);
+
+        // Pairing invite card.
+        if let Some(invite) = &self.pairing_invite {
+            let expiry_note = format!(
+                "Valid until UNIX {} — share this URL with the joining device.",
+                invite.expires_at_unix
+            );
+            let card = container(
+                column![
+                    text("Pairing Invite").size(14).color(TEXT_SECONDARY),
+                    text(&invite.url).size(12).color(Color::WHITE),
+                    text(expiry_note).size(11).color(TEXT_MUTED),
+                    row![
+                        button(text("Copy URL").size(12))
+                            .on_press(Message::CopyPairingInviteUrl)
+                            .style(primary_btn)
+                            .padding(6),
+                        button(text("Dismiss").size(12))
+                            .on_press(Message::ClearPairingInvite)
+                            .style(secondary_btn)
+                            .padding(6),
+                    ]
+                    .spacing(6),
+                ]
+                .spacing(6),
+            )
+            .padding(14)
+            .width(Length::Fill)
+            .style(card_style);
+            col = col.push(card);
+        }
 
         // This device
         if let Some(local) = self

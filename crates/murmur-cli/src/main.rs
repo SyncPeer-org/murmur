@@ -96,6 +96,40 @@ enum Command {
         /// File path within the folder.
         path: String,
     },
+    /// Pairing-invite commands
+    #[command(subcommand)]
+    Pair(PairCommand),
+    /// Mnemonic helpers, including a raw-mnemonic QR fallback
+    #[command(subcommand)]
+    MnemonicCmd(MnemonicCommand),
+}
+
+/// Pairing-invite subcommands.
+#[derive(Subcommand)]
+enum PairCommand {
+    /// Issue a signed pairing invite, rendered as a `murmur://` URL + QR.
+    Invite,
+    /// Redeem a `murmur://join?token=…` URL — prints the mnemonic.
+    ///
+    /// Works offline — the URL is self-contained.
+    Redeem {
+        /// The `murmur://join?token=…` URL.
+        url: String,
+    },
+}
+
+/// Mnemonic subcommands (subcommands of `mnemonic-cmd` to avoid clashing with
+/// the older top-level `mnemonic` command that prints the current network's
+/// phrase).
+#[derive(Subcommand)]
+enum MnemonicCommand {
+    /// Render the current mnemonic as a QR code (dangerous — prefer
+    /// `pair invite`). Requires an explicit consent flag.
+    Qr {
+        /// Explicit acknowledgement that the mnemonic is a secret.
+        #[arg(long = "i-understand-this-is-secret")]
+        acknowledged: bool,
+    },
 }
 
 /// Folder management subcommands.
@@ -105,6 +139,14 @@ enum FolderCommand {
     Create {
         /// Folder name.
         name: String,
+        /// Optional local directory path to back the folder.
+        #[arg(long)]
+        local_path: Option<String>,
+        /// Optional built-in ignore-file template (requires `--local-path`).
+        ///
+        /// One of: `rust`, `node`, `python`, `photos`, `documents`, `office`.
+        #[arg(long)]
+        template: Option<String>,
     },
     /// List all shared folders.
     List,
@@ -165,7 +207,15 @@ fn main() {
 
     let result = match cli.command {
         Command::Join { mnemonic, name } => offline::cmd_join(&cli.data_dir, &mnemonic, &name),
-        // All online commands go through the socket.
+        // Pair redeem works fully offline — the URL is self-contained.
+        Command::Pair(PairCommand::Redeem { ref url }) => cmd_pair_redeem_offline(url),
+        // Pair invite: contact daemon, render URL as QR.
+        Command::Pair(PairCommand::Invite) => cmd_pair_invite_online(&cli.data_dir, cli.json),
+        // Mnemonic QR fallback: gated by an explicit --i-understand-this-is-secret flag.
+        Command::MnemonicCmd(MnemonicCommand::Qr { acknowledged }) => {
+            cmd_mnemonic_qr_online(&cli.data_dir, acknowledged, cli.json)
+        }
+        // All other online commands go through the socket.
         cmd => run_online(&cli.data_dir, cmd, cli.json),
     };
 
@@ -173,6 +223,160 @@ fn main() {
         eprintln!("error: {e:#}");
         process::exit(1);
     }
+}
+
+/// Offline redeem: parse + verify the URL locally and print the mnemonic.
+///
+/// This works even when the joiner doesn't have a running daemon, which is
+/// the common case — they haven't joined the network yet.
+fn cmd_pair_redeem_offline(url: &str) -> Result<()> {
+    let token = murmur_seed::PairingToken::from_url(url).context("parse invite URL")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let mnemonic = token.redeem(now).context("redeem invite")?;
+    println!("Invite valid — issued by {}.", token.issued_by);
+    println!("Mnemonic:");
+    println!("{mnemonic}");
+    println!();
+    println!("To join this network, run: murmur-cli join \"{mnemonic}\" --name <your device name>");
+    Ok(())
+}
+
+/// Online pair invite: ask daemon to mint an invite, then render the returned
+/// URL as an ASCII QR code.
+fn cmd_pair_invite_online(base_dir: &std::path::Path, json: bool) -> Result<()> {
+    let response = send_single(base_dir, CliRequest::IssuePairingInvite)?;
+    if json {
+        return print_json(&response);
+    }
+    match response {
+        CliResponse::PairingInvite {
+            url,
+            expires_at_unix,
+        } => {
+            println!("Pairing invite (valid for 5 minutes):");
+            println!();
+            println!("{url}");
+            println!();
+            println!("{}", render_qr_ascii(&url));
+            println!("Expires at UNIX {expires_at_unix}.");
+            println!(
+                "The joining device can scan this QR or run `murmur-cli pair redeem '<url>'`."
+            );
+            Ok(())
+        }
+        CliResponse::Error { message } => {
+            eprintln!("error: {message}");
+            process::exit(1);
+        }
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+/// Online mnemonic-QR fallback. Requires the caller to pass
+/// `--i-understand-this-is-secret` to affirm they grasp the risk.
+fn cmd_mnemonic_qr_online(
+    base_dir: &std::path::Path,
+    acknowledged: bool,
+    json: bool,
+) -> Result<()> {
+    if !acknowledged {
+        anyhow::bail!(
+            "refusing to render a raw mnemonic QR. Re-run with \
+             --i-understand-this-is-secret to acknowledge that anyone who sees \
+             the QR gains full control of your network."
+        );
+    }
+    let response = send_single(base_dir, CliRequest::ShowMnemonic)?;
+    if json {
+        return print_json(&response);
+    }
+    match response {
+        CliResponse::Mnemonic { mnemonic } => {
+            eprintln!(
+                "WARNING: the QR below encodes your raw mnemonic. \
+                 Keep the screen hidden and clear it when done."
+            );
+            eprintln!();
+            println!("{}", render_qr_ascii(&mnemonic));
+            Ok(())
+        }
+        CliResponse::Error { message } => {
+            eprintln!("error: {message}");
+            process::exit(1);
+        }
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+/// Send a single request to the daemon and return its response.
+///
+/// Kept private because [`run_online`] already handles the common case with
+/// automatic rendering — this wrapper is for callers that need to inspect the
+/// response structurally.
+fn send_single(base_dir: &std::path::Path, request: CliRequest) -> Result<CliResponse> {
+    let sock_path = murmur_ipc::socket_path(base_dir);
+    let mut stream = UnixStream::connect(&sock_path).with_context(|| {
+        format!(
+            "murmurd is not running (socket not found at {})",
+            sock_path.display()
+        )
+    })?;
+    murmur_ipc::send_message(&mut stream, &request)?;
+    let response = murmur_ipc::recv_message(&mut stream)?;
+    Ok(response)
+}
+
+/// Render arbitrary text as a monochrome ASCII QR code using full/half blocks.
+///
+/// Uses `qrcodegen` at medium error-correction level — sufficient for invite
+/// URLs displayed on screen or printed on paper.
+fn render_qr_ascii(text: &str) -> String {
+    use qrcodegen::{QrCode, QrCodeEcc};
+    let qr = match QrCode::encode_text(text, QrCodeEcc::Medium) {
+        Ok(qr) => qr,
+        Err(_) => return format!("<failed to render QR for {text}>"),
+    };
+    let size = qr.size();
+    let mut out = String::new();
+    // Quiet zone: 2 rows top/bottom, 2 modules left/right, using half-block
+    // characters so each terminal row encodes 2 QR rows.
+    let border = 2i32;
+    let h_border = "  ".repeat((size as usize + border as usize * 2).max(0));
+    out.push_str(&h_border);
+    out.push('\n');
+    let mut y = -border;
+    while y < size + border {
+        // Left quiet zone.
+        for _ in 0..border {
+            out.push_str("  ");
+        }
+        for x in -border..size + border {
+            let top = qr.get_module(x, y);
+            let bottom = if y + 1 < size + border {
+                qr.get_module(x, y + 1)
+            } else {
+                false
+            };
+            // Two horizontal spaces per module for aspect ratio.
+            let ch = match (top, bottom) {
+                (false, false) => "  ",
+                (true, false) => "\u{2580}\u{2580}", // upper half
+                (false, true) => "\u{2584}\u{2584}", // lower half
+                (true, true) => "\u{2588}\u{2588}",  // full block
+            };
+            out.push_str(ch);
+        }
+        // Right quiet zone.
+        for _ in 0..border {
+            out.push_str("  ");
+        }
+        out.push('\n');
+        y += 2;
+    }
+    out
 }
 
 /// Execute an online command by connecting to the daemon socket.
@@ -222,10 +426,37 @@ fn command_to_request(command: Command) -> CliRequest {
         Command::Add { path } => CliRequest::AddFile { path },
         Command::Transfers => CliRequest::TransferStatus,
         Command::Folder(sub) => match sub {
-            FolderCommand::Create { name } => CliRequest::CreateFolder {
+            FolderCommand::Create {
                 name,
-                local_path: None,
-            },
+                local_path,
+                template,
+            } => {
+                let ignore_patterns = match template.as_deref() {
+                    Some(slug) => match offline::template_patterns(slug) {
+                        Some(p) => Some(p),
+                        None => {
+                            eprintln!(
+                                "error: unknown template '{slug}'. Available: {}",
+                                offline::TEMPLATES.join(", ")
+                            );
+                            process::exit(1);
+                        }
+                    },
+                    None => None,
+                };
+                if template.is_some() && local_path.is_none() {
+                    eprintln!(
+                        "error: --template requires --local-path (the ignore file is \
+                         written to the folder's local directory)."
+                    );
+                    process::exit(1);
+                }
+                CliRequest::CreateFolder {
+                    name,
+                    local_path,
+                    ignore_patterns,
+                }
+            }
             FolderCommand::List => CliRequest::ListFolders,
             FolderCommand::Subscribe {
                 folder_id,
@@ -279,8 +510,11 @@ fn command_to_request(command: Command) -> CliRequest {
             folder_id_hex: folder_id,
             path,
         },
-        // Join is handled before we get here.
-        Command::Join { .. } => unreachable!(),
+        Command::Pair(PairCommand::Invite) => CliRequest::IssuePairingInvite,
+        // MnemonicCmd::Qr needs the current mnemonic from the daemon.
+        Command::MnemonicCmd(MnemonicCommand::Qr { .. }) => CliRequest::ShowMnemonic,
+        // Join and Pair Redeem are handled before we get here.
+        Command::Join { .. } | Command::Pair(PairCommand::Redeem { .. }) => unreachable!(),
     }
 }
 
@@ -574,6 +808,23 @@ fn print_plain(response: &CliResponse) {
         }
         CliResponse::Error { message } => {
             eprintln!("error: {message}");
+        }
+        // handled directly by dedicated commands; included here so the
+        // generic dispatch path (JSON / unexpected shape) still formats them
+        // without panicking.
+        CliResponse::PairingInvite {
+            url,
+            expires_at_unix,
+        } => {
+            println!("Pairing invite URL: {url}");
+            println!("Expires at UNIX {expires_at_unix}.");
+        }
+        CliResponse::RedeemedMnemonic {
+            mnemonic,
+            issued_by,
+        } => {
+            println!("Issuer: {issued_by}");
+            println!("{mnemonic}");
         }
     }
 }

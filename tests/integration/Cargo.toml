@@ -28,11 +28,16 @@ path = "conflict_resolution.rs"
 name = "file_operations"
 path = "file_operations.rs"
 
+[[test]]
+name = "pairing"
+path = "pairing.rs"
+
 [dependencies]
 murmur-types = { workspace = true }
 murmur-seed = { workspace = true }
 murmur-dag = { workspace = true }
 murmur-engine = { workspace = true }
+murmur-ipc = { workspace = true }
 blake3 = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
