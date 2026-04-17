@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use iced::{Color, Task, Theme};
 
 use murmur_ipc::{
-    CliRequest, ConflictInfoIpc, DeviceInfoIpc, DevicePresenceIpc, FileInfoIpc, FileVersionIpc,
-    FolderInfoIpc, FolderSubscriberIpc, NetworkFolderInfoIpc, PeerInfoIpc,
+    CliRequest, ConflictDiffSide, ConflictInfoIpc, DeviceInfoIpc, DevicePresenceIpc, FileInfoIpc,
+    FileVersionIpc, FolderInfoIpc, FolderSubscriberIpc, NetworkFolderInfoIpc, PeerInfoIpc,
 };
 
 use crate::daemon;
@@ -107,6 +107,22 @@ pub struct App {
     pub(crate) connectivity_result: Option<(bool, Option<u64>)>,
     /// Current pairing invite (URL + expiry) shown in the Devices view.
     pub(crate) pairing_invite: Option<PairingInviteCache>,
+    /// Cached conflict diffs keyed by (folder_id, path) (M29).
+    pub(crate) conflict_diffs: std::collections::HashMap<(String, String), ConflictDiffCache>,
+    /// Which conflict diff panels are currently expanded (M29).
+    pub(crate) expanded_conflict_diffs: std::collections::HashSet<(String, String)>,
+    /// Draft text for the current folder's auto-resolve setting.
+    pub(crate) folder_auto_resolve_input: String,
+    /// Draft text for the current folder's conflict-expiry input (days).
+    pub(crate) folder_conflict_expiry_input: String,
+}
+
+/// Cached conflict diff data (M29).
+#[derive(Debug, Clone)]
+pub struct ConflictDiffCache {
+    pub is_text: bool,
+    pub left: ConflictDiffSide,
+    pub right: ConflictDiffSide,
 }
 
 /// Cached pairing-invite state for display.
@@ -182,6 +198,10 @@ impl App {
             storage_stats: None,
             connectivity_result: None,
             pairing_invite: None,
+            conflict_diffs: std::collections::HashMap::new(),
+            expanded_conflict_diffs: std::collections::HashSet::new(),
+            folder_auto_resolve_input: String::new(),
+            folder_conflict_expiry_input: String::new(),
         };
         let path = app.socket_path.clone();
         (

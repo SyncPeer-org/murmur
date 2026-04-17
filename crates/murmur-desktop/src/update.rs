@@ -153,6 +153,7 @@ impl App {
                 download_throttle,
                 sync_paused,
                 device_name,
+                folders,
                 ..
             })) => {
                 self.cfg_auto_approve = auto_approve;
@@ -161,6 +162,18 @@ impl App {
                 self.cfg_download_throttle = download_throttle;
                 self.sync_paused = sync_paused;
                 self.status_device_name = device_name;
+                // Populate the folder-detail drafts from config so the
+                // Conflict Resolution card reflects reality before the user
+                // edits it (M29).
+                if let Some(selected) = &self.selected_folder
+                    && let Some(fc) = folders.iter().find(|f| f.folder_id == selected.folder_id)
+                {
+                    self.folder_auto_resolve_input = fc.auto_resolve.clone();
+                    self.folder_conflict_expiry_input = fc
+                        .conflict_expiry_days
+                        .map(|d| d.to_string())
+                        .unwrap_or_default();
+                }
             }
             Message::GotMnemonic(Ok(CliResponse::Mnemonic { mnemonic })) => {
                 self.cfg_mnemonic = mnemonic;
@@ -303,9 +316,14 @@ impl App {
                 let fid = folder.folder_id.clone();
                 self.selected_folder = Some(folder);
                 self.screen = Screen::FolderDetail;
+                // Reset drafts; `GotConfig` will repopulate them with the
+                // saved values for the newly-selected folder.
+                self.folder_auto_resolve_input.clear();
+                self.folder_conflict_expiry_input.clear();
                 let p = self.socket_path.clone();
                 let p2 = self.socket_path.clone();
                 let p3 = self.socket_path.clone();
+                let p4 = self.socket_path.clone();
                 let fid2 = fid.clone();
                 let fid3 = fid.clone();
                 return Task::batch([
@@ -331,6 +349,7 @@ impl App {
                         ),
                         Message::GotIgnorePatterns,
                     ),
+                    Task::perform(ipc::send(p4, CliRequest::GetConfig), Message::GotConfig),
                 ]);
             }
             Message::ResolveConflict {
@@ -663,12 +682,119 @@ impl App {
                     tracing::warn!(%slug, "unknown folder template");
                 }
             }
+            // M29: conflict diff + per-folder resolve settings
+            Message::ToggleConflictDiff { folder_id, path } => {
+                let key = (folder_id.clone(), path.clone());
+                if self.expanded_conflict_diffs.contains(&key) {
+                    self.expanded_conflict_diffs.remove(&key);
+                } else {
+                    self.expanded_conflict_diffs.insert(key.clone());
+                    if !self.conflict_diffs.contains_key(&key) {
+                        let s = self.socket_path.clone();
+                        let fid = folder_id.clone();
+                        let p = path.clone();
+                        return Task::perform(
+                            async move {
+                                ipc::send(
+                                    s,
+                                    CliRequest::ConflictDiff {
+                                        folder_id_hex: fid,
+                                        path: p,
+                                    },
+                                )
+                                .await
+                            },
+                            move |response| Message::GotConflictDiff {
+                                folder_id: folder_id.clone(),
+                                path: path.clone(),
+                                response,
+                            },
+                        );
+                    }
+                }
+            }
+            Message::GotConflictDiff {
+                folder_id,
+                path,
+                response,
+            } => match response {
+                Ok(CliResponse::ConflictDiff {
+                    is_text,
+                    left,
+                    right,
+                }) => {
+                    self.conflict_diffs.insert(
+                        (folder_id, path),
+                        crate::app::ConflictDiffCache {
+                            is_text,
+                            left,
+                            right,
+                        },
+                    );
+                }
+                Ok(CliResponse::Error { message }) => {
+                    tracing::warn!(%message, "conflict diff IPC error");
+                    self.push_event(format!("conflict diff: {message}"));
+                }
+                Ok(other) => {
+                    tracing::warn!(?other, "unexpected response to ConflictDiff");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "ConflictDiff IPC failed");
+                }
+            },
+            Message::FolderAutoResolveInputChanged(s) => self.folder_auto_resolve_input = s,
+            Message::FolderConflictExpiryInputChanged(s) => self.folder_conflict_expiry_input = s,
+            Message::SaveFolderAutoResolve(folder_id) => {
+                let strategy = self.folder_auto_resolve_input.clone();
+                let s = self.socket_path.clone();
+                return Task::perform(
+                    ipc::send(
+                        s,
+                        CliRequest::SetFolderAutoResolve {
+                            folder_id_hex: folder_id,
+                            strategy,
+                        },
+                    ),
+                    Message::GotGeneric,
+                );
+            }
+            Message::SaveFolderConflictExpiry(folder_id) => {
+                // Empty input → disable (0). Non-numeric → warn and bail.
+                let days = if self.folder_conflict_expiry_input.trim().is_empty() {
+                    0
+                } else {
+                    match self.folder_conflict_expiry_input.trim().parse::<u64>() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            self.push_event(format!(
+                                "invalid expiry days: {}",
+                                self.folder_conflict_expiry_input
+                            ));
+                            return Task::none();
+                        }
+                    }
+                };
+                let s = self.socket_path.clone();
+                return Task::perform(
+                    ipc::send(
+                        s,
+                        CliRequest::SetConflictExpiry {
+                            folder_id_hex: folder_id,
+                            days,
+                        },
+                    ),
+                    Message::GotGeneric,
+                );
+            }
             // Events
             Message::DaemonEvent(CliResponse::Event { event }) => {
                 self.push_event(format!("{}: {}", event.event_type, event.data));
                 match event.event_type.as_str() {
                     "file_synced" | "dag_synced" => return self.fetch_folders(),
-                    "conflict_detected" => return self.fetch_conflicts(),
+                    "conflict_detected" | "conflict_auto_resolved" => {
+                        return self.fetch_conflicts();
+                    }
                     "device_approved" | "device_join_requested"
                         if self.screen == Screen::Devices =>
                     {

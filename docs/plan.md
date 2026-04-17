@@ -23,119 +23,12 @@ For a feature overview, see [features.md](features.md).
 | 25 — File Browser & Search                                       | ✅ Done    |
 | 26 — Settings & Configuration UI                                 | ✅ Done    |
 | 27 — Diagnostics & Network Health                                | ✅ Done    |
-| 29 — Conflict Resolution Improvements                            | 🔲 Planned |
+| 29 — Conflict Resolution Improvements                            | ✅ Done    |
 | 30 — Onboarding                                                  | ✅ Done    |
 | 31 — Sync Progress & Desktop UX Polish                           | 🔲 Planned |
 | 32 — Miscellaneous Quality-of-Life                               | 🔲 Planned |
 | 33 — Cross-Platform Desktop Builds & Distribution                | 🔲 Planned |
 | 34 — iOS App                                                     | 🔲 Planned |
-
----
-
-## Milestone 29 — Conflict Resolution Improvements
-
-Better tooling and automation for conflict resolution. The diff viewer and expiry must
-work consistently across CLI and desktop — conflicts are mostly resolved in the GUI.
-
-### Features
-
-- **Conflict diff viewer** — unified diff for text file conflicts, available in both CLI (`murmur-cli conflicts diff <folder> <path>`) and the desktop Conflicts view (inline panel)
-- **Conflict expiry** — conflicts older than N days (configurable) that haven't been manually resolved get auto-resolved using the folder's existing auto-resolve strategy (`none/newest/mine` from M22), or fall back to "keep both" if strategy is `none`. Prevents accumulation of stale conflicts without overriding user intent.
-
-### Implementation
-
-1. Add `similar` crate as a dependency of `murmur-cli` and `murmur-desktop`
-2. Add `ConflictDiff` IPC request returning a `ConflictDiff` response with both blobs' raw bytes plus a `is_text: bool` flag (UTF-8 detection done daemon-side, single source of truth)
-3. Implement `conflicts diff` subcommand in `murmur-cli` — render unified diff with `similar::TextDiff`; fall back to "binary files differ — N vs M bytes" for non-text
-4. Add an inline diff preview panel to the desktop `views/conflicts.rs` reusing the same IPC; collapsed by default, expand-on-click
-5. Add `conflict_expiry_days: Option<u64>` to folder config in `config.toml` (default: `None` = disabled)
-6. On each tick / DAG rebuild, check conflict timestamps against expiry. For expired conflicts: invoke the folder's configured auto-resolve strategy if set; otherwise apply "keep both" (write both versions to disk with conflict suffixes). Emit `EngineEvent::ConflictAutoResolved { folder, path, strategy }` so the desktop activity feed surfaces the action.
-7. Add `SetConflictExpiry` IPC request; wire into CLI (`murmur-cli folder set-conflict-expiry <id> <days>`) and desktop settings
-
-### Tests
-
-- Unit test: `similar`-based diff output for known text inputs
-- Unit test: binary detection — non-UTF-8 bytes flagged as binary
-- Unit test: expiry triggers auto-resolve using folder's strategy when set
-- Unit test: expiry falls back to "keep both" when strategy is `none`
-- Integration test: create a conflict, set expiry to 0, verify auto-resolution and event emission
-
----
-
-## Milestone 30 — Onboarding ✅ Done
-
-Streamline device pairing and folder setup. Reduce reliance on typing 12 words and
-template the common `.murmurignore` cases. The mnemonic-verification step from the
-original plan was dropped at the user's request — see "Scope changes" below.
-
-### Features (shipped)
-
-- **QR pairing token (preferred)** — short-lived [`PairingToken`](../crates/murmur-seed/src/pairing.rs)
-  (32-byte random nonce + 5-minute expiry + issuer `DeviceId` + ed25519 signature +
-  AES-256-GCM-encrypted mnemonic). Encoded as `murmur://join?token=<base64url>`. Mint via
-  `murmur-cli pair invite` (renders an ASCII QR) or the desktop **Devices → Invite device**
-  button. Joiners redeem offline with `murmur-cli pair redeem <url>` — no running daemon
-  needed, since the URL is self-contained.
-- **Raw mnemonic QR (fallback)** — `murmur-cli mnemonic-cmd qr --i-understand-this-is-secret`.
-  Gated behind an explicit consent flag; prints a stderr warning before the QR.
-- **Invite-link URL scheme** — `murmur://join?token=…` deep links. Android registered via
-  `AndroidManifest.xml` intent-filter (`scheme="murmur"`, `host="join"`). Linux registered
-  via `crates/murmur-desktop/packaging/linux/murmur-desktop.desktop` (`MimeType=x-scheme-handler/murmur`).
-  macOS/Windows registration deferred to M33 (signed installers).
-- **Folder templates** — `murmur_ipc::templates::{TEMPLATES, template_patterns}` — stable
-  slugs `rust`, `node`, `python`, `photos`, `documents`, `office`. Exposed via
-  `murmur-cli folder create <name> --local-path <path> --template rust` and as a
-  click-to-prefill button row in the desktop folder-detail "Ignore Patterns" card.
-
-### Scope changes from the original plan
-
-- **Mnemonic verification step was dropped.** Not implemented at user request.
-- **One-shot Noise handshake over iroh was simplified** to a self-contained URL: the
-  mnemonic is encrypted with AES-256-GCM under a key derived (HKDF-SHA256) from the URL's
-  random nonce. Security properties:
-  - Signed origin (joiner verifies the invite came from a real network device).
-  - 5-minute expiry; single-use enforced per-daemon on the issuer side.
-  - **No forward secrecy against URL capture** — same threat model as reading a paper
-    mnemonic. Acceptable because the QR is a brief visual handshake; we don't claim
-    stronger. Documented in `crates/murmur-seed/src/pairing.rs`.
-
-### Implementation
-
-1. `qrcodegen` added to `murmur-cli` and `murmur-desktop` workspace deps. `image` and
-   `data-encoding` added to the workspace; `data-encoding` + `aes-gcm` + `postcard`
-   promoted to hard deps of `murmur-seed` for the pairing module.
-2. `murmur-seed::pairing` module hosts `PairingToken`, `PairingError`,
-   `MURMUR_URL_SCHEME`, `JOIN_URL_HOST`, `DEFAULT_EXPIRY_SECS`, plus
-   `issue` / `issue_default` / `redeem` / `to_url` / `from_url`.
-3. `murmur-ipc` gained `CliRequest::{IssuePairingInvite, RedeemPairingInvite}` and
-   `CliResponse::{PairingInvite, RedeemedMnemonic}`. `CliRequest::CreateFolder` gained
-   an optional `ignore_patterns` field written to `.murmurignore` after folder creation.
-4. Daemon signs invites with its device key; tracks redeemed nonces in-process to reject
-   same-daemon replays.
-5. `murmur-cli pair invite` renders a terminal QR (half-block ASCII). `pair redeem`
-   works fully offline — no daemon needed on the joining side.
-6. `murmur-ipc::templates` is the single source of truth for template slugs, descriptions,
-   and patterns. Both the CLI (`--template`) and the desktop template-row buttons consume
-   it directly.
-7. Linux URL-scheme registration shipped as a `.desktop` file in
-   `crates/murmur-desktop/packaging/linux/`. Android manifest updated. macOS/Windows
-   packaging intentionally deferred to M33.
-
-### Tests
-
-- `murmur-seed::pairing`: 9 unit tests covering sign/verify, URL roundtrip, expiry,
-  wrong-issuer rejection, tampered-ciphertext rejection, trailing-fragment tolerance,
-  nonce uniqueness, default expiry window.
-- `murmur-ipc::templates`: every slug has patterns + description; non-empty; unknown
-  slug returns `None`; key templates exclude/include expected paths.
-- `murmurd` bin tests: `IssuePairingInvite` returns a parseable URL, the same daemon's
-  `RedeemPairingInvite` recovers the network mnemonic, replays are rejected, invalid
-  URLs are rejected, `CreateFolder { ignore_patterns: Some(...) }` writes `.murmurignore`,
-  and `None` does not.
-- `murmur-cli::offline`: re-export parity with `murmur-ipc::templates`.
-- Integration (`tests/integration/pairing.rs`): end-to-end invite → redeem → identical
-  `NetworkIdentity`; cross-signed invites rejected; expired invites rejected; every
-  template slug exposes non-empty multi-line patterns.
 
 ---
 
@@ -177,7 +70,7 @@ Small but impactful improvements across daemon, CLI, and filesystem handling.
 Two anti-goals worth calling out:
 
 - **Don't block sync silently.** Several proposed "warnings" can become user-facing
-  stalls if implemented as hard rejects. Default to *quarantine + warn*, never *drop*.
+  stalls if implemented as hard rejects. Default to _quarantine + warn_, never _drop_.
 - **Don't bury signals in `tracing`.** `tracing::warn!` is invisible to GUI users —
   every detection here must also emit an `EngineEvent` so the activity feed surfaces it.
 
@@ -189,7 +82,7 @@ Two anti-goals worth calling out:
 - **`murmur-cli doctor`** — comprehensive self-diagnostic with a `--deep` mode for expensive checks. Default mode is fast (sub-second); `--deep` verifies cryptographic integrity.
 - **Selective scrub** — `murmur-cli scrub <folder>` re-verifies all blob hashes for a folder against the DAG. Used after suspected disk corruption or filesystem repair.
 - **Dry-run flags** — `--dry-run` on destructive operations (`folder remove`, `leave-network`, `reclaim-orphans`) shows what would happen without doing it.
-- **Daemon backup/restore** — `murmur-cli backup <out.tar.zst>` exports config + DAG + key material (encrypted with the mnemonic); `restore <in.tar.zst>` rehydrates a daemon. For migrations and disaster recovery. (Blobs are *not* in the backup — they re-sync from peers.)
+- **Daemon backup/restore** — `murmur-cli backup <out.tar.zst>` exports config + DAG + key material (encrypted with the mnemonic); `restore <in.tar.zst>` rehydrates a daemon. For migrations and disaster recovery. (Blobs are _not_ in the backup — they re-sync from peers.)
 
 ### Implementation
 

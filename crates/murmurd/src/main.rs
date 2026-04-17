@@ -545,6 +545,28 @@ fn run_daemon(base_dir: &Path, default_name: &str, http_port: Option<u16>) -> Re
             device_id,
         });
 
+        // Spawn conflict-expiry tick (M29). Periodically scans folder
+        // configs and auto-resolves conflicts older than their expiry window.
+        let ctx_for_expiry = ctx.clone();
+        let expiry_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                EXPIRE_CONFLICTS_INTERVAL_SECS,
+            ));
+            // First tick fires immediately — skip it so we don't resolve on
+            // startup before the daemon has a chance to stabilise.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let ctx = ctx_for_expiry.clone();
+                // Lock-heavy work runs on the blocking pool so the runtime
+                // stays responsive under large folder counts.
+                let _ = tokio::task::spawn_blocking(move || {
+                    expire_conflicts(&ctx);
+                })
+                .await;
+            }
+        });
+
         let accept_handle = tokio::task::spawn_blocking(move || {
             for stream in listener.incoming() {
                 match stream {
@@ -610,6 +632,7 @@ fn run_daemon(base_dir: &Path, default_name: &str, http_port: Option<u16>) -> Re
         forward_sync_task.abort();
         reverse_sync_task.abort();
         blob_arrived_task.abort();
+        expiry_task.abort();
 
         // Abort HTTP server if running.
         #[cfg(feature = "metrics")]
@@ -888,6 +911,8 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                                 name: folder.name.clone(),
                                 local_path: local.clone(),
                                 mode: SyncMode::Full.as_str().to_string(),
+                                auto_resolve: "none".to_string(),
+                                conflict_expiry_days: None,
                             });
                             persist_config(ctx, &cfg);
                         }
@@ -1097,6 +1122,8 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                                 name: folder_name.clone(),
                                 local_path: PathBuf::from(&local_path),
                                 mode: mode.clone(),
+                                auto_resolve: "none".to_string(),
+                                conflict_expiry_days: None,
                             });
                         }
                         persist_config(ctx, &cfg);
@@ -1403,7 +1430,8 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                     name: f.name.clone(),
                     local_path: f.local_path.to_string_lossy().to_string(),
                     mode: f.mode.clone(),
-                    auto_resolve: "none".to_string(),
+                    auto_resolve: f.auto_resolve.clone(),
+                    conflict_expiry_days: f.conflict_expiry_days,
                 })
                 .collect();
             CliResponse::Config {
@@ -1569,13 +1597,34 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
             }
         }
         CliRequest::SetFolderAutoResolve {
-            folder_id_hex: _,
-            strategy: _,
+            folder_id_hex,
+            strategy,
         } => {
-            // Auto-resolve is stored in config but not yet fully wired to
-            // automatic engine callbacks. Save the preference.
-            CliResponse::Ok {
-                message: "Auto-resolve preference saved.".to_string(),
+            // Validate strategy up-front so typos surface as errors, not a
+            // silent no-op on the next expiry tick.
+            if !matches!(strategy.as_str(), "none" | "newest" | "mine") {
+                return CliResponse::Error {
+                    message: format!(
+                        "invalid auto-resolve strategy '{strategy}' (expected: none, newest, mine)"
+                    ),
+                };
+            }
+            let mut cfg = ctx.config.lock().unwrap();
+            match cfg
+                .folders
+                .iter_mut()
+                .find(|f| f.folder_id == folder_id_hex)
+            {
+                Some(fc) => {
+                    fc.auto_resolve = strategy.clone();
+                    persist_config(ctx, &cfg);
+                    CliResponse::Ok {
+                        message: format!("Auto-resolve set to '{strategy}'."),
+                    }
+                }
+                None => CliResponse::Error {
+                    message: format!("folder not in local config: {folder_id_hex}"),
+                },
             }
         }
         CliRequest::DismissConflict {
@@ -1595,6 +1644,39 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                 .retain(|c| !(c.folder_id == folder_id && c.path == path));
             CliResponse::Ok {
                 message: format!("Conflict dismissed for {path}."),
+            }
+        }
+
+        // -- M29a: Conflict Resolution Improvements --
+        CliRequest::ConflictDiff {
+            folder_id_hex,
+            path,
+        } => handle_conflict_diff(ctx, &folder_id_hex, &path),
+        CliRequest::SetConflictExpiry {
+            folder_id_hex,
+            days,
+        } => {
+            let mut cfg = ctx.config.lock().unwrap();
+            match cfg
+                .folders
+                .iter_mut()
+                .find(|f| f.folder_id == folder_id_hex)
+            {
+                Some(fc) => {
+                    // `0` is the UX-friendly way to disable expiry from the CLI.
+                    fc.conflict_expiry_days = if days == 0 { None } else { Some(days) };
+                    persist_config(ctx, &cfg);
+                    CliResponse::Ok {
+                        message: if days == 0 {
+                            "Conflict expiry disabled.".to_string()
+                        } else {
+                            format!("Conflict expiry set to {days} days.")
+                        },
+                    }
+                }
+                None => CliResponse::Error {
+                    message: format!("folder not in local config: {folder_id_hex}"),
+                },
             }
         }
 
@@ -2378,6 +2460,250 @@ fn parse_blob_hash(hex_str: &str) -> Result<BlobHash, String> {
     Ok(BlobHash::from_bytes(arr))
 }
 
+/// Seconds between conflict-expiry ticks. Short enough that setting
+/// `conflict_expiry_days = 0` (used in tests) triggers resolution promptly,
+/// long enough to be free in steady state.
+const EXPIRE_CONFLICTS_INTERVAL_SECS: u64 = 60;
+
+/// Scan every locally-configured folder for conflicts that have aged past
+/// `conflict_expiry_days`. Apply the folder's `auto_resolve` strategy
+/// (`newest` or `mine`), or fall back to "keep both" — a DAG-free dismissal
+/// that leaves both file versions on disk untouched.
+///
+/// Emits [`murmur_engine::EngineEvent::ConflictAutoResolved`] per resolved
+/// conflict so the desktop activity feed surfaces the action.
+pub(crate) fn expire_conflicts(ctx: &DaemonCtx) {
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+
+    // Snapshot per-folder expiry policy under the config lock only.
+    let policies: Vec<(FolderId, u64, String)> = {
+        let cfg = ctx.config.lock().unwrap();
+        cfg.folders
+            .iter()
+            .filter_map(|fc| {
+                let days = fc.conflict_expiry_days?;
+                // Treat `Some(0)` as "expire immediately" — useful for tests
+                // and also a sensible "nag me about any unresolved conflict
+                // on the next tick" mode.
+                let fid_bytes: [u8; 32] = hex::decode(&fc.folder_id).ok()?.try_into().ok()?;
+                Some((
+                    FolderId::from_bytes(fid_bytes),
+                    days,
+                    fc.auto_resolve.clone(),
+                ))
+            })
+            .collect()
+    };
+
+    if policies.is_empty() {
+        return;
+    }
+
+    let mut dag_entries_to_broadcast: Vec<Vec<u8>> = Vec::new();
+    let mut events_to_broadcast: Vec<murmur_engine::EngineEvent> = Vec::new();
+    let mut any_resolved = false;
+
+    {
+        let mut eng = ctx.engine.lock().unwrap();
+        let device_id = eng.device_id();
+
+        for (folder_id, days, strategy) in &policies {
+            let expiry_ns = (*days).saturating_mul(24 * 3600 * 1_000_000_000u64);
+            let conflicts = eng.list_conflicts_in_folder(*folder_id);
+            for conflict in conflicts {
+                if conflict.detected_at.saturating_add(expiry_ns) > now_ns {
+                    continue;
+                }
+                let chosen = match strategy.as_str() {
+                    "newest" => conflict
+                        .versions
+                        .iter()
+                        .max_by_key(|v| v.hlc)
+                        .map(|v| v.blob_hash),
+                    "mine" => conflict
+                        .versions
+                        .iter()
+                        .find(|v| v.device_id == device_id)
+                        .map(|v| v.blob_hash),
+                    // "none" (or any unrecognised value) → keep both.
+                    _ => None,
+                };
+
+                let applied_strategy = if chosen.is_some() {
+                    strategy.clone()
+                } else {
+                    "keep_both".to_string()
+                };
+
+                if let Some(hash) = chosen {
+                    match eng.resolve_conflict(*folder_id, &conflict.path, hash) {
+                        Ok(entry) => {
+                            dag_entries_to_broadcast.push(entry.to_bytes());
+                            events_to_broadcast.push(
+                                murmur_engine::EngineEvent::ConflictAutoResolved {
+                                    folder_id: *folder_id,
+                                    path: conflict.path.clone(),
+                                    strategy: applied_strategy,
+                                },
+                            );
+                            any_resolved = true;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, path = %conflict.path, "expire_conflicts: resolve failed");
+                        }
+                    }
+                } else {
+                    // Keep-both fallback: dismiss from active list without a
+                    // `ConflictResolved` DAG entry. Both files remain on
+                    // disk and the user can still intervene later if another
+                    // peer reintroduces the conflict.
+                    let state = eng.state_mut();
+                    state
+                        .conflicts
+                        .retain(|c| !(c.folder_id == *folder_id && c.path == conflict.path));
+                    events_to_broadcast.push(murmur_engine::EngineEvent::ConflictAutoResolved {
+                        folder_id: *folder_id,
+                        path: conflict.path.clone(),
+                        strategy: applied_strategy,
+                    });
+                    any_resolved = true;
+                }
+            }
+        }
+    }
+
+    for bytes in dag_entries_to_broadcast {
+        let _ = ctx.broadcast_tx.send(bytes);
+    }
+    for event in events_to_broadcast {
+        let _ = ctx.event_broadcast.send(event);
+    }
+
+    if any_resolved && let Err(e) = ctx.storage.flush() {
+        error!(error = %e, "flush after expire_conflicts");
+    }
+}
+
+/// Upper bound on the bytes returned per side of a [`CliResponse::ConflictDiff`].
+///
+/// Keeps the full payload well under the 1 MiB IPC frame cap even when both
+/// sides max out. Text diffs over this size are rare and truncation there is
+/// acceptable — `similar` renders the truncated slice and the client can read
+/// `size` to know more bytes exist on disk.
+const CONFLICT_DIFF_MAX_BYTES: usize = 256 * 1024;
+
+/// Binary-detection heuristic: treat the prefix as text if it is valid UTF-8
+/// and contains no NUL bytes (a strong binary signal in otherwise-UTF-8 data).
+///
+/// Scans only the first [`UTF8_SNIFF_LEN`] bytes so behaviour is bounded on
+/// very large blobs. Both sides must pass for the diff to be rendered as text.
+fn is_utf8_text(bytes: &[u8]) -> bool {
+    const UTF8_SNIFF_LEN: usize = 8192;
+    let prefix = &bytes[..bytes.len().min(UTF8_SNIFF_LEN)];
+    if prefix.contains(&0u8) {
+        return false;
+    }
+    std::str::from_utf8(prefix).is_ok()
+}
+
+/// Handle a [`CliRequest::ConflictDiff`]: load both blobs, detect text vs.
+/// binary, and build a [`CliResponse::ConflictDiff`].
+///
+/// Returns an error response if the conflict doesn't exist or doesn't have
+/// exactly two versions (the diff viewer only supports pairs — multi-way
+/// conflicts still show all versions in the list view).
+fn handle_conflict_diff(ctx: &DaemonCtx, folder_id_hex: &str, path: &str) -> CliResponse {
+    use murmur_ipc::ConflictDiffSide;
+
+    let folder_id = match parse_folder_id(folder_id_hex) {
+        Ok(id) => id,
+        Err(e) => return CliResponse::Error { message: e },
+    };
+
+    // Snapshot the conflict + device names while holding the engine lock once.
+    let (left_version, right_version, left_device_name, right_device_name) = {
+        let eng = ctx.engine.lock().unwrap();
+        let conflict = match eng
+            .list_conflicts_in_folder(folder_id)
+            .into_iter()
+            .find(|c| c.path == path)
+        {
+            Some(c) => c,
+            None => {
+                return CliResponse::Error {
+                    message: format!("no active conflict for {path}"),
+                };
+            }
+        };
+        if conflict.versions.len() < 2 {
+            return CliResponse::Error {
+                message: format!(
+                    "conflict has {} versions — at least 2 required",
+                    conflict.versions.len()
+                ),
+            };
+        }
+        let state = eng.state();
+        let left = conflict.versions[0].clone();
+        let right = conflict.versions[1].clone();
+        let ln = state
+            .devices
+            .get(&left.device_id)
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let rn = state
+            .devices
+            .get(&right.device_id)
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        (left, right, ln, rn)
+    };
+
+    let load = |hash: BlobHash| -> (u64, Vec<u8>) {
+        match ctx.storage.load_blob(hash) {
+            Ok(Some(data)) => {
+                let size = data.len() as u64;
+                let truncated = if data.len() > CONFLICT_DIFF_MAX_BYTES {
+                    data[..CONFLICT_DIFF_MAX_BYTES].to_vec()
+                } else {
+                    data
+                };
+                (size, truncated)
+            }
+            _ => (0, Vec::new()),
+        }
+    };
+
+    let (left_size, left_bytes) = load(left_version.blob_hash);
+    let (right_size, right_bytes) = load(right_version.blob_hash);
+
+    // Text vs. binary is determined on the bytes we actually hold. A truncated
+    // prefix is still a fine representative sample for UTF-8 detection.
+    let is_text = !left_bytes.is_empty()
+        && !right_bytes.is_empty()
+        && is_utf8_text(&left_bytes)
+        && is_utf8_text(&right_bytes);
+
+    CliResponse::ConflictDiff {
+        is_text,
+        left: ConflictDiffSide {
+            blob_hash: left_version.blob_hash.to_string(),
+            device_name: left_device_name,
+            size: left_size,
+            bytes: left_bytes,
+        },
+        right: ConflictDiffSide {
+            blob_hash: right_version.blob_hash.to_string(),
+            device_name: right_device_name,
+            size: right_size,
+            bytes: right_bytes,
+        },
+    }
+}
+
 /// Build a list of conflict info for IPC, optionally filtered by folder.
 fn build_conflict_list(
     eng: &murmur_engine::MurmurEngine,
@@ -2609,6 +2935,18 @@ fn engine_event_to_ipc(event: &murmur_engine::EngineEvent, _ctx: &DaemonCtx) -> 
             data: format!(
                 "{{\"folder_id\":\"{folder_id}\",\"path\":\"{}\"}}",
                 escape_json(path)
+            ),
+        },
+        EngineEvent::ConflictAutoResolved {
+            folder_id,
+            path,
+            strategy,
+        } => EngineEventIpc {
+            event_type: "conflict_auto_resolved".to_string(),
+            data: format!(
+                "{{\"folder_id\":\"{folder_id}\",\"path\":\"{}\",\"strategy\":\"{}\"}}",
+                escape_json(path),
+                escape_json(strategy)
             ),
         },
     }
@@ -4082,5 +4420,433 @@ mod tests {
         assert!(matches!(resp, CliResponse::Ok { .. }));
 
         assert!(!local.join(".murmurignore").exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // M29 — Conflict Resolution Improvements
+    // -----------------------------------------------------------------------
+
+    /// Build a folder + seeded conflict inside the engine, and register it
+    /// in both engine state and daemon config so M29 handlers see a normal
+    /// pair-of-versions scenario.
+    ///
+    /// Returns `(folder_id_hex, conflict_path)`.
+    fn seed_conflict(ctx: &DaemonCtx) -> (String, String) {
+        use murmur_types::{BlobHash, ConflictInfo, ConflictVersion};
+
+        // Create a folder and subscribe via the IPC path so the config reflects
+        // reality.
+        let resp = process_request(
+            CliRequest::CreateFolder {
+                name: "M29Folder".to_string(),
+                local_path: None,
+                ignore_patterns: None,
+            },
+            ctx,
+        );
+        let folder_id_hex = match resp {
+            CliResponse::Ok { message } => {
+                let paren_start = message.find('(').unwrap();
+                let paren_end = message.find(')').unwrap();
+                message[paren_start + 1..paren_end].to_string()
+            }
+            other => panic!("expected Ok from CreateFolder, got {other:?}"),
+        };
+
+        // Also register in config so M29 handlers (SetFolderAutoResolve,
+        // SetConflictExpiry, expire_conflicts) find a matching FolderConfig.
+        {
+            let mut cfg = ctx.config.lock().unwrap();
+            cfg.folders.push(config::FolderConfig {
+                folder_id: folder_id_hex.clone(),
+                name: "M29Folder".to_string(),
+                local_path: ctx.base_dir.join("m29"),
+                mode: "full".to_string(),
+                auto_resolve: "none".to_string(),
+                conflict_expiry_days: None,
+            });
+        }
+
+        // Inject a synthetic conflict directly into engine state. The two
+        // versions are crafted so "newest" picks the higher-HLC one and
+        // "mine" picks the local device's version.
+        let path = "readme.txt".to_string();
+        let folder_id = parse_folder_id(&folder_id_hex).unwrap();
+        let local_device = ctx.engine.lock().unwrap().device_id();
+        let remote_device = DeviceId::from_bytes([0x77; 32]);
+
+        let local_bytes: &[u8] = b"local version content\n";
+        let remote_bytes: &[u8] = b"remote version content\n";
+        let local_hash = BlobHash::from_data(local_bytes);
+        let remote_hash = BlobHash::from_data(remote_bytes);
+
+        // Store the blobs so ConflictDiff can load them.
+        ctx.storage.store_blob(local_hash, local_bytes).unwrap();
+        ctx.storage.store_blob(remote_hash, remote_bytes).unwrap();
+
+        // Register the remote device so ConflictDiff can resolve its name.
+        {
+            let mut eng = ctx.engine.lock().unwrap();
+            let state = eng.state_mut();
+            state.devices.insert(
+                remote_device,
+                murmur_types::DeviceInfo {
+                    device_id: remote_device,
+                    name: "Remote".to_string(),
+                    approved: true,
+                    approved_by: Some(local_device),
+                    joined_at: 0,
+                },
+            );
+            state.conflicts.push(ConflictInfo {
+                folder_id,
+                path: path.clone(),
+                versions: vec![
+                    ConflictVersion {
+                        blob_hash: local_hash,
+                        device_id: local_device,
+                        hlc: 1_000,
+                        dag_entry_hash: [0u8; 32],
+                    },
+                    ConflictVersion {
+                        blob_hash: remote_hash,
+                        device_id: remote_device,
+                        hlc: 2_000,
+                        dag_entry_hash: [0u8; 32],
+                    },
+                ],
+                // `0` is interpreted as "epoch" so any positive `expiry_days`
+                // immediately marks this conflict as expired. Tests that
+                // require "not yet expired" override this explicitly.
+                detected_at: 0,
+            });
+        }
+
+        (folder_id_hex, path)
+    }
+
+    #[test]
+    fn test_is_utf8_text_utf8_passes() {
+        assert!(is_utf8_text(b"hello world\n"));
+        assert!(is_utf8_text("héllo".as_bytes()));
+    }
+
+    #[test]
+    fn test_is_utf8_text_binary_fails() {
+        // Non-UTF-8 bytes.
+        assert!(!is_utf8_text(&[0xff, 0xfe, 0x00, 0x01]));
+        // Valid UTF-8 but contains a NUL — treated as binary.
+        assert!(!is_utf8_text(b"hello\0world"));
+    }
+
+    #[test]
+    fn test_ipc_conflict_diff_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let (folder_id_hex, path) = seed_conflict(&ctx);
+
+        let resp = process_request(
+            CliRequest::ConflictDiff {
+                folder_id_hex,
+                path,
+            },
+            &ctx,
+        );
+        match resp {
+            CliResponse::ConflictDiff {
+                is_text,
+                left,
+                right,
+            } => {
+                assert!(is_text, "text blobs should be detected as text");
+                assert_eq!(left.bytes, b"local version content\n");
+                assert_eq!(right.bytes, b"remote version content\n");
+                assert_eq!(right.device_name, "Remote");
+            }
+            other => panic!("expected ConflictDiff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ipc_conflict_diff_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        // Build a conflict with binary blobs (the seed_conflict helper writes
+        // text; we need raw bytes here).
+        let resp = process_request(
+            CliRequest::CreateFolder {
+                name: "BinFolder".to_string(),
+                local_path: None,
+                ignore_patterns: None,
+            },
+            &ctx,
+        );
+        let folder_id_hex = match resp {
+            CliResponse::Ok { message } => {
+                let paren_start = message.find('(').unwrap();
+                let paren_end = message.find(')').unwrap();
+                message[paren_start + 1..paren_end].to_string()
+            }
+            _ => unreachable!(),
+        };
+        let folder_id = parse_folder_id(&folder_id_hex).unwrap();
+
+        let left = vec![0xffu8, 0xfe, 0x00, 0x01, 0x02];
+        let right = vec![0xffu8, 0xfe, 0x00, 0x03, 0x04];
+        let left_hash = BlobHash::from_data(&left);
+        let right_hash = BlobHash::from_data(&right);
+        ctx.storage.store_blob(left_hash, &left).unwrap();
+        ctx.storage.store_blob(right_hash, &right).unwrap();
+
+        {
+            let mut eng = ctx.engine.lock().unwrap();
+            let device_id = eng.device_id();
+            let state = eng.state_mut();
+            state.conflicts.push(murmur_types::ConflictInfo {
+                folder_id,
+                path: "pic.bin".to_string(),
+                versions: vec![
+                    murmur_types::ConflictVersion {
+                        blob_hash: left_hash,
+                        device_id,
+                        hlc: 1,
+                        dag_entry_hash: [0u8; 32],
+                    },
+                    murmur_types::ConflictVersion {
+                        blob_hash: right_hash,
+                        device_id,
+                        hlc: 2,
+                        dag_entry_hash: [0u8; 32],
+                    },
+                ],
+                detected_at: 0,
+            });
+        }
+
+        let resp = process_request(
+            CliRequest::ConflictDiff {
+                folder_id_hex,
+                path: "pic.bin".to_string(),
+            },
+            &ctx,
+        );
+        match resp {
+            CliResponse::ConflictDiff { is_text, .. } => {
+                assert!(!is_text, "binary blobs should NOT be detected as text");
+            }
+            other => panic!("expected ConflictDiff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_conflict_expiry_persists_to_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let (folder_id_hex, _) = seed_conflict(&ctx);
+
+        let resp = process_request(
+            CliRequest::SetConflictExpiry {
+                folder_id_hex: folder_id_hex.clone(),
+                days: 7,
+            },
+            &ctx,
+        );
+        assert!(matches!(resp, CliResponse::Ok { .. }));
+
+        let cfg = ctx.config.lock().unwrap();
+        let fc = cfg
+            .folders
+            .iter()
+            .find(|f| f.folder_id == folder_id_hex)
+            .unwrap();
+        assert_eq!(fc.conflict_expiry_days, Some(7));
+
+        drop(cfg);
+        // `0` disables.
+        let resp2 = process_request(
+            CliRequest::SetConflictExpiry {
+                folder_id_hex: folder_id_hex.clone(),
+                days: 0,
+            },
+            &ctx,
+        );
+        assert!(matches!(resp2, CliResponse::Ok { .. }));
+        let cfg2 = ctx.config.lock().unwrap();
+        let fc2 = cfg2
+            .folders
+            .iter()
+            .find(|f| f.folder_id == folder_id_hex)
+            .unwrap();
+        assert_eq!(fc2.conflict_expiry_days, None);
+    }
+
+    #[test]
+    fn test_set_folder_auto_resolve_validates_strategy() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let (folder_id_hex, _) = seed_conflict(&ctx);
+
+        // Valid strategy is accepted + persisted.
+        let resp = process_request(
+            CliRequest::SetFolderAutoResolve {
+                folder_id_hex: folder_id_hex.clone(),
+                strategy: "newest".to_string(),
+            },
+            &ctx,
+        );
+        assert!(matches!(resp, CliResponse::Ok { .. }));
+        let cfg = ctx.config.lock().unwrap();
+        assert_eq!(
+            cfg.folders
+                .iter()
+                .find(|f| f.folder_id == folder_id_hex)
+                .unwrap()
+                .auto_resolve,
+            "newest"
+        );
+        drop(cfg);
+
+        // Garbage strategy is rejected.
+        let resp2 = process_request(
+            CliRequest::SetFolderAutoResolve {
+                folder_id_hex,
+                strategy: "bogus".to_string(),
+            },
+            &ctx,
+        );
+        assert!(matches!(resp2, CliResponse::Error { .. }));
+    }
+
+    #[test]
+    fn test_expire_conflicts_newest_strategy_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let (folder_id_hex, path) = seed_conflict(&ctx);
+
+        // Configure: auto-resolve=newest, expiry=0 (immediately).
+        {
+            let mut cfg = ctx.config.lock().unwrap();
+            let fc = cfg
+                .folders
+                .iter_mut()
+                .find(|f| f.folder_id == folder_id_hex)
+                .unwrap();
+            fc.auto_resolve = "newest".to_string();
+            fc.conflict_expiry_days = Some(0);
+        }
+
+        // Subscribe to events so we can verify ConflictAutoResolved fires.
+        let mut event_rx = ctx.event_broadcast.subscribe();
+
+        expire_conflicts(&ctx);
+
+        // Conflict list is now empty.
+        let folder_id = parse_folder_id(&folder_id_hex).unwrap();
+        let eng = ctx.engine.lock().unwrap();
+        let remaining = eng.list_conflicts_in_folder(folder_id);
+        assert!(
+            remaining.is_empty(),
+            "expected no conflicts after expiry tick, got {remaining:?}"
+        );
+        drop(eng);
+
+        // Event was emitted.
+        let event = event_rx
+            .try_recv()
+            .expect("expected ConflictAutoResolved event");
+        match event {
+            murmur_engine::EngineEvent::ConflictAutoResolved {
+                strategy, path: ep, ..
+            } => {
+                assert_eq!(strategy, "newest");
+                assert_eq!(ep, path);
+            }
+            other => panic!("expected ConflictAutoResolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_expire_conflicts_keep_both_when_strategy_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let (folder_id_hex, _) = seed_conflict(&ctx);
+
+        // auto_resolve stays "none" (from seed); enable immediate expiry.
+        {
+            let mut cfg = ctx.config.lock().unwrap();
+            let fc = cfg
+                .folders
+                .iter_mut()
+                .find(|f| f.folder_id == folder_id_hex)
+                .unwrap();
+            fc.conflict_expiry_days = Some(0);
+        }
+        let mut event_rx = ctx.event_broadcast.subscribe();
+
+        expire_conflicts(&ctx);
+
+        let folder_id = parse_folder_id(&folder_id_hex).unwrap();
+        let eng = ctx.engine.lock().unwrap();
+        assert!(eng.list_conflicts_in_folder(folder_id).is_empty());
+        drop(eng);
+
+        let event = event_rx
+            .try_recv()
+            .expect("expected ConflictAutoResolved event");
+        match event {
+            murmur_engine::EngineEvent::ConflictAutoResolved { strategy, .. } => {
+                assert_eq!(
+                    strategy, "keep_both",
+                    "strategy=none should fall back to keep_both"
+                );
+            }
+            other => panic!("expected ConflictAutoResolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_expire_conflicts_respects_not_yet_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let (folder_id_hex, _) = seed_conflict(&ctx);
+
+        // Bump the conflict's detected_at to *now* so any non-zero expiry
+        // window will not have elapsed yet.
+        let folder_id = parse_folder_id(&folder_id_hex).unwrap();
+        {
+            let mut eng = ctx.engine.lock().unwrap();
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64;
+            for c in eng
+                .state_mut()
+                .conflicts
+                .iter_mut()
+                .filter(|c| c.folder_id == folder_id)
+            {
+                c.detected_at = now_ns;
+            }
+        }
+        {
+            let mut cfg = ctx.config.lock().unwrap();
+            let fc = cfg
+                .folders
+                .iter_mut()
+                .find(|f| f.folder_id == folder_id_hex)
+                .unwrap();
+            fc.auto_resolve = "newest".to_string();
+            fc.conflict_expiry_days = Some(7);
+        }
+
+        expire_conflicts(&ctx);
+
+        let eng = ctx.engine.lock().unwrap();
+        assert_eq!(
+            eng.list_conflicts_in_folder(folder_id).len(),
+            1,
+            "recently-detected conflict should NOT be auto-resolved"
+        );
     }
 }

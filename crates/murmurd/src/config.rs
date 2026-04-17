@@ -36,10 +36,29 @@ pub struct FolderConfig {
     /// Sync mode: "full", "send-only", or "receive-only".
     #[serde(default = "default_mode")]
     pub mode: String,
+    /// Auto-resolve strategy for this folder: "none" (default), "newest", or "mine".
+    ///
+    /// Used by the conflict-expiry tick (M29): when a conflict ages past
+    /// [`Self::conflict_expiry_days`], the configured strategy is applied.
+    /// When `"none"`, the daemon falls back to "keep both" — it dismisses
+    /// the conflict from the active list without creating a `ConflictResolved`
+    /// DAG entry, leaving both versions on disk.
+    #[serde(default = "default_auto_resolve")]
+    pub auto_resolve: String,
+    /// Days until an unresolved conflict is auto-resolved. `None` disables.
+    ///
+    /// Compared against the conflict's HLC `detected_at` timestamp on each
+    /// expiry tick.
+    #[serde(default)]
+    pub conflict_expiry_days: Option<u64>,
 }
 
 fn default_mode() -> String {
     "full".to_string()
+}
+
+fn default_auto_resolve() -> String {
+    "none".to_string()
 }
 
 /// Device identity.

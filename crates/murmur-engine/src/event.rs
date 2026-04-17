@@ -111,4 +111,17 @@ pub enum EngineEvent {
         /// The file's path within the folder.
         path: String,
     },
+    /// A conflict expired and was auto-resolved by the daemon (M29).
+    ///
+    /// Emitted when the conflict-expiry tick applies the folder's configured
+    /// auto-resolve strategy (`newest`, `mine`) or falls back to keeping both
+    /// versions (`keep_both`).
+    ConflictAutoResolved {
+        /// The folder containing the conflicted file.
+        folder_id: FolderId,
+        /// The file path within the folder.
+        path: String,
+        /// The strategy applied: `newest`, `mine`, or `keep_both`.
+        strategy: String,
+    },
 }

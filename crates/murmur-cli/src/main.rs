@@ -74,12 +74,9 @@ enum Command {
     /// Folder management commands.
     #[command(subcommand)]
     Folder(FolderCommand),
-    /// List active file conflicts.
-    Conflicts {
-        /// Filter by folder ID (optional).
-        #[arg(long)]
-        folder: Option<String>,
-    },
+    /// Conflict inspection and diffs.
+    #[command(subcommand)]
+    Conflicts(ConflictsCommand),
     /// Resolve a file conflict.
     Resolve {
         /// Folder ID (64-character hex).
@@ -102,6 +99,24 @@ enum Command {
     /// Mnemonic helpers, including a raw-mnemonic QR fallback
     #[command(subcommand)]
     MnemonicCmd(MnemonicCommand),
+}
+
+/// Conflict subcommands (M29).
+#[derive(Subcommand)]
+enum ConflictsCommand {
+    /// List active conflicts.
+    List {
+        /// Filter by folder ID (optional).
+        #[arg(long)]
+        folder: Option<String>,
+    },
+    /// Show a unified diff between the two versions of a conflicted file.
+    Diff {
+        /// Folder ID (64-character hex).
+        folder_id: String,
+        /// File path within the folder.
+        path: String,
+    },
 }
 
 /// Pairing-invite subcommands.
@@ -200,6 +215,20 @@ enum FolderCommand {
         /// New display name.
         name: String,
     },
+    /// Set the conflict-expiry window. `0` disables (M29).
+    SetConflictExpiry {
+        /// Folder ID (64-character hex).
+        folder_id: String,
+        /// Days until unresolved conflicts auto-resolve. `0` disables.
+        days: u64,
+    },
+    /// Set the auto-resolve strategy for conflicts (`none`, `newest`, `mine`).
+    SetAutoResolve {
+        /// Folder ID (64-character hex).
+        folder_id: String,
+        /// Strategy: `none`, `newest`, or `mine`.
+        strategy: String,
+    },
 }
 
 fn main() {
@@ -215,6 +244,11 @@ fn main() {
         Command::MnemonicCmd(MnemonicCommand::Qr { acknowledged }) => {
             cmd_mnemonic_qr_online(&cli.data_dir, acknowledged, cli.json)
         }
+        // Conflicts diff needs custom rendering (unified diff / binary summary).
+        Command::Conflicts(ConflictsCommand::Diff {
+            ref folder_id,
+            ref path,
+        }) => cmd_conflicts_diff(&cli.data_dir, folder_id, path, cli.json),
         // All other online commands go through the socket.
         cmd => run_online(&cli.data_dir, cmd, cli.json),
     };
@@ -309,6 +343,79 @@ fn cmd_mnemonic_qr_online(
         }
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
+}
+
+/// Render a conflict as a unified diff (text) or size summary (binary).
+///
+/// The daemon decides `is_text` so all clients agree on rendering. For text,
+/// we delegate to `similar::TextDiff` at line granularity. For binary, we
+/// print a one-line summary instead of a meaningless hex dump.
+fn cmd_conflicts_diff(
+    base_dir: &std::path::Path,
+    folder_id: &str,
+    path: &str,
+    json: bool,
+) -> Result<()> {
+    let response = send_single(
+        base_dir,
+        CliRequest::ConflictDiff {
+            folder_id_hex: folder_id.to_string(),
+            path: path.to_string(),
+        },
+    )?;
+
+    if json {
+        return print_json(&response);
+    }
+
+    match response {
+        CliResponse::ConflictDiff {
+            is_text,
+            left,
+            right,
+        } => {
+            println!("--- {} ({} bytes)", left.device_name, left.size);
+            println!("+++ {} ({} bytes)", right.device_name, right.size);
+            if !is_text {
+                println!(
+                    "binary files differ — {} vs {} bytes",
+                    left.size, right.size
+                );
+                return Ok(());
+            }
+            let left_text = String::from_utf8_lossy(&left.bytes);
+            let right_text = String::from_utf8_lossy(&right.bytes);
+            print!("{}", render_unified_diff(&left_text, &right_text));
+            Ok(())
+        }
+        CliResponse::Error { message } => {
+            eprintln!("error: {message}");
+            process::exit(1);
+        }
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+/// Build a unified-diff string using `similar::TextDiff` at line granularity.
+///
+/// Pure so it can be unit-tested without standing up a daemon.
+fn render_unified_diff(left: &str, right: &str) -> String {
+    use similar::{ChangeTag, TextDiff};
+    let diff = TextDiff::from_lines(left, right);
+    let mut out = String::new();
+    for change in diff.iter_all_changes() {
+        let sign = match change.tag() {
+            ChangeTag::Delete => "-",
+            ChangeTag::Insert => "+",
+            ChangeTag::Equal => " ",
+        };
+        out.push_str(sign);
+        out.push_str(change.value());
+        if !change.value().ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Send a single request to the daemon and return its response.
@@ -493,10 +600,25 @@ fn command_to_request(command: Command) -> CliRequest {
                 folder_id_hex: folder_id,
                 name,
             },
+            FolderCommand::SetConflictExpiry { folder_id, days } => CliRequest::SetConflictExpiry {
+                folder_id_hex: folder_id,
+                days,
+            },
+            FolderCommand::SetAutoResolve {
+                folder_id,
+                strategy,
+            } => CliRequest::SetFolderAutoResolve {
+                folder_id_hex: folder_id,
+                strategy,
+            },
         },
-        Command::Conflicts { folder } => CliRequest::ListConflicts {
+        Command::Conflicts(ConflictsCommand::List { folder }) => CliRequest::ListConflicts {
             folder_id_hex: folder,
         },
+        // Diff is dispatched in `main()` before this function runs — it
+        // needs custom rendering (unified diff / binary summary) rather
+        // than the generic response printer.
+        Command::Conflicts(ConflictsCommand::Diff { .. }) => unreachable!(),
         Command::Resolve {
             folder_id,
             path,
@@ -694,8 +816,12 @@ fn print_plain(response: &CliResponse) {
             } else {
                 println!("Folders:");
                 for f in folders {
+                    let expiry = match f.conflict_expiry_days {
+                        Some(d) => format!(" conflict_expiry={d}d"),
+                        None => String::new(),
+                    };
                     println!(
-                        "  {} ({}) -> {} [{}] auto_resolve={}",
+                        "  {} ({}) -> {} [{}] auto_resolve={}{expiry}",
                         f.name, f.folder_id, f.local_path, f.mode, f.auto_resolve
                     );
                 }
@@ -826,6 +952,18 @@ fn print_plain(response: &CliResponse) {
             println!("Issuer: {issued_by}");
             println!("{mnemonic}");
         }
+        // Normally rendered by `cmd_conflicts_diff`; this arm keeps the
+        // dispatcher total in case the response comes through another path.
+        CliResponse::ConflictDiff {
+            is_text,
+            left,
+            right,
+        } => {
+            println!(
+                "ConflictDiff (is_text={is_text}): {} ({} bytes) vs {} ({} bytes)",
+                left.device_name, left.size, right.device_name, right.size
+            );
+        }
     }
 }
 
@@ -842,6 +980,35 @@ mod tests {
         assert!(
             err_msg.contains("not running"),
             "expected 'not running' in: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_render_unified_diff_shows_additions_and_deletions() {
+        let left = "alpha\nbeta\ngamma\n";
+        let right = "alpha\nBETA\ngamma\n";
+        let out = render_unified_diff(left, right);
+        assert!(
+            out.contains("-beta"),
+            "expected removed line marker, got: {out}"
+        );
+        assert!(
+            out.contains("+BETA"),
+            "expected added line marker, got: {out}"
+        );
+        // Unchanged lines are prefixed with a space.
+        assert!(
+            out.contains(" alpha"),
+            "expected context line marker, got: {out}"
+        );
+    }
+
+    #[test]
+    fn test_render_unified_diff_identical_inputs_have_no_changes() {
+        let out = render_unified_diff("same\nlines\n", "same\nlines\n");
+        assert!(
+            !out.contains('+') && !out.contains('-'),
+            "identical inputs should produce no insert/delete markers, got: {out:?}"
         );
     }
 }

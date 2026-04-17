@@ -69,3 +69,4 @@ ignore = "0.4"
 qrcodegen = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 data-encoding = "2"
+similar = "2"

@@ -300,11 +300,44 @@ impl App {
                     .padding(6)
                     .width(Length::Fill),
                 button(text("Save"))
-                    .on_press(Message::SaveIgnorePatterns(fid))
+                    .on_press(Message::SaveIgnorePatterns(fid.clone()))
                     .style(primary_btn)
                     .padding(6),
             ]
             .spacing(4),
+        ]
+        .spacing(6);
+
+        // Conflict resolution settings (M29). Auto-resolve strategy controls
+        // the expiry-tick fallback; expiry days is the age threshold.
+        let conflict_section = column![
+            text("Conflict Resolution").size(14).color(TEXT_SECONDARY),
+            row![
+                text("Auto-resolve:").size(12).color(TEXT_MUTED),
+                text_input("none | newest | mine", &self.folder_auto_resolve_input)
+                    .on_input(Message::FolderAutoResolveInputChanged)
+                    .padding(6)
+                    .width(Length::Fill),
+                button(text("Save").size(12))
+                    .on_press(Message::SaveFolderAutoResolve(fid.clone()))
+                    .style(primary_btn)
+                    .padding(6),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+            row![
+                text("Expiry (days, 0 = off):").size(12).color(TEXT_MUTED),
+                text_input("0", &self.folder_conflict_expiry_input)
+                    .on_input(Message::FolderConflictExpiryInputChanged)
+                    .padding(6)
+                    .width(Length::Fill),
+                button(text("Save").size(12))
+                    .on_press(Message::SaveFolderConflictExpiry(fid))
+                    .style(primary_btn)
+                    .padding(6),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
         ]
         .spacing(6);
 
@@ -436,6 +469,10 @@ impl App {
                 .width(Length::Fill)
                 .style(card_style),
             container(ignore_section)
+                .padding(14)
+                .width(Length::Fill)
+                .style(card_style),
+            container(conflict_section)
                 .padding(14)
                 .width(Length::Fill)
                 .style(card_style),

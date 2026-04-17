@@ -317,6 +317,28 @@ pub enum CliRequest {
         /// A `murmur://join?token=…` URL.
         url: String,
     },
+
+    // -- M29a: Conflict Resolution Improvements --
+    /// Fetch the two competing versions of a conflicted file for side-by-side
+    /// rendering. Returns raw blob bytes plus an `is_text` flag so all clients
+    /// share a single UTF-8 detection result.
+    ConflictDiff {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+        /// File path within the folder.
+        path: String,
+    },
+    /// Set (or clear) the conflict-expiry window for a folder.
+    ///
+    /// When enabled, conflicts older than `days` days are auto-resolved on
+    /// the daemon's periodic tick using the folder's auto-resolve strategy
+    /// (or "keep both" if the strategy is `none`).
+    SetConflictExpiry {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+        /// Days until unresolved conflicts are auto-resolved. `0` disables.
+        days: u64,
+    },
 }
 
 /// A response sent from `murmurd` to `murmur-cli`.
@@ -514,6 +536,17 @@ pub enum CliResponse {
         /// Device ID of the issuer, as 64-character hex.
         issued_by: String,
     },
+
+    // -- M29a: Conflict Resolution Improvements --
+    /// Two-way conflict diff payload (response to [`CliRequest::ConflictDiff`]).
+    ConflictDiff {
+        /// Whether both blobs decoded as UTF-8 (and so should be diffed as text).
+        is_text: bool,
+        /// Left (first) side of the conflict.
+        left: ConflictDiffSide,
+        /// Right (second) side of the conflict.
+        right: ConflictDiffSide,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -644,6 +677,24 @@ pub struct FolderConfigIpc {
     pub mode: String,
     /// Auto-resolve strategy: "none", "newest", or "mine".
     pub auto_resolve: String,
+    /// Days until unresolved conflicts auto-resolve. `None` = disabled (M29).
+    #[serde(default)]
+    pub conflict_expiry_days: Option<u64>,
+}
+
+/// One side of a conflict diff for IPC transport (M29).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConflictDiffSide {
+    /// Content hash of this version (hex).
+    pub blob_hash: String,
+    /// Name of the device that produced this version.
+    pub device_name: String,
+    /// Full size of the blob in bytes.
+    pub size: u64,
+    /// Blob bytes. May be truncated for very large blobs; empty for unreadable
+    /// blobs (e.g., not yet synced locally). Clients compare `size` to
+    /// `bytes.len()` to detect truncation.
+    pub bytes: Vec<u8>,
 }
 
 /// Network folder info for discovery (M21a).
@@ -960,6 +1011,15 @@ mod tests {
             CliRequest::ExportDiagnostics {
                 output_path: "/tmp/diag.json".to_string(),
             },
+            // M29a
+            CliRequest::ConflictDiff {
+                folder_id_hex: "aa".repeat(32),
+                path: "readme.txt".to_string(),
+            },
+            CliRequest::SetConflictExpiry {
+                folder_id_hex: "bb".repeat(32),
+                days: 7,
+            },
         ];
         for req in variants {
             let bytes = postcard::to_allocvec(&req).unwrap();
@@ -1155,6 +1215,7 @@ mod tests {
                     local_path: "/home/user/Murmur".to_string(),
                     mode: "read-write".to_string(),
                     auto_resolve: "none".to_string(),
+                    conflict_expiry_days: None,
                 }],
                 auto_approve: false,
                 mdns: true,
@@ -1232,6 +1293,22 @@ mod tests {
             CliResponse::RedeemedMnemonic {
                 mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),
                 issued_by: "aa".repeat(32),
+            },
+            // M29a
+            CliResponse::ConflictDiff {
+                is_text: true,
+                left: ConflictDiffSide {
+                    blob_hash: "cc".repeat(32),
+                    device_name: "Phone".to_string(),
+                    size: 12,
+                    bytes: b"hello world\n".to_vec(),
+                },
+                right: ConflictDiffSide {
+                    blob_hash: "dd".repeat(32),
+                    device_name: "NAS".to_string(),
+                    size: 13,
+                    bytes: b"hello, world\n".to_vec(),
+                },
             },
         ];
         for resp in variants {
@@ -1375,31 +1452,46 @@ mod tests {
         // If someone adds or removes a CliResponse variant, this test
         // forces them to also update the golden-byte tests above.
         //
-        // Last variant is now RedeemedMnemonic. Variant index 24 (0x18),
-        // then strings "m" and "i" (each len 1 + byte).
-        let last = CliResponse::RedeemedMnemonic {
-            mnemonic: "m".to_string(),
-            issued_by: "i".to_string(),
+        // Last variant is now ConflictDiff at index 25 (0x19). Payload:
+        // - is_text: true → 0x01
+        // - left: blob_hash "" (0x00), device_name "" (0x00), size 0 (0x00),
+        //   bytes [] (0x00)
+        // - right: same → "00000000"
+        let last = CliResponse::ConflictDiff {
+            is_text: true,
+            left: ConflictDiffSide {
+                blob_hash: String::new(),
+                device_name: String::new(),
+                size: 0,
+                bytes: Vec::new(),
+            },
+            right: ConflictDiffSide {
+                blob_hash: String::new(),
+                device_name: String::new(),
+                size: 0,
+                bytes: Vec::new(),
+            },
         };
         let bytes = postcard::to_allocvec(&last).unwrap();
         assert_eq!(
             hex(&bytes),
-            "18016d0169",
+            "19010000000000000000",
             "CliResponse variant count changed — update golden-byte tests for new variants"
         );
     }
 
     #[test]
     fn test_request_variant_count_guard() {
-        // Last variant is now RedeemPairingInvite. Variant index 51 (0x33),
-        // then string payload ("x" = len 1 + byte).
-        let last = CliRequest::RedeemPairingInvite {
-            url: "x".to_string(),
+        // Last variant is now SetConflictExpiry at index 53 (0x35). Payload:
+        // folder_id_hex "" (0x00), days 0 (0x00).
+        let last = CliRequest::SetConflictExpiry {
+            folder_id_hex: String::new(),
+            days: 0,
         };
         let bytes = postcard::to_allocvec(&last).unwrap();
         assert_eq!(
             hex(&bytes),
-            "330178",
+            "350000",
             "CliRequest variant count changed — update golden-byte tests for new variants"
         );
     }

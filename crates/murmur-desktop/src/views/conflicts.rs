@@ -1,9 +1,9 @@
 //! Conflicts list and file history views.
 
-use iced::widget::{button, column, container, row, text};
+use iced::widget::{button, column, container, row, scrollable, text};
 use iced::{Color, Element, Length};
 
-use crate::app::{App, Screen};
+use crate::app::{App, ConflictDiffCache, Screen};
 use crate::helpers::{format_size, truncate_hex};
 use crate::message::Message;
 use crate::style::*;
@@ -81,15 +81,32 @@ impl App {
                         .align_y(iced::Alignment::Center),
                     );
                 }
+                let key = (conflict.folder_id.clone(), conflict.path.clone());
+                let expanded = self.expanded_conflict_diffs.contains(&key);
+                let diff_label = if expanded { "Hide diff" } else { "Show diff" };
                 card_content = card_content.push(
-                    button(text("Keep Both (dismiss)").size(12))
-                        .on_press(Message::DismissConflict {
-                            folder_id: conflict.folder_id.clone(),
-                            path: conflict.path.clone(),
-                        })
-                        .style(secondary_btn)
-                        .padding(6),
+                    row![
+                        button(text(diff_label).size(12))
+                            .on_press(Message::ToggleConflictDiff {
+                                folder_id: conflict.folder_id.clone(),
+                                path: conflict.path.clone(),
+                            })
+                            .style(secondary_btn)
+                            .padding(6),
+                        button(text("Keep Both (dismiss)").size(12))
+                            .on_press(Message::DismissConflict {
+                                folder_id: conflict.folder_id.clone(),
+                                path: conflict.path.clone(),
+                            })
+                            .style(secondary_btn)
+                            .padding(6),
+                    ]
+                    .spacing(6),
                 );
+                if expanded {
+                    card_content = card_content
+                        .push(render_conflict_diff_panel(self.conflict_diffs.get(&key)));
+                }
                 col = col.push(
                     container(card_content)
                         .padding(14)
@@ -162,4 +179,73 @@ impl App {
         .spacing(16)
         .into()
     }
+}
+
+/// Build the inline diff panel for a single conflict (M29).
+///
+/// `diff` is `None` while the IPC fetch is in flight, and `Some(cache)` once
+/// the daemon has responded. Binary pairs render a single summary line; text
+/// pairs render a unified diff via `similar::TextDiff`.
+fn render_conflict_diff_panel(diff: Option<&ConflictDiffCache>) -> Element<'_, Message> {
+    let Some(cache) = diff else {
+        return container(text("Loading diff…").size(12).color(TEXT_MUTED))
+            .padding(8)
+            .into();
+    };
+
+    let header = text(format!(
+        "{} ({} bytes) vs {} ({} bytes)",
+        cache.left.device_name, cache.left.size, cache.right.device_name, cache.right.size
+    ))
+    .size(12)
+    .color(TEXT_MUTED);
+
+    if !cache.is_text {
+        return column![
+            header,
+            text(format!(
+                "binary files differ — {} vs {} bytes",
+                cache.left.size, cache.right.size
+            ))
+            .size(12)
+            .color(TEXT_SECONDARY),
+        ]
+        .spacing(4)
+        .into();
+    }
+
+    let left_text = String::from_utf8_lossy(&cache.left.bytes);
+    let right_text = String::from_utf8_lossy(&cache.right.bytes);
+    let diff_text = format_unified_diff(&left_text, &right_text);
+
+    column![
+        header,
+        container(scrollable(text(diff_text).size(12).color(Color::WHITE)))
+            .padding(6)
+            .width(Length::Fill)
+            .max_height(300.0)
+            .style(card_style),
+    ]
+    .spacing(4)
+    .into()
+}
+
+/// Render a unified diff between two strings at line granularity.
+fn format_unified_diff(left: &str, right: &str) -> String {
+    use similar::{ChangeTag, TextDiff};
+    let diff = TextDiff::from_lines(left, right);
+    let mut out = String::new();
+    for change in diff.iter_all_changes() {
+        let sign = match change.tag() {
+            ChangeTag::Delete => "-",
+            ChangeTag::Insert => "+",
+            ChangeTag::Equal => " ",
+        };
+        out.push_str(sign);
+        out.push_str(change.value());
+        if !change.value().ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
 }

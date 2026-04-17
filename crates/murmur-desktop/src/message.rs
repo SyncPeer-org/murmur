@@ -112,6 +112,27 @@ pub enum Message {
     CopyPairingInviteUrl,
     /// User picked a folder-template slug — fill the ignore-patterns input.
     ApplyFolderTemplate(String),
+    // M29: conflict diff + per-folder resolve settings
+    /// Toggle (expand/collapse) the inline diff panel for a conflict.
+    ToggleConflictDiff {
+        folder_id: String,
+        path: String,
+    },
+    /// Response from a `ConflictDiff` fetch. Carries the key so the app can
+    /// store the result in the right slot of `conflict_diffs`.
+    GotConflictDiff {
+        folder_id: String,
+        path: String,
+        response: Result<CliResponse, String>,
+    },
+    /// User edited the draft auto-resolve strategy for the selected folder.
+    FolderAutoResolveInputChanged(String),
+    /// User edited the draft conflict-expiry days for the selected folder.
+    FolderConflictExpiryInputChanged(String),
+    /// Save the current draft auto-resolve strategy.
+    SaveFolderAutoResolve(String),
+    /// Save the current draft conflict-expiry days.
+    SaveFolderConflictExpiry(String),
     DaemonEvent(CliResponse),
     Tick,
 }

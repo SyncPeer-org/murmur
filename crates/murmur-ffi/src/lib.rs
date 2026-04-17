@@ -168,6 +168,12 @@ pub enum MurmurEventFfi {
     },
     /// A file was deleted.
     FileDeleted { folder_id: Vec<u8>, path: String },
+    /// A conflict expired and was auto-resolved by the daemon (M29).
+    ConflictAutoResolved {
+        folder_id: Vec<u8>,
+        path: String,
+        strategy: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +274,15 @@ fn engine_event_to_ffi(event: EngineEvent) -> MurmurEventFfi {
         EngineEvent::FileDeleted { folder_id, path } => MurmurEventFfi::FileDeleted {
             folder_id: folder_id.as_bytes().to_vec(),
             path,
+        },
+        EngineEvent::ConflictAutoResolved {
+            folder_id,
+            path,
+            strategy,
+        } => MurmurEventFfi::ConflictAutoResolved {
+            folder_id: folder_id.as_bytes().to_vec(),
+            path,
+            strategy,
         },
     }
 }
